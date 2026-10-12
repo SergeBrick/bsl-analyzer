@@ -673,3 +673,89 @@ fn trivia_after_a_closed_method_offers_no_locals() {
         "за закрытым методом его локальных имён быть не должно"
     );
 }
+
+fn sort_text_of<'a>(items: &'a [CompletionItem], label: &str) -> Option<&'a str> {
+    items.iter().find(|i| i.label == label)?.sort_text.as_deref()
+}
+
+#[test]
+fn completion_latin_typed_for_cyrillic_name_offers_it_in_fuzzy_tier() {
+    // `vjz` is what the keys of `моя` produce while the Latin layout is active.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем МояПеременная;
+    vjz$0
+КонецПроцедуры
+"#,
+    );
+    let sort_text = sort_text_of(&items, "МояПеременная").unwrap_or_else(|| {
+        panic!(
+            "a name typed in the wrong keyboard layout must still be offered; got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        sort_text.starts_with('3'),
+        "a layout-corrected hit must sit in the Fuzzy tier; got {sort_text:?}"
+    );
+}
+
+#[test]
+fn completion_cyrillic_typed_for_latin_name_offers_it() {
+    // `ьнм` is what the keys of `myv` produce while the Cyrillic layout is active.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем MyValue;
+    ьнм$0
+КонецПроцедуры
+"#,
+    );
+    assert!(
+        has_label(&items, "MyValue"),
+        "a Latin name typed with Cyrillic keys must still be offered; got: {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn completion_correct_layout_hit_outranks_layout_corrected_hit() {
+    // `Сум` hits `СуммаИтог` directly; on the other layout the same keys read
+    // `cev`, which hits `CevДанные`. The direct hit must keep the top tier and
+    // sort ahead.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    СуммаИтог = 0;
+    CevДанные = 1;
+    Сум$0
+КонецПроцедуры
+"#,
+    );
+    let direct = sort_text_of(&items, "СуммаИтог").expect("direct prefix hit must be offered");
+    let corrected =
+        sort_text_of(&items, "CevДанные").expect("layout-corrected hit must be offered too");
+    assert!(direct.starts_with('0'), "direct prefix hit must stay in the top tier; got {direct:?}");
+    assert!(corrected.starts_with('3'), "layout-corrected hit must be Fuzzy; got {corrected:?}");
+    assert!(direct < corrected, "direct hit must sort first; got {direct:?} vs {corrected:?}");
+}
+
+#[test]
+fn completion_correct_layout_prefix_keeps_its_tier() {
+    // Input typed in the right layout ranks exactly as before: top tier.
+    let items = complete(
+        r#"//- /test.bsl
+Процедура Тест()
+    Перем МояПеременная;
+    Моя$0
+КонецПроцедуры
+"#,
+    );
+    let sort_text =
+        sort_text_of(&items, "МояПеременная").expect("correct-layout prefix hit must be offered");
+    assert!(
+        sort_text.starts_with('0'),
+        "correct-layout prefix must be top tier; got {sort_text:?}"
+    );
+}

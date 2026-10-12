@@ -40,6 +40,11 @@ pub(super) struct PrefixMatcher {
     matcher: Matcher,
     needle_lower: String,
     needle_chars: Vec<char>,
+    /// Wrong-keyboard-layout alternative of the needle (ЙЦУКЕН<->QWERTY by
+    /// physical key): typing Latin while a Cyrillic word was meant, or vice versa.
+    /// `Some` only when transposing actually changes the text. Matches against it
+    /// are demoted to [`MatchTier::Fuzzy`] so a correct-layout hit always wins.
+    alt: Option<(String, Vec<char>)>,
     empty: bool,
 }
 
@@ -47,11 +52,16 @@ impl PrefixMatcher {
     pub(super) fn new(prefix: &str) -> Self {
         let needle_lower = prefix.fold_lower();
         let needle_chars = needle_lower.chars().collect();
+        let alt = transpose_layout(&needle_lower).map(|t| {
+            let chars = t.chars().collect();
+            (t, chars)
+        });
         Self {
             matcher: Matcher::new(Config::DEFAULT),
             empty: needle_lower.is_empty(),
             needle_lower,
             needle_chars,
+            alt,
         }
     }
 
@@ -67,17 +77,10 @@ impl PrefixMatcher {
         if self.empty {
             return true;
         }
-        let mut needle = self.needle_chars.iter().copied().peekable();
-        for hc in candidate.chars().flat_map(|c| c.to_lowercase()) {
-            match needle.peek() {
-                Some(&nc) if nc == hc => {
-                    needle.next();
-                }
-                Some(_) => {}
-                None => return true,
-            }
+        if is_subsequence(&self.needle_chars, candidate) {
+            return true;
         }
-        needle.peek().is_none()
+        matches!(&self.alt, Some((_, chars)) if is_subsequence(chars, candidate))
     }
 
     /// Stricter gate requiring the typed text as a contiguous substring (still
@@ -88,7 +91,9 @@ impl PrefixMatcher {
         if self.empty {
             return true;
         }
-        candidate.fold_lower().contains(self.needle_lower.as_str())
+        let hay = candidate.fold_lower();
+        hay.contains(self.needle_lower.as_str())
+            || matches!(&self.alt, Some((alt, _)) if hay.contains(alt.as_str()))
     }
 
     /// Bilingual variant of [`PrefixMatcher::admits_contiguous`].
@@ -96,26 +101,100 @@ impl PrefixMatcher {
         self.admits_contiguous(ru) || self.admits_contiguous(en)
     }
 
-    /// Precise score + quality tier for a candidate. `None` when the typed text
-    /// is not a subsequence of the candidate.
+    /// Precise score + quality tier for a candidate. `None` when neither the typed
+    /// text nor its wrong-layout alternative is a subsequence of the candidate.
     pub(super) fn score(&mut self, candidate: &str) -> Option<MatchResult> {
         if self.empty {
             return Some(MatchResult { tier: MatchTier::Prefix, score: 0 });
         }
 
         let hay_lower = candidate.fold_lower();
-        let mut hay_buf = Vec::new();
-        let mut needle_buf = Vec::new();
-        let hay = Utf32Str::new(&hay_lower, &mut hay_buf);
-        let needle = Utf32Str::new(&self.needle_lower, &mut needle_buf);
-
-        let mut indices = Vec::new();
-        let score = self.matcher.fuzzy_indices(hay, needle, &mut indices)?;
-        indices.sort_unstable();
-
-        let tier = classify_tier(candidate, &indices);
-        Some(MatchResult { tier, score })
+        if let Some(r) = fuzzy_score(&mut self.matcher, &hay_lower, &self.needle_lower, candidate) {
+            return Some(r);
+        }
+        // Wrong-layout fallback, only when the correct-layout needle did not hit.
+        if let Some((alt, _)) = &self.alt {
+            if let Some(mut r) = fuzzy_score(&mut self.matcher, &hay_lower, alt, candidate) {
+                r.tier = MatchTier::Fuzzy;
+                return Some(r);
+            }
+        }
+        None
     }
+}
+
+/// Case-insensitive subsequence test of `needle` (already lowercase) against
+/// `candidate`. Shared by the primary and wrong-layout `admits` gates.
+fn is_subsequence(needle: &[char], candidate: &str) -> bool {
+    let mut needle = needle.iter().copied().peekable();
+    for hc in candidate.chars().flat_map(|c| c.to_lowercase()) {
+        match needle.peek() {
+            Some(&nc) if nc == hc => {
+                needle.next();
+            }
+            Some(_) => {}
+            None => return true,
+        }
+    }
+    needle.peek().is_none()
+}
+
+/// One `nucleo` fuzzy pass of `needle_lower` against `hay_lower`, with the tier
+/// derived from the match positions in the case-preserving `candidate`.
+fn fuzzy_score(
+    matcher: &mut Matcher,
+    hay_lower: &str,
+    needle_lower: &str,
+    candidate: &str,
+) -> Option<MatchResult> {
+    let mut hay_buf = Vec::new();
+    let mut needle_buf = Vec::new();
+    let hay = Utf32Str::new(hay_lower, &mut hay_buf);
+    let needle = Utf32Str::new(needle_lower, &mut needle_buf);
+
+    let mut indices = Vec::new();
+    let score = matcher.fuzzy_indices(hay, needle, &mut indices)?;
+    indices.sort_unstable();
+
+    let tier = classify_tier(candidate, &indices);
+    Some(MatchResult { tier, score })
+}
+
+/// Lowercase keys of the QWERTY layout, row by row; the char at the same position
+/// in [`LAYOUT_JCUKEN`] sits on the same physical key of the ЙЦУКЕН layout.
+const LAYOUT_QWERTY: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+const LAYOUT_JCUKEN: &str = "йцукенгшщзхъфывапролджэячсмитьбю";
+
+/// Map one lowercase char between the QWERTY and ЙЦУКЕН layouts by physical key
+/// (bidirectional). `None` for keys that don't carry a letter on either layout.
+fn layout_char(c: char) -> Option<char> {
+    let pairs = LAYOUT_QWERTY.chars().zip(LAYOUT_JCUKEN.chars());
+    for (latin, cyrillic) in pairs {
+        if c == latin {
+            return Some(cyrillic);
+        }
+        if c == cyrillic {
+            return Some(latin);
+        }
+    }
+    None
+}
+
+/// Transpose a lowercase string between layouts. `None` if no char mapped (so the
+/// caller skips a pointless second matching pass).
+fn transpose_layout(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut changed = false;
+    for c in s.chars() {
+        match layout_char(c) {
+            Some(m) => {
+                out.push(m);
+                changed = true;
+            }
+            None => out.push(c),
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Score a completion candidate by its label and any bilingual aliases carried in
@@ -244,6 +323,38 @@ mod tests {
     #[test]
     fn non_subsequence_does_not_match() {
         assert_eq!(tier("xyz", "Справочники"), None);
+    }
+
+    #[test]
+    fn wrong_layout_matches_but_is_demoted() {
+        // "nf," typed on a US layout is "таб" on ЙЦУКЕН -> ТаблицаЗначений.
+        let mut m = PrefixMatcher::new("nf,");
+        let r = m.score("ТаблицаЗначений").expect("wrong-layout prefix should still match");
+        assert_eq!(r.tier, MatchTier::Fuzzy, "layout-corrected hits never outrank real ones");
+        // Reverse direction: Cyrillic keys for a Latin identifier.
+        assert!(PrefixMatcher::new("мфд").score("ValueTable").is_some()); // м-ф-д = v-a-l
+    }
+
+    #[test]
+    fn correct_layout_is_not_demoted() {
+        assert_eq!(tier("таб", "ТаблицаЗначений"), Some(MatchTier::Prefix));
+    }
+
+    #[test]
+    fn layout_tables_map_every_key_both_ways() {
+        assert_eq!(LAYOUT_QWERTY.chars().count(), LAYOUT_JCUKEN.chars().count());
+        for (latin, cyrillic) in LAYOUT_QWERTY.chars().zip(LAYOUT_JCUKEN.chars()) {
+            assert_eq!(layout_char(latin), Some(cyrillic));
+            assert_eq!(layout_char(cyrillic), Some(latin));
+        }
+        assert_eq!(layout_char('1'), None);
+        assert_eq!(transpose_layout("123"), None);
+    }
+
+    #[test]
+    fn admits_wrong_layout() {
+        assert!(PrefixMatcher::new("nf,").admits("ТаблицаЗначений"));
+        assert!(PrefixMatcher::new("nf,").admits_contiguous("ТаблицаЗначений"));
     }
 
     #[test]

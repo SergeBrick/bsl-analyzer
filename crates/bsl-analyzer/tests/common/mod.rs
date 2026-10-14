@@ -19,6 +19,13 @@ pub const BROKEN: &str = "Процедура Тест(\n";
 /// Silence a server at rest is allowed before a wait is judged lost.
 pub const SILENCE: Duration = Duration::from_secs(60);
 
+/// Total bound for one wait, even while unrelated messages keep arriving.
+pub const BUSY_CEILING: Duration = Duration::from_secs(10 * 60);
+
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -138,9 +145,26 @@ impl Lsp {
         }));
         let deadline = std::time::Instant::now() + SILENCE;
         loop {
-            let remaining = deadline.checked_duration_since(std::time::Instant::now()).unwrap();
-            let message =
-                lsp.messages.recv_timeout(remaining).expect("the LSP server answers initialize");
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                panic!(
+                    "LSP child {} phase initialize exceeded {SILENCE:?}; recent messages: {}",
+                    lsp.child.id(),
+                    lsp.recent_methods()
+                );
+            };
+            let message = match lsp.messages.recv_timeout(remaining) {
+                Ok(message) if std::time::Instant::now() < deadline => message,
+                Ok(_) => panic!(
+                    "LSP child {} phase initialize exceeded {SILENCE:?}; recent messages: {}",
+                    lsp.child.id(),
+                    lsp.recent_methods()
+                ),
+                Err(error) => panic!(
+                    "LSP child {} phase initialize failed after {SILENCE:?}: {error}; recent messages: {}",
+                    lsp.child.id(),
+                    lsp.recent_methods()
+                ),
+            };
             lsp.note_seen(&message);
             if message["id"] == 1 {
                 break;
@@ -170,28 +194,38 @@ impl Lsp {
     /// so the failure names the condition instead of "Timeout".
     #[track_caller]
     pub fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
-        self.wait_for_judging(SILENCE, predicate)
+        self.wait_for_judging(SILENCE, BUSY_CEILING, predicate)
     }
 
     /// [`Self::wait_for`] with the silence window spelled out — for the control that
     /// shows the judgement can fail, without sitting through the real window.
     #[track_caller]
-    pub fn wait_for_judging(&self, silence: Duration, predicate: impl Fn(&Value) -> bool) -> Value {
-        /// How long a server may stay busy and silent before the wait gives up anyway:
-        /// a bound on a runaway, not a measure of anything the tests expect.
-        const BUSY_CEILING: Duration = Duration::from_secs(10 * 60);
-
+    pub fn wait_for_judging(
+        &self,
+        silence: Duration,
+        busy_ceiling: Duration,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
         let caller = std::panic::Location::caller();
         let started = std::time::Instant::now();
+        let deadline = started + busy_ceiling;
         loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let cpu_before = self.server_cpu_ticks();
-            if let Some(message) = self.wait_for_within(silence, |_| true) {
+            let message = self.wait_for_within(silence.min(remaining), |_| true);
+            let waited = started.elapsed();
+            assert!(
+                waited < busy_ceiling,
+                "waiting at {caller} for {waited:?}: total deadline elapsed for LSP child {}; recent messages: {}",
+                self.child.id(),
+                self.recent_methods(),
+            );
+            if let Some(message) = message {
                 if predicate(&message) {
                     return message;
                 }
                 continue;
             }
-            let waited = started.elapsed();
             let cpu_after = self.server_cpu_ticks();
             let worked = match (cpu_before, cpu_after) {
                 (Some(before), Some(after)) => after > before,
@@ -203,14 +237,8 @@ impl Lsp {
                 "waiting at {caller} for {waited:?}: the server answered nothing for \
                  {silence:?} and used no CPU in that time, so it is not working towards \
                  an answer — the awaited condition is one it will not meet. Last messages \
-                 seen: {}",
-                self.recent_methods(),
-            );
-            assert!(
-                waited < BUSY_CEILING,
-                "waiting at {caller} for {waited:?}: the server stayed busy but answered \
-                 nothing for {silence:?} at a stretch, past the {BUSY_CEILING:?} ceiling. \
-                 Last messages seen: {}",
+                 seen from LSP child {}: {}",
+                self.child.id(),
                 self.recent_methods(),
             );
         }
@@ -266,17 +294,23 @@ impl Lsp {
     /// `None` means silence and nothing else. A server that has exited is not silence —
     /// it is the answer — so it fails here rather than leaving the caller to provoke a
     /// process that is gone, as fast as the loop can go round.
+    #[track_caller]
     pub fn wait_for_within(
         &self,
         timeout: Duration,
         predicate: impl Fn(&Value) -> bool,
     ) -> Option<Value> {
+        let caller = std::panic::Location::caller();
+        let pid = self.child.id();
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
             let pending = self.pending.lock().unwrap().pop_front();
             match pending.map(Ok).unwrap_or_else(|| self.messages.recv_timeout(remaining)) {
                 Ok(message) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
                     self.note_seen(&message);
                     if predicate(&message) {
                         return Some(message);
@@ -284,7 +318,10 @@ impl Lsp {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => return None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("the server exited instead of answering")
+                    panic!(
+                        "LSP child {pid} phase message wait at {caller}: output closed before matching a message; recent messages: {}",
+                        self.recent_methods()
+                    )
                 }
             }
         }
@@ -298,6 +335,67 @@ impl Lsp {
         self.send(json!({
             "jsonrpc": "2.0", "method": "$/setTrace", "params": {"value": "off"}
         }));
+    }
+
+    pub fn wait_for_exit_within(
+        &mut self,
+        timeout: Duration,
+        phase: &str,
+    ) -> Result<Option<std::process::ExitStatus>, String> {
+        let pid = self.child.id();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Ok(Some(status)),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "LSP child {pid} phase {phase}: process poll failed: {error}; recent messages: {}",
+                        self.recent_methods()
+                    ));
+                }
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+        }
+    }
+
+    fn stop_child(
+        &mut self,
+        phase: &str,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let pid = self.child.id();
+        let poll_error = match self.wait_for_exit_within(Duration::ZERO, phase) {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        if let Err(error) = self.child.kill() {
+            match self.wait_for_exit_within(Duration::ZERO, phase) {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(poll_error) => {
+                    return Err(format!(
+                        "LSP child {pid} phase {phase}: kill failed: {error}; {poll_error}"
+                    ));
+                }
+            }
+            return Err(format!(
+                "LSP child {pid} phase {phase}: kill failed: {error}; prior process poll: {}; recent messages: {}",
+                poll_error.as_deref().unwrap_or("no process poll error"),
+                self.recent_methods()
+            ));
+        }
+        self.wait_for_exit_within(timeout, phase)?.ok_or_else(|| {
+            format!(
+                "LSP child {pid} phase {phase}: did not exit within {timeout:?} after kill; recent messages: {}",
+                self.recent_methods()
+            )
+        })
     }
 
     pub fn open(&mut self, path: &Path, text: &str) -> Value {
@@ -325,13 +423,28 @@ impl Lsp {
         let response = self.request(id, "shutdown", Value::Null);
         assert!(response["error"].is_null(), "shutdown request failed: {response}");
         self.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-        self.child.wait().expect("LSP child exits after shutdown/exit")
+        match self.wait_for_exit_within(PROCESS_SHUTDOWN_TIMEOUT, "shutdown/exit") {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                let pid = self.child.id();
+                let recent = self.recent_methods();
+                let cleanup = self.stop_child("shutdown timeout cleanup", PROCESS_CLEANUP_TIMEOUT);
+                panic!(
+                    "LSP child {pid} phase shutdown/exit exceeded {PROCESS_SHUTDOWN_TIMEOUT:?}; recent messages: {recent}; forced cleanup: {cleanup:?}"
+                );
+            }
+            Err(error) => {
+                let cleanup = self.stop_child("shutdown error cleanup", PROCESS_CLEANUP_TIMEOUT);
+                panic!("{error}; forced cleanup: {cleanup:?}");
+            }
+        }
     }
 }
 
 impl Drop for Lsp {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
+            eprintln!("{error}");
+        }
     }
 }

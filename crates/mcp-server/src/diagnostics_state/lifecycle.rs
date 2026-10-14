@@ -812,6 +812,7 @@ impl DiagnosticsState {
         // model the LSP server and CLI `analyze` use.
         let crate::graph::input::BatchLoad { mut db, unread } =
             db_for_files_lazy(&source_root, files, &configs, None);
+        super::resident::apply_project_compatibility_mode(&mut db, project.compatibility_mode());
         // A file whose bytes could not be read is NOT served: it is held out of
         // `by_path` and answered as "known but unreadable", and the retry list
         // re-reads it every window. Its baseline fingerprint stays — the scan did

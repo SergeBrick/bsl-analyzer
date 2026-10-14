@@ -10,7 +10,8 @@ mod load;
 mod metadata;
 
 pub use load::{
-    build_source_root, register_files_disk_backed, set_file_text_source, FileTextSource,
+    apply_source_batch, build_source_root, register_files_disk_backed, set_file_text_source,
+    BatchTextSource, FileTextSource, SourceBatchChange, SourceBatchEffects,
 };
 pub use metadata::{bootstrap_metadata_substrate, refresh_metadata_substrate, VfsWrite};
 

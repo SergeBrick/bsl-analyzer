@@ -186,7 +186,7 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
 
     let started = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lsp.wait_for_judging(silence, |_| false);
+        lsp.wait_for_judging(silence, common::BUSY_CEILING, |_| false);
     }));
     let waited = started.elapsed();
 
@@ -202,4 +202,65 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
         waited < SILENCE,
         "an idle server is judged on its own silence window, not the default: {waited:?}",
     );
+}
+
+#[test]
+fn a_continuous_unrelated_message_stream_cannot_extend_a_wait_past_its_ceiling() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    let stream_for = Duration::from_millis(300);
+    let producer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + stream_for;
+        while std::time::Instant::now() < deadline {
+            if sender.send(json!({"method": "$/testNoise"})).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lsp.wait_for_judging(Duration::from_millis(20), Duration::from_millis(80), |_| false);
+    }));
+    let waited = started.elapsed();
+    let payload = outcome.expect_err("unrelated traffic cannot satisfy the requested condition");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("total deadline elapsed"),
+        "the verdict names the total bound: {message}"
+    );
+    assert!(message.contains("$/testNoise"), "the verdict names the unrelated traffic: {message}");
+    assert!(waited < stream_for, "the wait ended before the bounded noise producer: {waited:?}");
+    producer.join().expect("the bounded noise producer exits");
+    lsp.messages = original;
+}
+
+#[test]
+fn an_owned_live_lsp_child_is_killed_and_reaped_with_a_bounded_wait() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let pid = lsp.child.id();
+    assert!(lsp.child.try_wait().unwrap().is_none(), "owned LSP child {pid} is running");
+
+    assert_eq!(
+        lsp.wait_for_exit_within(Duration::from_millis(20), "process deadline control").unwrap(),
+        None,
+        "a running child remains alive when its bounded poll expires"
+    );
+    assert!(lsp.child.try_wait().unwrap().is_none(), "the deadline poll did not kill child {pid}");
+
+    lsp.child.kill().expect("the owned LSP child can be killed directly");
+    let status = lsp
+        .wait_for_exit_within(Duration::from_secs(2), "process cleanup control")
+        .expect("the post-kill process poll succeeds")
+        .expect("the killed LSP child is reaped within the bound");
+    assert!(!status.success(), "forced cleanup is not a graceful LSP shutdown");
+    assert!(lsp.child.try_wait().unwrap().is_some(), "owned LSP child {pid} was reaped");
 }

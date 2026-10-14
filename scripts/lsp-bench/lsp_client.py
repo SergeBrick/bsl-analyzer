@@ -53,6 +53,7 @@ class Response:
     result: object
     error: dict | None
     elapsed_s: float
+    received_at: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -162,11 +163,12 @@ class LspClient:
                 message = self._read_message()
                 if message is None:
                     break
+                received_at = time.monotonic()
                 self.transcript.add("in", message)
                 if "method" in message and "id" in message:
                     self._handle_server_request(message)
                 elif "id" in message:
-                    self._route_response(message)
+                    self._route_response(message, received_at)
                 else:
                     self._handle_notification(message)
         except ProtocolError as exc:
@@ -184,11 +186,12 @@ class LspClient:
             waiter["error"] = reason
             waiter["event"].set()
 
-    def _route_response(self, message: dict) -> None:
+    def _route_response(self, message: dict, received_at: float) -> None:
         with self._pending_lock:
             waiter = self._pending.pop(message["id"], None)
         if waiter is not None:
             waiter["message"] = message
+            waiter["received_at"] = received_at
             waiter["event"].set()
 
     def _handle_server_request(self, message: dict) -> None:
@@ -230,17 +233,22 @@ class LspClient:
 
     def wait_response(self, request_id: int, waiter: dict, timeout: float | None = None) -> Response:
         timeout = self.default_timeout if timeout is None else timeout
-        if not waiter["event"].wait(timeout):
+        deadline = time.monotonic() + timeout
+        if not waiter["event"].wait(max(0.0, deadline - time.monotonic())):
             with self._pending_lock:
                 self._pending.pop(request_id, None)
             raise RequestTimeout(f"request {request_id} timed out after {timeout}s")
         if waiter["error"] is not None:
             raise ProtocolError(waiter["error"])
+        received_at = waiter["received_at"]
+        if received_at is None or received_at > deadline:
+            raise RequestTimeout(f"request {request_id} response arrived after {timeout}s deadline")
         message = waiter["message"]
         return Response(
             result=message.get("result"),
             error=message.get("error"),
-            elapsed_s=time.monotonic() - waiter["t0"],
+            elapsed_s=received_at - waiter["t0"],
+            received_at=received_at,
         )
 
     def request(self, method: str, params, timeout: float | None = None) -> Response:

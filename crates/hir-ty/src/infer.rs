@@ -4426,6 +4426,15 @@ impl<'db> InferenceContext<'db> {
             ));
         }
 
+        // An exported variable of an application module is a user global, so it ranks
+        // here exactly as on the bare-name read path: below a common module of the same
+        // name, above platform globals. Its value is untyped, so a member called through
+        // it is not this call site's to judge; the read of the receiver has already
+        // checked the environments the variable is visible in.
+        if self.global_read_export(module_name).is_some() {
+            return BareReceiverDispatch::Unhandled;
+        }
+
         // A manager module that calls one of its own methods through the object's
         // own name (`ОбъектМетаданных.Метод()`) is a redundant self-qualified
         // access — the method is reachable directly. The name denotes this

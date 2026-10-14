@@ -5,7 +5,10 @@ use rmcp::ErrorData as McpError;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
-const DEFAULT_AUTO_ATTACH: &[&str] = &["Client", "Server", "HTTPService"];
+/// A FILE infobase produces `ManagedClient` and `ServerEmulation` and nothing else, so leaving
+/// those two out made file-mode debugging attach nothing at all.
+const DEFAULT_AUTO_ATTACH: &[&str] =
+    &["Client", "ManagedClient", "Server", "ServerEmulation", "HTTPService"];
 
 /// A deep stack, a frame full of locals, or an evaluated collection has no size of its own,
 /// so the state-reading actions render through the output budget.
@@ -44,13 +47,9 @@ pub fn debug_attach(
     let AttachParams { host, port, infobase, config_root, workspace_root, extensions, auto_attach } =
         params;
 
-    let root = if let Some(cr) = config_root {
-        std::path::PathBuf::from(cr)
-    } else if let Some(wr) = workspace_root {
-        wr.to_path_buf()
-    } else {
-        std::path::PathBuf::from(".")
-    };
+    // The workspace root is not the configuration root whenever the configuration lives in a
+    // subdirectory — the normal layout, and the one `--configuration-root` declares.
+    let (root, root_origin) = resolve_config_root(config_root, workspace_root);
 
     let ext_pairs: Vec<(String, std::path::PathBuf)> =
         extensions.iter().map(|e| (e[0].clone(), std::path::PathBuf::from(&e[1]))).collect();
@@ -68,29 +67,106 @@ pub fn debug_attach(
         config_root: root.clone(),
         extensions: ext_pairs,
         auto_attach: attach_types.clone(),
+        // The OS temp directory is per user, and so is the takeover: a session may inherit only
+        // a registration the same user's dead session left behind.
+        lease_dir: Some(std::env::temp_dir().join("bsl-analyzer-debug")),
     };
     let session = DebugSession::connect(config)
         .map_err(|e| McpError::internal_error(format!("Failed to connect: {e}"), None))?;
-    let targets = session.targets().map_err(|e| {
-        McpError::internal_error(format!("Connected but failed to get targets: {e}"), None)
-    })?;
-    let mut out = format!("Connected to debug server {host}:{port}, infobase: {infobase}\n");
-    let _ = writeln!(out, "Config root: {}", root.display());
+    let targets = session.known_targets().to_vec();
+    // `attachDebugUI` answers `registered` for any alias, a misspelled one included, so this
+    // line says what was registered and claims nothing about reaching that infobase.
+    let mut out =
+        format!("Debugger registered on {host}:{port} under infobase alias '{infobase}'\n");
+    let _ = writeln!(out, "Config root: {} ({root_origin})", root.display());
     let _ = writeln!(out, "Modules indexed: {}", session.module_count());
-    let _ = writeln!(out, "Auto-attach: {}\n", attach_types.join(", "));
+    let _ = writeln!(out, "Auto-attach: {}", attach_types.join(", "));
+    if session.reclaimed_dead_session() {
+        let lease = session.lease_path().map(|p| p.display().to_string()).unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "Took over the registration of an earlier session of this user that ended without \
+             disconnect (lease {lease})"
+        );
+    }
+    for warning in session.setup_warnings() {
+        let _ = writeln!(out, "Warning: {warning}");
+    }
+    out.push('\n');
     if targets.is_empty() {
         out.push_str(
-            "No debug targets available yet. \
-             Start a 1C client or trigger an HTTP service request to begin debugging.\n",
+            "No debug targets found: either no session of this infobase is running, or the \
+             alias does not match the one its sessions report. The debug server accepts any \
+             alias, so registration alone does not confirm it — a file infobase is always \
+             `DefAlias`, a cluster infobase uses its name in the cluster.\n",
         );
     } else {
         let _ = writeln!(out, "Available targets: {}", targets.len());
         for t in &targets {
-            let _ = writeln!(out, "- {} ({})", t.user_name, t.id);
+            // The state comes from `getDbgAllTargetStates`; when that was refused it is empty,
+            // and printing it would invent a field no answer had.
+            let state =
+                if t.state.is_empty() { String::new() } else { format!(", state {}", t.state) };
+            let _ =
+                writeln!(out, "- {} {} (alias {}{state})", t.target_type, t.id, t.infobase_alias);
+        }
+        let _ = writeln!(out, "Attached: {} of {}", session.attached_count(), targets.len());
+    }
+    let halted = session.suspended_at_attach();
+    if !halted.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nHalted before this attach: {} — its client is frozen until resumed. wait_stop \
+             shows where; continue resumes it (`target` picks one by id).",
+            halted.len()
+        );
+        for id in halted {
+            let kind = session.target_type_of(id).unwrap_or("type unknown");
+            let _ = writeln!(out, "- {id} ({kind})");
         }
     }
     *guard = Some(session);
     Ok(text_within_budget(out, max_output_tokens, TARGETS_NOTE))
+}
+
+/// Where the module index should be rooted, and which of the three sources said so.
+fn resolve_config_root(
+    config_root: Option<&str>,
+    workspace_root: Option<&std::path::Path>,
+) -> (std::path::PathBuf, &'static str) {
+    if let Some(cr) = config_root {
+        return (std::path::PathBuf::from(cr), "explicit config_root");
+    }
+    let Some(workspace_root) = workspace_root else {
+        return (std::path::PathBuf::from("."), "workspace root — no Configuration.xml found");
+    };
+    // A project that cannot be built is a project without a configuration root, not a reason to
+    // refuse the attach.
+    let from_project = crate::project::at(workspace_root)
+        .ok()
+        .and_then(|p| p.configuration_path().map(|c| c.to_path_buf()));
+    match from_project {
+        Some(path) => (plain_path(path), "project configuration root"),
+        None => (
+            plain_path(workspace_root.to_path_buf()),
+            "workspace root — no Configuration.xml found",
+        ),
+    }
+}
+
+/// The workspace root arrives canonicalized, and the module index is built by joining onto it, so
+/// a `\\?\` prefix left in place would prefix every path this tool prints back. Only a drive path
+/// is unwrapped: stripping the prefix from `\\?\UNC\...` would produce a path to nowhere.
+fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else {
+        return path;
+    };
+    let is_drive = rest.as_bytes().get(1) == Some(&b':');
+    if is_drive {
+        std::path::PathBuf::from(rest)
+    } else {
+        path
+    }
 }
 
 pub fn debug_disconnect(
@@ -99,8 +175,22 @@ pub fn debug_disconnect(
     let mut guard = session_mutex.lock().unwrap();
     let session =
         guard.take().ok_or_else(|| McpError::invalid_params("No active debug session", None))?;
-    let _ = session.disconnect();
-    Ok(CallToolResult::success(vec![ContentBlock::text("Debug session disconnected")]))
+    let report = session
+        .disconnect()
+        .map_err(|e| McpError::internal_error(format!("Failed to disconnect: {e}"), None))?;
+    let mut out = String::from("Debug session disconnected");
+    if !report.resumed.is_empty() {
+        let _ = write!(
+            out,
+            "\nResumed {} halted target(s) first, so their clients are not left frozen: {}",
+            report.resumed.len(),
+            report.resumed.join(", ")
+        );
+    }
+    for warning in &report.warnings {
+        let _ = write!(out, "\nWarning: {warning}");
+    }
+    Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
 }
 
 pub fn debug_set_breakpoint(
@@ -161,12 +251,13 @@ pub fn debug_remove_breakpoint(
 
 pub fn debug_continue(
     session_mutex: &Arc<Mutex<Option<DebugSession>>>,
+    target: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let mut guard = session_mutex.lock().unwrap();
     let session =
         guard.as_mut().ok_or_else(|| McpError::invalid_params("No active debug session", None))?;
     session
-        .continue_execution()
+        .continue_target(target)
         .map_err(|e| McpError::internal_error(format!("Failed to continue: {e}"), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text("Execution continued")]))
 }
@@ -174,6 +265,7 @@ pub fn debug_continue(
 pub fn debug_step(
     session_mutex: &Arc<Mutex<Option<DebugSession>>>,
     action: &str,
+    target: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let mut guard = session_mutex.lock().unwrap();
     let session =
@@ -190,7 +282,7 @@ pub fn debug_step(
         }
     };
     session
-        .step(step_action)
+        .step_target(step_action, target)
         .map_err(|e| McpError::internal_error(format!("Failed to step: {e}"), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(format!("Step {action}"))]))
 }
@@ -217,10 +309,25 @@ pub fn debug_wait_stop(
                     let _ = writeln!(out, "Exception: {message}\n");
                     "exception"
                 }
+                bsl_debug::session::StopReason::Suspended => "halted before this attach",
             };
             let _ = writeln!(out, "Stopped (reason: {reason})");
-            let _ = writeln!(out, "- Module: {}", event.module);
-            let _ = writeln!(out, "- Line: {}", event.line);
+            if let Some(detail) = &event.detail {
+                let _ = writeln!(out, "- Position unknown: {detail}");
+            } else {
+                let _ = writeln!(out, "- Module: {}", event.module);
+                let _ = writeln!(out, "- Line: {}", event.line);
+            }
+            let target_kind =
+                session.target_type_of(&event.target_id).unwrap_or("type unknown").to_string();
+            let _ = writeln!(out, "- Target: {} ({target_kind})", event.target_id);
+            let stopped = session.stopped_count();
+            if stopped > 1 {
+                let _ = writeln!(
+                    out,
+                    "- {stopped} targets are stopped; the commands below act on this one."
+                );
+            }
             if !event.stack.is_empty() {
                 let _ = writeln!(out, "\nCall stack:");
                 for (i, frame) in event.stack.iter().enumerate() {
@@ -229,9 +336,19 @@ pub fn debug_wait_stop(
             }
             Ok(text_within_budget(out, max_output_tokens, STACK_NOTE))
         }
-        None => Ok(CallToolResult::success(vec![ContentBlock::text(
-            "Timeout — no stop event received",
-        )])),
+        None => {
+            let mut out = String::from("Timeout — no stop event received");
+            // A debugger the server no longer counts as registered receives no event at all; a
+            // bare timeout would read as "the code did not run".
+            if let Some(error) = session.event_channel_error() {
+                let _ = write!(
+                    out,
+                    "\nThe debug server refuses this debugger's event channel, so no stop can \
+                     arrive: {error}\nDisconnect and attach again."
+                );
+            }
+            Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        }
     }
 }
 

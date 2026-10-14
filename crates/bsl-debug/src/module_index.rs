@@ -149,6 +149,7 @@ impl ModuleIndex {
             );
             if let Some(ext_dir) = ext_dir.filter(|d| d.is_dir()) {
                 self.index_bsl_files(extension, &config_object_id, "", &ext_dir)?;
+                self.register_root_names(extension, &config_object_id, &ext_dir)?;
             }
         }
 
@@ -375,6 +376,52 @@ impl ModuleIndex {
         Ok(())
     }
 
+    /// Names the configuration's own modules — `МодульУправляемогоПриложения`, `МодульСеанса`
+    /// and friends. Their name is the kind label alone: they belong to the configuration, so
+    /// there is no type or object to prefix: [`Self::register_names`]'s `{type}.{object}.{kind}`
+    /// format does not apply here.
+    fn register_root_names(
+        &mut self,
+        extension: &str,
+        object_id: &str,
+        ext_dir: &Path,
+    ) -> Result<(), DebugError> {
+        for entry in fs::read_dir(ext_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !bsl_conventions::has_extension(&path, bsl_conventions::BSL_EXTENSION) {
+                continue;
+            }
+
+            let kind = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(bsl_conventions::conventional_of);
+
+            let property_id = match property_id_for_module("", kind) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let name = crate::constants::module_kind_label(property_id).to_string();
+            // An extension has a session module of its own and would claim the same bare name;
+            // the configuration is scanned first, so first writer wins.
+            if self.by_name.contains_key(&name) {
+                continue;
+            }
+
+            let module_id = ModuleId {
+                extension: extension.to_string(),
+                object_id: object_id.to_string(),
+                property_id: property_id.to_string(),
+            };
+            self.by_name.insert(name, (module_id, path));
+        }
+
+        Ok(())
+    }
+
     fn register_names(
         &mut self,
         extension: &str,
@@ -542,6 +589,30 @@ mod case_parity_tests {
             "<?xml version=\"1.0\"?><MetaDataObject><Configuration \
              uuid=\"00000000-0000-0000-0000-0000000000c0\"></Configuration></MetaDataObject>",
         );
+    }
+
+    /// Модули самой конфигурации платформа называет одним видом («МодульУправляемогоПриложения»),
+    /// и именно так их называют стеки вызовов, — без этих имён точку останова в startup-коде
+    /// поставить нечем.
+    #[test]
+    fn configuration_level_modules_resolve_by_their_bare_kind_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        root_with_config(root, "Configuration.xml");
+        write(&root.join("Ext/ManagedApplicationModule.bsl"), "//");
+        write(&root.join("Ext/SessionModule.bsl"), "//");
+
+        let index = ModuleIndex::scan(root, &[]).unwrap();
+
+        for label in ["МодульУправляемогоПриложения", "МодульСеанса"]
+        {
+            assert!(
+                index.resolve_name(label).is_some(),
+                "{label} должен разрешаться по имени; есть: {:?}",
+                index.all_names()
+            );
+            assert!(index.all_names().contains(&label), "{label} должен быть в all_names()");
+        }
     }
 
     /// В семействах одиночных модулей вид даёт КАТАЛОГ, а не имя файла:

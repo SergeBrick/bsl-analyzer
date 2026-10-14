@@ -353,6 +353,7 @@ fn do_attach(
         config_root,
         extensions: Vec::new(),
         auto_attach: vec!["Client".to_string(), "Server".to_string()],
+        lease_dir: None,
     };
 
     let session = DebugSession::connect(config)?;
@@ -515,8 +516,8 @@ fn do_variables(
 }
 
 fn do_step(action: StepAction, state: &Arc<Mutex<DapState>>) -> Result<(), String> {
-    let guard = state.lock().unwrap();
-    let session = guard.session.as_ref().ok_or("no active debug session")?;
+    let mut guard = state.lock().unwrap();
+    let session = guard.session.as_mut().ok_or("no active debug session")?;
     session.step(action).map_err(|e| e.to_string())
 }
 
@@ -571,6 +572,11 @@ fn spawn_event_listener(
                         types::StoppedEventReason::Exception,
                         Some(message.clone()),
                         Some("Paused on exception".to_string()),
+                    ),
+                    StopReason::Suspended => (
+                        types::StoppedEventReason::Pause,
+                        None,
+                        Some("Was paused before this debugger attached".to_string()),
                     ),
                 };
 

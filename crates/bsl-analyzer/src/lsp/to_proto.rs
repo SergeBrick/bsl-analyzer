@@ -355,6 +355,7 @@ pub fn semantic_tokens_legend() -> SemanticTokensLegend {
         SemanticTokenType::ENUM_MEMBER,
         SemanticTokenType::NAMESPACE,
         SemanticTokenType::CLASS,
+        SemanticTokenType::MODIFIER,
     ];
 
     let token_modifiers = vec![
@@ -387,6 +388,7 @@ fn token_type_index(tag: HlTag) -> u32 {
         HlTag::EnumMember => 13,
         HlTag::Namespace => 14,
         HlTag::Class => 15,
+        HlTag::CompilerDirective => 16,
     }
 }
 

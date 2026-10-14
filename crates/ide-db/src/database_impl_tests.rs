@@ -8004,13 +8004,26 @@ fn borrowed_form_db(
     roots: &[(Option<&str>, &std::path::Path, RootKind)],
     modules: &[std::path::PathBuf],
 ) -> RootDatabaseImpl {
+    borrowed_form_db_with_registered_modules(
+        roots,
+        modules,
+        &(0..modules.len()).collect::<Vec<_>>(),
+    )
+}
+
+fn borrowed_form_db_with_registered_modules(
+    roots: &[(Option<&str>, &std::path::Path, RootKind)],
+    modules: &[std::path::PathBuf],
+    registered_modules: &[usize],
+) -> RootDatabaseImpl {
     let mut db = RootDatabaseImpl::new();
     let mut file_set = FileSet::new();
     for (idx, path) in modules.iter().enumerate() {
         file_set.insert(FileId(idx as u32), VfsPath::new(path.to_string_lossy().as_ref()));
     }
     db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
-    for (idx, path) in modules.iter().enumerate() {
+    for &idx in registered_modules {
+        let path = &modules[idx];
         db.set_file_source_root(FileId(idx as u32), SourceRootId(0));
         db.set_file_text(FileId(idx as u32), &std::fs::read_to_string(path).unwrap());
     }
@@ -8041,6 +8054,92 @@ fn borrowed_form_db(
         source_exclusions: Default::default(),
     });
     db
+}
+
+#[test]
+fn borrowed_form_batch_resolves_base_before_base_registration() {
+    let root = borrowed_form_fixture_root();
+    let base = root.join("base");
+    let extension = root.join("extension");
+    let modules = vec![
+        borrowed_form_module(&extension, "Заказ", "ФормаДокумента"),
+        borrowed_form_module(&base, "Заказ", "ФормаДокумента"),
+    ];
+    let mut db = borrowed_form_db_with_registered_modules(
+        &[(None, &base, RootKind::Base), (Some("Расширение"), &extension, RootKind::Extension)],
+        &modules,
+        &[0],
+    );
+
+    let inherited = borrowed_form(&db, FileId(0))
+        .expect("extension form metadata resolves its base path across batch boundaries");
+    assert_eq!(borrowed_form_names(&inherited), ["Объект", "БазовыйРеквизитФормы"]);
+    assert!(db.files.try_file_text(FileId(1)).is_none());
+    assert!(db.files.try_file_revision(FileId(1)).is_none());
+
+    let unknown = FileId(99);
+    assert_eq!(
+        crate::vfs_helpers::get_file_path(&db, unknown),
+        None,
+        "only exact members of the known BSL root have a fallback path"
+    );
+    let unknown_metadata =
+        crate::queries::module_metadata_query(&db, base_db::FileIdInput::new(&db, unknown));
+    assert_eq!(unknown_metadata.module_type, bsl_metadata::ModuleType::Unknown);
+
+    let root_input = db.source_root_input(SourceRootId(0));
+    let mut file_set = root_input.root(&db).file_set().clone();
+    file_set.remove(FileId(1));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    let after_remove = borrowed_form(&db, FileId(0)).expect("extension form still loads");
+    assert!(
+        !borrowed_form_names(&after_remove).contains(&"БазовыйРеквизитФормы"),
+        "removing the base FileId invalidates the inherited metadata query"
+    );
+
+    let root_input = db.source_root_input(SourceRootId(0));
+    let mut file_set = root_input.root(&db).file_set().clone();
+    file_set.insert(FileId(1), VfsPath::new(modules[1].to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    let after_readd = borrowed_form(&db, FileId(0)).expect("re-added base form resolves");
+    assert!(borrowed_form_names(&after_readd).contains(&"БазовыйРеквизитФормы"));
+}
+
+#[test]
+fn file_path_lookup_uses_explicit_root_and_does_not_fallback_from_it() {
+    let mut db = RootDatabaseImpl::new();
+    let explicitly_mapped = FileId(7);
+    let explicitly_missing = FileId(8);
+    let mut bsl_files = FileSet::new();
+    bsl_files.insert(explicitly_mapped, VfsPath::new("/bsl/registered.bsl"));
+    bsl_files.insert(explicitly_missing, VfsPath::new("/bsl/missing-from-explicit-root.bsl"));
+    let mut other_files = FileSet::new();
+    other_files.insert(explicitly_mapped, VfsPath::new("/other/registered.bsl"));
+    let root1_only = FileId(9);
+    other_files.insert(root1_only, VfsPath::new("/other/root1-only.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(bsl_files));
+    db.set_source_root(SourceRootId(1), SourceRoot::new_local(other_files));
+    db.set_file_source_root(explicitly_mapped, SourceRootId(1));
+    db.set_file_source_root(explicitly_missing, SourceRootId(1));
+
+    assert_eq!(
+        crate::vfs_helpers::get_file_path(&db, explicitly_mapped),
+        Some(std::path::PathBuf::from("/other/registered.bsl")),
+        "an explicit root wins when the ID appears in more than one FileSet"
+    );
+    assert_eq!(
+        crate::vfs_helpers::get_file_path(&db, explicitly_missing),
+        None,
+        "an explicit mapping with no matching FileSet path must not fall back to root 0"
+    );
+    assert_eq!(
+        crate::vfs_helpers::get_file_path(&db, root1_only),
+        None,
+        "an unregistered ID in root 1 is not eligible for the BSL-root fallback"
+    );
+    let root1_metadata =
+        crate::queries::module_metadata_query(&db, base_db::FileIdInput::new(&db, root1_only));
+    assert_eq!(root1_metadata.module_type, bsl_metadata::ModuleType::Unknown);
 }
 
 fn borrowed_form(db: &RootDatabaseImpl, file: FileId) -> Option<Arc<bsl_metadata::Form>> {

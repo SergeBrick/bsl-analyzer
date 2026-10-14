@@ -7,7 +7,9 @@ use stdx::case::CaseExt;
 use dashmap::DashMap;
 use rustc_hash::FxHasher;
 
-use base_db::{FileIdInput, Files, RootQueryDb, SourceDatabase, SourceRoot, SourceRootId};
+use base_db::{
+    FileIdInput, Files, RootQueryDb, SourceDatabase, SourceRoot, SourceRootId, BSL_SOURCE_ROOT,
+};
 use hir::{
     ConditionalTree, DefDatabase, ItemTree, ModuleBodies, ModuleData, ModuleId, RegionTree,
     SymbolTree,
@@ -800,10 +802,10 @@ impl RootDatabaseImpl {
     /// The same ranking, addressed by PATH.
     ///
     /// A caller that already holds the path must not go back through the file id:
-    /// resolving a path from an id needs the global file→root mapping, which
-    /// PANICS for a file the database was never told about — and the graph builder
-    /// runs against per-batch databases that legitimately know only their own
-    /// slice. See `CommonModuleCandidates::reflagged` for the same asymmetry.
+    /// graph batches intentionally register text and file→root inputs only for
+    /// their own slice. Path lookup can use the shared root's exact FileId without
+    /// those registrations, but this method's caller already has the path.
+    /// See `CommonModuleCandidates::reflagged` for the same asymmetry.
     pub fn config_root_rank_for_path(
         &self,
         file_path: &std::path::Path,
@@ -2449,10 +2451,9 @@ impl RootDatabaseImpl {
             hir::MdoModuleRole::RecordSet => index.record_set_candidates(mdo_type, &name).to_vec(),
         };
 
-        // Paths come from the source root's own file set, never from the global
-        // file→root mapping: that mapping panics for a file the database has not
-        // been told about, and the graph builder resolves against per-batch
-        // databases holding only their own slice.
+        // Paths come from the source root's own file set: graph batches resolve
+        // against the full root while registering file→root inputs only for their
+        // own slice.
         let source_root = self.source_root_input(source_root_id).root(self);
         let file_set = source_root.file_set();
         let rank_of = |file: FileId| -> Option<usize> {
@@ -2673,9 +2674,14 @@ impl RootDatabaseImpl {
     }
 
     pub(crate) fn get_file_path(&self, file_id: FileId) -> Option<PathBuf> {
-        let source_root_input = self.file_source_root_input(file_id);
-        let source_root_id = source_root_input.source_root_id(self);
-        let source_root_input = self.source_root_input(source_root_id);
+        // Graph batch databases publish the full BSL FileSet but register a
+        // file→root input only for the batch whose text they load.
+        let source_root_id = self
+            .files
+            .try_file_source_root(file_id)
+            .map(|input| input.source_root_id(self))
+            .unwrap_or(BSL_SOURCE_ROOT);
+        let source_root_input = self.try_source_root_input(source_root_id)?;
         let source_root = source_root_input.root(self);
         let file_set = source_root.file_set();
         let vfs_path = file_set.path_for_file(&file_id)?;

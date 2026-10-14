@@ -184,6 +184,12 @@ impl<'a> AnalysisContext<'a> {
         bsl_platform::PlatformVersion::parse_release(&value)
     }
 
+    /// The compatibility mode the code compiles under; `None` when it hides
+    /// nothing (unknown, `DontUse`, or not a mode).
+    pub fn compatibility_mode(&self) -> Option<bsl_platform::PlatformVersion> {
+        hir::compat_mode::effective_mode(self.provider.compatibility_mode().as_deref())
+    }
+
     pub fn main_configuration(&self) -> Option<Arc<bsl_metadata::Configuration>> {
         self.visible_configurations()
             .into_iter()

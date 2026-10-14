@@ -289,6 +289,12 @@ pub trait AnalysisProvider {
         None
     }
 
+    /// The configuration's compatibility mode as written; `None` (the default for
+    /// providers without project settings) when unknown.
+    fn compatibility_mode(&self) -> Option<Arc<str>> {
+        None
+    }
+
     fn parse(&self, file_id: FileId) -> Parse<SyntaxNode>;
 
     fn file_text(&self, file_id: FileId) -> String;

@@ -1,3 +1,4 @@
+use crate::AnalysisContext;
 use bsl_platform::deprecation::{
     self, CompatibilityBucket, DeprecationEntry, DisplayKind, ElementKind, LifecycleGroup, Lookup,
 };
@@ -79,6 +80,28 @@ pub(crate) fn replacement_for_name(
 
 pub(crate) fn is_russian_alias(entry: &DeprecationEntry, input_name: &str) -> bool {
     input_name.fold_lower() == entry.ru.fold_lower()
+}
+
+/// Whether a call to the global function `replacement` compiles in this project:
+/// neither the configuration's compatibility mode hides it nor the project's minimum
+/// platform release predates it. A quick fix that swaps in a name the code cannot
+/// compile with would trade a warning for an error.
+pub(crate) fn replacement_compiles_here(replacement: &str, ctx: &AnalysisContext) -> bool {
+    if let (Some(mode), Some(visible_from)) =
+        (ctx.compatibility_mode(), hir::compat_mode::hidden_global(replacement))
+    {
+        if visible_from.release_newer_than(mode) {
+            return false;
+        }
+    }
+    if let (Some(min), Some(since)) =
+        (ctx.min_platform_version(), hir::min_platform::global_function(replacement))
+    {
+        if since.release_newer_than(min) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn deprecated_8312_replacement(name: &str, kind: DeprecatedKind8312) -> &'static str {

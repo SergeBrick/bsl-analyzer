@@ -70,6 +70,8 @@ fn object_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadata::M
         MetadataKind::ExternalReportObject => MdoType::ExternalReport,
         MetadataKind::ChartOfCharacteristicTypesObject => MdoType::ChartOfCharacteristicTypes,
         MetadataKind::ChartOfCalculationTypesObject => MdoType::ChartOfCalculationTypes,
+        // The module index files a constant's value-manager module in its object slot.
+        MetadataKind::ConstantValueManager => MdoType::Constant,
         MetadataKind::CatalogRef
         | MetadataKind::DocumentRef
         | MetadataKind::EnumRef
@@ -121,7 +123,8 @@ fn record_set_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadat
         | MetadataKind::ChartOfCalculationTypesObject
         | MetadataKind::ReportObject
         | MetadataKind::ExternalDataProcessorObject
-        | MetadataKind::ExternalReportObject => return None,
+        | MetadataKind::ExternalReportObject
+        | MetadataKind::ConstantValueManager => return None,
         MetadataKind::CatalogRef
         | MetadataKind::DocumentRef
         | MetadataKind::EnumRef

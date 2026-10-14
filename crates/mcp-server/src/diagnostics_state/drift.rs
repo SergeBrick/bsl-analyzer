@@ -104,6 +104,11 @@ impl DiagnosticsState {
         *lock_recover(&self.pre_force_probe) = Some(Box::new(f));
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_failure_probe(&self, f: impl FnOnce() + Send + 'static) {
+        *lock_recover(&self.failure_probe) = Some(Box::new(f));
+    }
+
     pub(super) fn poll_drift(&self) {
         let Some(root) = self.workspace_root.clone() else {
             return;
@@ -1094,6 +1099,30 @@ impl DiagnosticsState {
     #[cfg(test)]
     pub(super) fn fire_pre_force_probe(&self) {
         let probe = lock_recover(&self.pre_force_probe).take();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    /// Fire the failure snapshot's one-shot seam, if a test armed one — see
+    /// [`Inner::failure_probe`].
+    #[cfg(test)]
+    pub(super) fn fire_failure_probe(&self) {
+        let probe = lock_recover(&self.failure_probe).take();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_load_start_probe(&self, f: impl FnOnce() + Send + 'static) {
+        *lock_recover(&self.load_start_probe) = Some(Box::new(f));
+    }
+
+    /// Fire the loader's start seam, if a test armed one — see [`Inner::load_start_probe`].
+    #[cfg(test)]
+    pub(super) fn fire_load_start_probe(&self) {
+        let probe = lock_recover(&self.load_start_probe).take();
         if let Some(probe) = probe {
             probe();
         }
@@ -3494,7 +3523,7 @@ mod tests {
             std::thread::spawn(move || state.poll_drift_via_drain(&hub, &root))
         };
         entered_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the drain reaches the point where it holds the cursor");
 
         state.drop_cursor();
@@ -4372,7 +4401,7 @@ mod tests {
         assert!(roots.len() >= 2, "the scoped extension root must be declared: {roots:?}");
         let hub =
             WorkspaceChangeHub::start_targets(crate::change_hub::watch_targets_for(root, &roots));
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub must arm");
+        assert!(hub.wait_until_watching(), "the hub must arm");
 
         let mut state =
             DiagnosticsState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
@@ -5260,16 +5289,15 @@ mod tests {
         }
     }
 
-    /// Poll until the resident carries `path`, or the budget runs out. A fixed sleep
+    /// Poll until the resident carries `path`, or the poll budget runs out. A fixed sleep
     /// cannot replace this: the work being waited for is a full rebuild, whose duration
     /// is the machine's to decide.
-    fn resident_gains_file(
-        state: &DiagnosticsState,
-        path: &std::path::Path,
-        budget: Duration,
-    ) -> bool {
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
+    fn resident_gains_file(state: &DiagnosticsState, path: &std::path::Path) -> bool {
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(20),
+        );
+        while deadline.allows() {
             if resident_has_file(state, path) {
                 return true;
             }
@@ -5333,7 +5361,7 @@ mod tests {
             targets,
             Duration::from_secs(3600),
         );
-        assert!(hub.wait_until_watching(Duration::from_secs(5)), "the hub must arm");
+        assert!(hub.wait_until_watching(), "the hub must arm");
 
         let mut state =
             DiagnosticsState::for_workspace(root.to_path_buf()).with_change_hub(hub.clone());
@@ -5357,7 +5385,7 @@ mod tests {
         write_common_module(&cf, "Ковбой", true, "&НаСервере\nФункция Ф() Экспорт КонецФункции");
         let watched = cf.join("CommonModules/Ковбой/Ext/Module.bsl");
         assert!(
-            resident_gains_file(&state, &watched, Duration::from_secs(30)),
+            resident_gains_file(&state, &watched),
             "control: a change inside the watch must arrive with no force at all"
         );
         assert_eq!(
@@ -5393,7 +5421,7 @@ mod tests {
         state.force_rescan();
         // The forced scan surfaces files from the declared extension root.
         assert!(
-            resident_gains_file(&state, &ext_module, Duration::from_secs(30)),
+            resident_gains_file(&state, &ext_module),
             "the forced re-scan must surface files under the root the hub omitted"
         );
         assert!(

@@ -303,6 +303,7 @@ where
 }
 
 use crate::graph::GraphStatus;
+use crate::tools::resident::FailureAnswer;
 use std::collections::BTreeSet;
 
 use rmcp::handler::server::tool::ToolRouter;
@@ -1242,6 +1243,13 @@ impl McpServer {
         self.state.shutdown();
     }
 
+    /// [`shutdown`](Self::shutdown) with a caller-chosen bound on how long the owners may take
+    /// to leave. The bound covers the owners' wait only; the stops before it are unchanged.
+    /// See [`SharedState::shutdown_within`].
+    pub fn shutdown_within(&self, owners_budget: std::time::Duration) {
+        self.state.shutdown_within(owners_budget);
+    }
+
     pub(crate) fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
         self.state.scope_transport_stop()
     }
@@ -1442,9 +1450,16 @@ impl McpServer {
                         "metadata is only available in the workspace profile",
                         None,
                     )),
-                    ResidentOutcome::Failed(msg) => {
-                        Err(McpError::internal_error(format!("metadata database: {msg}"), None))
-                    }
+                    ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
+                        FailureAnswer::Failed { reason, data } => Err(McpError::internal_error(
+                            format!("metadata database: {reason}"),
+                            Some(data),
+                        )),
+                        // The lifecycle moved on between the read and the snapshot: the retry
+                        // is running (or a resident is being published), so the answer is this
+                        // tool's not-ready envelope — never a failure with no way back.
+                        FailureAnswer::Moved(report) => Ok(tools::metadata::loading(&report)),
+                    },
                 }
             },
             move || tools::metadata::loading(&retry_diag.status_report()),
@@ -2355,9 +2370,14 @@ impl McpServer {
                             None,
                         ))
                     }
-                    ResidentOutcome::Failed(msg) => {
-                        return Err(tools::symbol_info::database_error(msg))
-                    }
+                    ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
+                        FailureAnswer::Failed { reason, data } => {
+                            return Err(tools::symbol_info::database_error(reason, data))
+                        }
+                        FailureAnswer::Moved(report) => {
+                            return Ok(tools::symbol_info::loading(&report))
+                        }
+                    },
                 };
 
                 graph.read_optional(|snapshot| {
@@ -2559,10 +2579,15 @@ impl McpServer {
                             "references is only available in the workspace profile",
                             None,
                         )),
-                        ResidentOutcome::Failed(msg) => Err(McpError::internal_error(
-                            format!("references database: {msg}"),
-                            None,
-                        )),
+                        ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
+                            FailureAnswer::Failed { reason, data } => {
+                                Err(McpError::internal_error(
+                                    format!("references database: {reason}"),
+                                    Some(data),
+                                ))
+                            }
+                            FailureAnswer::Moved(report) => Ok(tools::references::loading(&report)),
+                        },
                     }
                 })
             },
@@ -2720,9 +2745,13 @@ impl McpServer {
                         "diagnostics 'file' is only available in the workspace profile",
                         None,
                     )),
-                    ResidentOutcome::Failed(msg) => {
-                        Err(McpError::internal_error(format!("diagnostics database: {msg}"), None))
-                    }
+                    ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
+                        FailureAnswer::Failed { reason, data } => Err(McpError::internal_error(
+                            format!("diagnostics database: {reason}"),
+                            Some(data),
+                        )),
+                        FailureAnswer::Moved(report) => Ok(tools::diagnostics::loading(&report)),
+                    },
                 }
             },
             move || tools::diagnostics::loading(&retry_diag.status_report()),
@@ -2815,9 +2844,13 @@ impl McpServer {
                         "diagnostics 'workspace' is only available in the workspace profile",
                         None,
                     )),
-                    ResidentOutcome::Failed(msg) => {
-                        Err(McpError::internal_error(format!("diagnostics database: {msg}"), None))
-                    }
+                    ResidentOutcome::Failed(msg) => match session.resident_failure(&msg) {
+                        FailureAnswer::Failed { reason, data } => Err(McpError::internal_error(
+                            format!("diagnostics database: {reason}"),
+                            Some(data),
+                        )),
+                        FailureAnswer::Moved(report) => Ok(tools::diagnostics::loading(&report)),
+                    },
                 }
             },
             move || tools::diagnostics::loading(&retry_diag.status_report()),
@@ -3254,6 +3287,36 @@ mod surface_guards {
         }
     }
 
+    /// Every string value a published discriminator may take.
+    ///
+    /// A single-variant vocabulary is rendered as a `const` and a multi-variant one as an
+    /// `enum` array, which is a rendering detail, not a difference in contract — a guard
+    /// that read only `const` would call a WIDENED vocabulary missing, and the widening is
+    /// exactly what it has to see.
+    fn discriminator_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        string_values(value, "const", out);
+        enum_values(value, out);
+    }
+
+    fn enum_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array) {
+                    out.extend(values.iter().filter_map(serde_json::Value::as_str));
+                }
+                for value in object.values() {
+                    enum_values(value, out);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    enum_values(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn array_for_key<'a>(
         value: &'a serde_json::Value,
         key: &str,
@@ -3381,16 +3444,38 @@ mod surface_guards {
         assert_eq!(reference["$defs"]["SearchSchemaVersion"]["enum"], serde_json::json!(["6"]));
     }
 
+    /// The values published for the not-ready envelope's `status` field, read from the node
+    /// that field actually IS.
+    ///
+    /// Named rather than swept: `failed` appearing anywhere in a nested enum is not this
+    /// vocabulary, and a guard that reads every `enum` in the document would stay green while
+    /// the `status` node lost the value — which is the only thing a consumer branches on.
+    fn loading_status_values(schema: &serde_json::Value) -> Vec<String> {
+        schema["$defs"]["LoadingStatus"]["enum"]
+            .as_array()
+            .map(|values| {
+                values.iter().filter_map(|value| value.as_str()).map(str::to_owned).collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn symbol_info_output_schema_requires_discriminators_and_member_branches() {
         let schema = tool_output_schema(McpProfile::Workspace, "symbol_info");
         assert_eq!(array_for_key(&schema, "oneOf").map(Vec::len), Some(4), "{schema}");
 
         let mut constants = Vec::new();
-        string_values(&schema, "const", &mut constants);
-        for value in ["1", "ok", "not_found", "ambiguous", "loading"] {
+        discriminator_values(&schema, &mut constants);
+        for value in ["1", "ok", "not_found", "ambiguous"] {
             assert!(constants.contains(&value), "missing const {value}: {schema}");
         }
+        // The readiness verdict is the OTHER `status` this tool serves, and its two values are
+        // the whole contract a poller branches on: read off the node itself, not off a sweep.
+        assert_eq!(
+            loading_status_values(&schema),
+            ["loading", "failed"],
+            "the not-ready envelope's status vocabulary moved: {schema}",
+        );
 
         let mut required = Vec::new();
         required_sets(&schema, &mut required);
@@ -3400,6 +3485,42 @@ mod surface_guards {
         assert!(required
             .iter()
             .any(|keys| ["availability", "signature"].iter().all(|key| keys.contains(key))));
+    }
+
+    /// Both tools that publish the not-ready envelope into a CLOSED schema must publish the
+    /// same two readiness values, each read off its own node: a vocabulary that reached one
+    /// tool and not the other is how a consumer's branch list becomes a guess. `references` is
+    /// opt-in, so the published surface is read through a launch that enables it.
+    #[test]
+    fn both_resident_tool_schemas_publish_the_two_readiness_values() {
+        let schema_of = |enabled: &[String], name: &str| -> serde_json::Value {
+            let router = McpServer::gated_router(
+                McpProfile::Workspace,
+                &ToolGate::for_launch(McpProfile::Workspace, enabled),
+            );
+            let tool = router
+                .list_all()
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is not served by this launch"))
+                .clone();
+            serde_json::Value::Object(
+                tool.output_schema.expect("published outputSchema").as_ref().clone(),
+            )
+        };
+
+        let symbol_info = schema_of(&[], "symbol_info");
+        assert_eq!(
+            loading_status_values(&symbol_info),
+            ["loading", "failed"],
+            "symbol_info: {symbol_info}",
+        );
+        let references = schema_of(&["references".to_owned()], "references");
+        assert_eq!(
+            loading_status_values(&references),
+            ["loading", "failed"],
+            "references: {references}",
+        );
     }
 
     #[test]
@@ -3481,6 +3602,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Bound on a status answer while the lease lock is held by the test: the call must answer
+    /// at once, not after the lock's own wait, so the bound is the latency contract itself.
+    const HANG_GUARD: Duration = Duration::from_millis(500);
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_status_requests_are_cached_under_held_lease() {
         let dir = tempfile::tempdir().unwrap();
@@ -3493,12 +3618,13 @@ mod tests {
         let lease = state.workspace_lease().clone();
         let server = McpServer::new(McpProfile::Workspace, state);
         let held_lease = lease.hold_file_lock_for_test();
+        let fences_before = lease.disk_checks_on_this_thread();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();
         let token = || tokio_util::sync::CancellationToken::new();
 
         tokio::time::timeout(
-            Duration::from_millis(500),
+            HANG_GUARD,
             server.metadata(
                 Parameters(MetadataParams {
                     action: "status".to_owned(),
@@ -3522,7 +3648,7 @@ mod tests {
         .expect("metadata status response");
 
         tokio::time::timeout(
-            Duration::from_millis(500),
+            HANG_GUARD,
             server.diagnostics(
                 Parameters(DiagnosticsParams {
                     action: "status".to_owned(),
@@ -3547,7 +3673,7 @@ mod tests {
         .expect("diagnostics status response");
 
         tokio::time::timeout(
-            Duration::from_millis(500),
+            HANG_GUARD,
             server.graph(
                 Parameters(GraphParams {
                     action: "status".to_owned(),
@@ -3571,6 +3697,16 @@ mod tests {
         .await
         .expect("graph status must not wait for the lease lock")
         .expect("graph status response");
+
+        // The status path answers from what the lease already knows, so it takes no fence. The
+        // test body runs on the test's own thread (a current-thread block_on), and the status
+        // calls answer inline there, so a fence they made is counted against this thread.
+        // Background owners fence on threads of their own and are not counted here.
+        assert_eq!(
+            lease.disk_checks_on_this_thread(),
+            fences_before,
+            "a status call fenced the lease"
+        );
 
         drop(held_lease);
         server.shutdown();
@@ -3697,6 +3833,7 @@ mod graph_supersession_contract {
     }
 
     async fn assert_busy_graph_handler_returns_immediately(handler: BusyGraphHandler) {
+        let _serialised = crate::walk_probe::WALK_GATE.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         crate::graph::test_support::sample_workspace(root);
@@ -3766,7 +3903,7 @@ mod graph_supersession_contract {
         // the release — slower, not stuck. The bound below is only a hang guard, not the
         // discriminator: a budget in the hundreds of milliseconds measured the runtime's
         // scheduling as much as the handler, and a loaded suite fails it for neither reason.
-        let answer = tokio::time::timeout(Duration::from_secs(30), call)
+        let answer = tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, call)
             .await
             .expect("the handler never answered while the lease lock was held")
             .expect("the handler did not panic");
@@ -3927,8 +4064,7 @@ mod graph_supersession_contract {
         // it does not come back — so the hold is given up only once that thread has gone, and
         // the graph then stays idle for as long as this test needs it to.
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(60), || !state
-                .search_initializing()),
+            crate::change_hub::test_support::eventually(|| !state.search_initializing()),
             "the boot's workspace-search init never finished",
         );
         drop(held);
@@ -3985,10 +4121,11 @@ mod graph_supersession_contract {
                         server.graph(asked, tokio_util::sync::CancellationToken::new()).await
                     })
                 };
-                let answered = tokio::time::timeout(Duration::from_secs(5), calling)
-                    .await
-                    .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
-                    .expect("the request task did not panic");
+                let answered =
+                    tokio::time::timeout(crate::change_hub::test_support::STATE_CEILING, calling)
+                        .await
+                        .unwrap_or_else(|_| panic!("{what}: graph {action} never came back"))
+                        .expect("the request task did not panic");
                 // A failed graph answers some actions with an error, and that IS the answer:
                 // what this test is about is the thread it came back on, not its shape.
                 let _ = answered;
@@ -4072,8 +4209,7 @@ mod graph_supersession_contract {
         release_the_lock.send(()).expect("the lock holder is still there to be released");
         lock.join().unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || state
-                .ownership_verdict_established()),
+            crate::change_hub::test_support::eventually(|| state.ownership_verdict_established()),
             "no background check ever established the verdict",
         );
         let body = answered(
@@ -4127,8 +4263,7 @@ mod graph_supersession_contract {
                 .expect("the background check starts")
         };
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(5), || state
-                .lease_lifecycle_is_busy()),
+            crate::change_hub::test_support::eventually(|| state.lease_lifecycle_is_busy()),
             "the background check never reached the lock this test is about",
         );
 
@@ -4239,8 +4374,7 @@ mod graph_supersession_contract {
         release_the_lock.send(()).expect("the lock holder is still there to be released");
         lock.join().unwrap();
         assert!(
-            crate::change_hub::test_support::eventually(Duration::from_secs(30), || state
-                .ownership_verdict_established()),
+            crate::change_hub::test_support::eventually(|| state.ownership_verdict_established()),
             "no background check ever established the verdict",
         );
         assert_eq!(
@@ -5465,7 +5599,7 @@ mod resolve_envelope {
         graph.ensure_loading();
 
         entered_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("real graph producer reached the post-persistence boundary");
         assert_eq!(graph.status(), crate::graph::GraphStatus::Loading);
         assert!(!graph.has_installed_snapshot());
@@ -5769,9 +5903,6 @@ mod rescan_hatch_consultations {
 mod search_cancellation_matrix {
     use super::*;
     use serde_json::json;
-    use std::time::{Duration, Instant};
-
-    const BOUND: Duration = Duration::from_millis(500);
 
     fn cancelled_token() -> tokio_util::sync::CancellationToken {
         let token = tokio_util::sync::CancellationToken::new();
@@ -5795,7 +5926,15 @@ mod search_cancellation_matrix {
         release_tx
     }
 
-    fn assert_cancelled(answer: Result<CallToolResult, McpError>, elapsed: Duration, cell: &str) {
+    /// How long a cancelled call may take to come back. Well above one poll (25 ms) and well
+    /// below every wait it must not sit out (a 2 s held lock, a 12 s embed, a latched actor).
+    const BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+
+    fn assert_cancelled(
+        answer: Result<CallToolResult, McpError>,
+        elapsed: std::time::Duration,
+        cell: &str,
+    ) {
         let error =
             answer.err().unwrap_or_else(|| panic!("{cell}: a cancelled call produced a body"));
         assert_eq!(error.message, "request cancelled", "{cell}: {error:?}");
@@ -5825,8 +5964,13 @@ mod search_cancellation_matrix {
             let held = hold_lock(engine);
             let params =
                 Parameters(serde_json::from_value::<WorkspaceSearchParams>(arguments).unwrap());
-            let started = Instant::now();
-            let answer = server.workspace_search(params, cancelled_token()).await;
+            let started = std::time::Instant::now();
+            let answer = tokio::time::timeout(
+                crate::change_hub::test_support::STATE_CEILING,
+                server.workspace_search(params, cancelled_token()),
+            )
+            .await
+            .expect("a cancelled request answers while the lock is still held");
             assert_cancelled(answer, started.elapsed(), cell);
             drop(held);
         }
@@ -5847,11 +5991,261 @@ mod search_cancellation_matrix {
                 )
                 .unwrap(),
             );
-            let started = Instant::now();
-            let answer = server.reference_search(params, cancelled_token()).await;
+            let started = std::time::Instant::now();
+            let answer = tokio::time::timeout(
+                crate::change_hub::test_support::STATE_CEILING,
+                server.reference_search(params, cancelled_token()),
+            )
+            .await
+            .expect("a cancelled request answers while the lock is still held");
             assert_cancelled(answer, started.elapsed(), action);
             drop(held);
         }
+        server.shutdown();
+    }
+}
+
+/// Every resident-reading tool that cannot answer says the SAME thing about the failure: a
+/// machine-readable `state: "failed"`, the reason the build gave, and the retry contract.
+///
+/// A failure that reached a client as an opaque internal error is a state it cannot act on:
+/// the resident retries itself on a backoff, and only `retry_after_ms` tells the client when
+/// to ask again — without it, "come back later" and "this will never be answered" are one
+/// sentence. One helper renders the data for all four tools, so these gates read the wire
+/// shape each tool actually produces rather than the helper alone.
+#[cfg(test)]
+mod resident_failed_answers {
+    use super::*;
+    use crate::diagnostics_state::DiagnosticsState;
+    use std::time::Duration;
+
+    const REASON: &str = "synthetic resident failure";
+
+    /// A workspace whose resident built and then failed, with retries held off so every call
+    /// below meets the FAILURE rather than the retry it would otherwise start. The pacing is
+    /// stated instead of slept through: the subject is the answer a failed resident gives.
+    fn failed_stand() -> (tempfile::TempDir, McpServer, DiagnosticsState) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        crate::graph::test_support::sample_workspace(root);
+        std::fs::write(root.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
+        state.diagnostics().ensure_loading();
+        crate::diagnostics_state::test_support::wait_ready(state.diagnostics());
+        // The pacing is stated on the SERVER's own handle, and the gates below read it back
+        // off the answer (`retry_after_ms` in the hundreds of thousands of ms): pacing that
+        // lived on a clone would leave the server on the 5-second default, and every gate
+        // built on it measuring a race against a real retry instead of a stated schedule.
+        state
+            .diagnostics()
+            .with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
+        state.diagnostics().fail_for_test(REASON);
+        let diag = state.diagnostics().clone();
+        (dir, McpServer::new(McpProfile::Workspace, state), diag)
+    }
+
+    fn token() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    #[track_caller]
+    fn assert_failed_data(error: &McpError, tool: &str) {
+        let data = error.data.as_ref().unwrap_or_else(|| panic!("{tool}: no structured data"));
+        assert_eq!(data["state"], "failed", "{tool}: {data}");
+        assert_eq!(data["reason"], REASON, "{tool}: {data}");
+        assert_eq!(data["attempts"], 1, "{tool}: {data}");
+        assert!(
+            data["retry_after_ms"].as_u64().is_some_and(|owed| owed > 0),
+            "{tool}: the failure must say it is retryable and when: {data}",
+        );
+        // The wait is the schedule the stand stated, read off the server's own answer: a
+        // pacing the server never saw would answer with the five-second default instead.
+        assert!(
+            data["retry_after_ms"].as_u64().is_some_and(|owed| owed > 60_000),
+            "{tool}: the answer does not carry the pacing the test stated: {data}",
+        );
+        assert!(
+            error.message.contains(REASON),
+            "{tool}: the human sentence keeps the cause: {error:?}",
+        );
+    }
+
+    fn metadata_params(action: &str) -> Parameters<MetadataParams> {
+        Parameters(MetadataParams {
+            action: action.to_owned(),
+            filter: None,
+            meta_type: None,
+            name_mask: None,
+            max_items: None,
+            object_type: None,
+            object_name: None,
+            form_name: None,
+            max_output_tokens: None,
+            connection: None,
+            mode: None,
+        })
+    }
+
+    fn symbol_params(symbol: &str) -> Parameters<SymbolInfoParams> {
+        Parameters(SymbolInfoParams {
+            symbol: Some(symbol.to_owned()),
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            include: Vec::new(),
+            member_kind: None,
+            member_name: None,
+            locale: None,
+            max_output_tokens: None,
+        })
+    }
+
+    fn references_params(symbol: &str) -> Parameters<ReferencesParams> {
+        Parameters(ReferencesParams {
+            symbol: Some(symbol.to_owned()),
+            anchor_root_id: None,
+            root_id: None,
+            path: None,
+            line: None,
+            column: None,
+            line_content: None,
+            area_root_id: None,
+            area_path_prefix: None,
+            kinds: Vec::new(),
+            include_declaration: None,
+            limit: None,
+            max_files: None,
+            include_preview: None,
+            max_output_tokens: None,
+        })
+    }
+
+    fn diagnostics_params(action: &str) -> Parameters<DiagnosticsParams> {
+        Parameters(DiagnosticsParams {
+            action: action.to_owned(),
+            path: Some("CommonModules/Сервер/Ext/Module.bsl".to_owned()),
+            root_id: None,
+            codes: Vec::new(),
+            locale: None,
+            min_severity: None,
+            range_start: None,
+            range_end: None,
+            detail: None,
+            max_findings: None,
+            max_files: None,
+            max_output_tokens: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_resident_answers_every_reading_tool_with_the_same_structured_failure() {
+        let _serialised = crate::walk_probe::WALK_GATE.lock().await;
+        let (_dir, server, _diag) = failed_stand();
+
+        let error = match server
+            .metadata(metadata_params("info"), token(), tasks::TaskCapable(false))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("metadata answered over a failed resident"),
+        };
+        assert_failed_data(&error, "metadata");
+
+        let error = match server
+            .symbol_info(symbol_params("Сервер.Считать"), token(), tasks::TaskCapable(false))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("symbol_info answered over a failed resident"),
+        };
+        assert_failed_data(&error, "symbol_info");
+
+        let error = match server
+            .references(references_params("Сервер.Считать"), token(), tasks::TaskCapable(false))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("references answered over a failed resident"),
+        };
+        assert_failed_data(&error, "references");
+
+        let error = match server
+            .diagnostics(diagnostics_params("file"), token(), tasks::TaskCapable(false))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("diagnostics file answered over a failed resident"),
+        };
+        assert_failed_data(&error, "diagnostics file");
+
+        let error = match server
+            .diagnostics(diagnostics_params("workspace"), token(), tasks::TaskCapable(false))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("diagnostics workspace answered over a failed resident"),
+        };
+        assert_failed_data(&error, "diagnostics workspace");
+
+        // The status action is the poller's own door on the same state: it must not leave the
+        // caller guessing whether a retry is coming.
+        let status = server
+            .metadata(metadata_params("status"), token(), tasks::TaskCapable(false))
+            .await
+            .expect("status answers without a resident");
+        let CallToolResponse::Complete(result) = status else {
+            panic!("a synchronous call does not create a task");
+        };
+        let body = result.structured_content.expect("status is structured");
+        assert_eq!(body["state"], "failed");
+        assert_eq!(body["error"], REASON);
+        assert!(body["retry_after_ms"].as_u64().is_some_and(|owed| owed > 0), "{body}");
+        assert_eq!(body["attempts"], 1);
+
+        server.shutdown();
+    }
+
+    /// A read can come back failed while the lifecycle has already moved on: the retry starts
+    /// between the read and the snapshot that words the answer. Serving the failure THEN would
+    /// publish `state: "failed"` with the new attempt's numbers — or with none — and the caller
+    /// would wait for a failure that is no longer there.
+    ///
+    /// The window is entered from the seam, not raced for: the probe fires inside the snapshot
+    /// step, which is exactly where a retry starting early lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failure_answered_after_the_lifecycle_moved_on_is_not_served_as_one() {
+        let (_dir, server, diag) = failed_stand();
+        // The retry is parked in the gate, so the state stays `loading` while the answer is
+        // built: without the hold this test would race a build that takes milliseconds.
+        let gate = diag.arm_build_gate_for_test();
+        // The retry starts INSIDE the snapshot step and nowhere earlier: the stand holds it an
+        // hour out, so the READ still finds `failed` and the Failed arm is the one under test.
+        // A retry already running before the read would answer `loading` from the ordinary
+        // not-ready arm, and this gate would pass without exercising anything.
+        let retry = diag.clone();
+        diag.set_failure_probe(move || {
+            retry.with_retry_pacing_for_test(Duration::ZERO, Duration::ZERO);
+            retry.ensure_loading();
+        });
+
+        let answer =
+            server.metadata(metadata_params("info"), token(), tasks::TaskCapable(false)).await;
+        let result = match answer {
+            Ok(CallToolResponse::Complete(result)) => result,
+            Ok(_) => panic!("a synchronous call does not create a task"),
+            Err(error) => panic!("a lifecycle that moved on was served as a failure: {error:?}"),
+        };
+        let body = result.structured_content.expect("the not-ready envelope is structured");
+        assert_eq!(body["state"], "loading", "{body}");
+        assert_eq!(
+            body["status"], "loading",
+            "the envelope must follow the state it was snapshotted from: {body}",
+        );
+        assert_eq!(body["error"], REASON, "and the retry still names the cause it answers: {body}",);
+        assert!(body.get("retry_after_ms").is_none(), "a build in flight owes no wait: {body}");
+
+        gate.release();
         server.shutdown();
     }
 }

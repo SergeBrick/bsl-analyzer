@@ -114,12 +114,11 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     let main_uri = lsp_types::Url::from_file_path(main.join("Main.bsl")).unwrap();
     let diagnostics = lsp.open(&main.join("Main.bsl"), "Процедура Проверка()\nКонецПроцедуры\n");
     assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    let hover_params = json!({
+        "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 10}
+    });
     for id in [2, 3] {
-        lsp.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
-            "params": {"textDocument": {"uri": main_uri.clone()}, "position": {"line": 0, "character": 10}}
-        }));
-        let response = lsp.wait_for(|message| message["id"] == id);
+        let response = lsp.request(id, "textDocument/hover", hover_params.clone());
         assert!(response.get("result").is_some(), "hover is answered: {response}");
     }
     assert!(
@@ -143,11 +142,7 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     // any other error remains a test failure.
     let mut response = Value::Null;
     for id in 4..=8 {
-        lsp.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
-            "params": {"textDocument": {"uri": main_uri.clone()}, "position": {"line": 0, "character": 10}}
-        }));
-        response = lsp.wait_for(|message| message["id"] == id);
+        response = lsp.request(id, "textDocument/hover", hover_params.clone());
         if response.get("result").is_some() {
             break;
         }
@@ -263,4 +258,25 @@ fn an_owned_live_lsp_child_is_killed_and_reaped_with_a_bounded_wait() {
         .expect("the killed LSP child is reaped within the bound");
     assert!(!status.success(), "forced cleanup is not a graceful LSP shutdown");
     assert!(lsp.child.try_wait().unwrap().is_some(), "owned LSP child {pid} was reaped");
+}
+
+#[test]
+fn a_server_request_reusing_the_client_id_is_not_taken_for_its_response() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    // Client and server number their requests independently, so a server request can
+    // carry the very id the client is waiting on.
+    let server_request = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "window/workDoneProgress/create",
+        "params": {"token": "bslAnalyzer/Analyzing"}
+    });
+    let response = json!({"jsonrpc": "2.0", "id": 2, "result": null});
+    sender.send(server_request).unwrap();
+    sender.send(response.clone()).unwrap();
+
+    let answer = lsp.request(2, "textDocument/hover", json!({}));
+    assert_eq!(answer, response, "the server request with the same id is skipped");
+    lsp.messages = original;
 }

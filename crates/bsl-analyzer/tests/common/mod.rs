@@ -309,6 +309,9 @@ impl Lsp {
             match pending.map(Ok).unwrap_or_else(|| self.messages.recv_timeout(remaining)) {
                 Ok(message) => {
                     if std::time::Instant::now() >= deadline {
+                        // Arrived past this wait's bound: not ours to judge, but still
+                        // the next wait's to see.
+                        self.pending.lock().unwrap().push_front(message);
                         return None;
                     }
                     self.note_seen(&message);

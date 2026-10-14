@@ -515,8 +515,8 @@ fn do_variables(
 }
 
 fn do_step(action: StepAction, state: &Arc<Mutex<DapState>>) -> Result<(), String> {
-    let guard = state.lock().unwrap();
-    let session = guard.session.as_ref().ok_or("no active debug session")?;
+    let mut guard = state.lock().unwrap();
+    let session = guard.session.as_mut().ok_or("no active debug session")?;
     session.step(action).map_err(|e| e.to_string())
 }
 

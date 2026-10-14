@@ -954,7 +954,8 @@ struct DebugParams {
     /// `attach`: `[name, root]` pairs for loaded extensions (optional).
     #[serde(default)]
     extensions: Vec<[String; 2]>,
-    /// `attach`: object-name patterns to auto-attach on connect (optional).
+    /// `attach`: debug TARGET TYPES to attach, default `Client`, `ManagedClient`, `Server`,
+    /// `ServerEmulation`, `HTTPService`; an empty list attaches every type (optional).
     #[serde(default)]
     auto_attach: Vec<String>,
     /// `set_breakpoint`/`remove_breakpoint`: target module id (required).
@@ -967,7 +968,8 @@ struct DebugParams {
     direction: Option<String>,
     /// `wait_stop`: max seconds to wait for a stop event (optional).
     timeout_secs: Option<u64>,
-    /// `locals`/`eval`: stack frame level to evaluate in (optional, default top frame).
+    /// `locals`/`eval`: stack frame to evaluate in — frame 0 is the current frame, and the
+    /// numbering matches the printed stack (optional, default 0).
     stack_level: Option<u32>,
     /// `eval`: BSL expression to evaluate in the current stop (required).
     expression: Option<String>,
@@ -4960,7 +4962,8 @@ mod tool_descriptions {
             (`host` + `infobase`, default port 1550).
               - action: attach | disconnect | set_breakpoint | remove_breakpoint | continue | step |
             wait_stop | stack_trace | locals | eval.
-              - auto_attach: `attach`: object-name patterns to auto-attach on connect (optional).
+              - auto_attach: `attach`: debug TARGET TYPES to attach, default `Client`, `ManagedClient`, `Server`,
+            `ServerEmulation`, `HTTPService`; an empty list attaches every type (optional).
               - condition: `set_breakpoint`: conditional-breakpoint expression (optional).
               - config_root: `attach`: configuration source root (optional).
               - direction: `step`: `over`/`next`, `in`/`into`, or `out` (required).
@@ -4974,7 +4977,8 @@ mod tool_descriptions {
             boundary with a continuation note (default 6000).
               - module: `set_breakpoint`/`remove_breakpoint`: target module id (required).
               - port: `attach`: debugger port (default 1550).
-              - stack_level: `locals`/`eval`: stack frame level to evaluate in (optional, default top frame).
+              - stack_level: `locals`/`eval`: stack frame to evaluate in — frame 0 is the current frame, and the
+            numbering matches the printed stack (optional, default 0).
               - timeout_secs: `wait_stop`: max seconds to wait for a stop event (optional).
 
             ## diagnostics

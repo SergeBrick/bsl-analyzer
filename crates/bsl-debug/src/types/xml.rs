@@ -240,10 +240,13 @@ pub fn build_attach_targets_request(
     b.build()
 }
 
+/// `break_on_condition` is a version split, not a preference: 8.3.27 needs the element or it
+/// ignores the condition without saying so, and 8.3.17 rejects the whole request over it.
 pub fn build_set_breakpoints_request(
     debugger_id: &str,
     infobase: &str,
     breakpoints: &[BreakpointDef],
+    break_on_condition: bool,
 ) -> Vec<u8> {
     let mut b = XmlRequestBuilder::new("RDBGSetBreakpointsRequest", debugger_id, infobase);
 
@@ -276,7 +279,9 @@ pub fn build_set_breakpoints_request(
             b.bool_element("isActive", true);
             if let Some(ref cond) = bp.condition {
                 b.text_element("condition", cond);
-                b.bool_element("breakOnCondition", true);
+                if break_on_condition {
+                    b.bool_element("breakOnCondition", true);
+                }
             }
             b.end("bpInfo");
         }
@@ -436,6 +441,7 @@ pub fn build_eval_expand_request(
     b.build()
 }
 
+#[derive(Clone)]
 pub struct BreakpointDef {
     pub extension: String,
     pub object_id: String,
@@ -464,5 +470,46 @@ mod tests {
             "targetType must have xmlns. Got: {s}");
         assert!(s.contains(r#"<targetType xmlns="http://v8.1c.ru/8.3/debugger/debugAutoAttach">Client</targetType>"#),
             "all targetType elements must have xmlns. Got: {s}");
+    }
+
+    fn bp(condition: Option<&str>) -> BreakpointDef {
+        BreakpointDef {
+            extension: String::new(),
+            object_id: "obj".to_string(),
+            property_id: "prop".to_string(),
+            line: 9,
+            condition: condition.map(|s| s.to_string()),
+        }
+    }
+
+    fn breakpoints_xml(condition: Option<&str>, break_on_condition: bool) -> String {
+        let xml = build_set_breakpoints_request("id", "db", &[bp(condition)], break_on_condition);
+        String::from_utf8(xml).unwrap()
+    }
+
+    #[test]
+    fn a_conditional_breakpoint_carries_break_on_condition_for_8327() {
+        let s = breakpoints_xml(Some("i = 3"), true);
+        assert!(s.contains("<condition>i = 3</condition>"), "condition is always sent: {s}");
+        assert!(s.contains("<breakOnCondition>true</breakOnCondition>"), "8.3.27 needs it: {s}");
+    }
+
+    #[test]
+    fn a_conditional_breakpoint_drops_break_on_condition_for_8317() {
+        let s = breakpoints_xml(Some("i = 3"), false);
+        assert!(s.contains("<condition>i = 3</condition>"), "condition still goes: {s}");
+        assert!(
+            !s.contains("breakOnCondition"),
+            "8.3.17 rejects the whole request over this element: {s}"
+        );
+    }
+
+    #[test]
+    fn an_unconditional_breakpoint_carries_neither_element_in_either_mode() {
+        for break_on_condition in [true, false] {
+            let s = breakpoints_xml(None, break_on_condition);
+            assert!(!s.contains("<condition>"), "no condition to send: {s}");
+            assert!(!s.contains("breakOnCondition"), "and nothing to qualify: {s}");
+        }
     }
 }

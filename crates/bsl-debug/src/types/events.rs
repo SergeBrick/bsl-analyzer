@@ -188,17 +188,23 @@ pub fn parse_ping_events(data: &[u8]) -> Vec<DebugEvent> {
                             "targetQuit" => {
                                 Some(DebugEvent::TargetQuit { target_id: target_id.clone() })
                             }
-                            "callStackFormed" => Some(DebugEvent::CallStackFormed {
-                                target_id: target_id.clone(),
-                                stop_by_bp,
-                                line_no,
-                                module_extension: mod_ext.clone(),
-                                module_object_id: mod_obj.clone(),
-                                module_property_id: mod_prop.clone(),
-                                message: message.clone(),
-                                send_message_only,
-                                call_stack: std::mem::take(&mut call_stack_frames),
-                            }),
+                            "callStackFormed" => {
+                                // The server sends the stack outermost-first; index 0 is the
+                                // current frame everywhere in this crate, as stackLevel counts.
+                                let mut frames = std::mem::take(&mut call_stack_frames);
+                                frames.reverse();
+                                Some(DebugEvent::CallStackFormed {
+                                    target_id: target_id.clone(),
+                                    stop_by_bp,
+                                    line_no,
+                                    module_extension: mod_ext.clone(),
+                                    module_object_id: mod_obj.clone(),
+                                    module_property_id: mod_prop.clone(),
+                                    message: message.clone(),
+                                    send_message_only,
+                                    call_stack: frames,
+                                })
+                            }
                             "exprEvaluated" => Some(DebugEvent::ExprEvaluated {
                                 result_id: result_id.clone(),
                                 raw_xml: data.to_vec(),

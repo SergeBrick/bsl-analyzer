@@ -67,9 +67,10 @@ pub fn debug_attach(
         config_root: root.clone(),
         extensions: ext_pairs,
         auto_attach: attach_types.clone(),
-        // The OS temp directory is per user, and so is the takeover: a session may inherit only
-        // a registration the same user's dead session left behind.
-        lease_dir: Some(std::env::temp_dir().join("bsl-analyzer-debug")),
+        // The takeover is per user — a session may inherit only a registration the same user's
+        // dead session left behind — so the lease lives in the user's own cache directory, not
+        // in the temp directory, which Unix shares between users.
+        lease_dir: dirs::cache_dir().map(|d| d.join("bsl-analyzer").join("debug-leases")),
     };
     let session = DebugSession::connect(config)
         .map_err(|e| McpError::internal_error(format!("Failed to connect: {e}"), None))?;
@@ -175,10 +176,11 @@ pub fn debug_disconnect(
     let mut guard = session_mutex.lock().unwrap();
     let session =
         guard.take().ok_or_else(|| McpError::invalid_params("No active debug session", None))?;
-    let report = session
-        .disconnect()
-        .map_err(|e| McpError::internal_error(format!("Failed to disconnect: {e}"), None))?;
-    let mut out = String::from("Debug session disconnected");
+    let report = session.disconnect();
+    let mut out = match &report.detach_error {
+        Some(e) => format!("Failed to disconnect: {e}"),
+        None => String::from("Debug session disconnected"),
+    };
     if !report.resumed.is_empty() {
         let _ = write!(
             out,
@@ -189,6 +191,9 @@ pub fn debug_disconnect(
     }
     for warning in &report.warnings {
         let _ = write!(out, "\nWarning: {warning}");
+    }
+    if report.detach_error.is_some() {
+        return Err(McpError::internal_error(out, None));
     }
     Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
 }

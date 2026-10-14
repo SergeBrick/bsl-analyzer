@@ -956,7 +956,7 @@ struct DebugParams {
     #[serde(default)]
     extensions: Vec<[String; 2]>,
     /// `attach`: debug TARGET TYPES to attach, default `Client`, `ManagedClient`, `Server`,
-    /// `ServerEmulation`, `HTTPService`; an empty list attaches every type (optional).
+    /// `ServerEmulation`, `HTTPService`; an empty or omitted list means that default (optional).
     #[serde(default)]
     auto_attach: Vec<String>,
     /// `set_breakpoint`/`remove_breakpoint`: target module id (required).
@@ -5086,7 +5086,7 @@ mod tool_descriptions {
               - action: attach | disconnect | set_breakpoint | remove_breakpoint | continue | step |
             wait_stop | stack_trace | locals | eval.
               - auto_attach: `attach`: debug TARGET TYPES to attach, default `Client`, `ManagedClient`, `Server`,
-            `ServerEmulation`, `HTTPService`; an empty list attaches every type (optional).
+            `ServerEmulation`, `HTTPService`; an empty or omitted list means that default (optional).
               - condition: `set_breakpoint`: conditional-breakpoint expression (optional).
               - config_root: `attach`: configuration source root (optional).
               - direction: `step`: `over`/`next`, `in`/`into`, or `out` (required).

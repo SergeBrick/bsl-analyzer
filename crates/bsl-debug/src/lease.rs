@@ -32,14 +32,11 @@ pub enum Reclaim {
 
 impl Lease {
     /// One file per endpoint: the server keys a debugger registration by infobase alias, and the
-    /// same alias on two debug servers is two infobases.
+    /// same alias on two debug servers is two infobases. Each part is escaped on its own and the
+    /// parts are joined by a character the escaping never leaves in place, so two endpoints never
+    /// share a file. Host names are case-insensitive; aliases are kept as given.
     pub fn file_name(host: &str, port: u16, infobase: &str) -> String {
-        let raw = format!("{host}_{port}_{infobase}");
-        let safe: String = raw
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
-            .collect();
-        format!("{safe}.lease")
+        format!("{}_{port}_{}.lease", escape_part(&host.to_lowercase()), escape_part(infobase))
     }
 
     /// Records `debugger_id` for the endpoint and holds the file locked. `Ok(None)` when another
@@ -90,18 +87,38 @@ impl Lease {
 
     /// Called only after `detachDebugUI` succeeded: nothing is left registered under the id, so
     /// there is nothing a later session could take over.
+    ///
+    /// The id is erased while the lock is still held, and the file itself stays: removing the
+    /// path after unlocking would race a session that locks the same file in between, and would
+    /// delete the lease that session has just written.
     pub fn release(self) {
         let Self { file, path } = self;
-        let _ = file.unlock();
-        drop(file);
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), error = %e, "debugger lease not removed");
+        if let Err(e) = file.set_len(0) {
+            tracing::debug!(path = %path.display(), error = %e, "debugger lease not erased");
         }
+        let _ = file.unlock();
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Letters, digits, `-` and `.` stay readable; every other character, `_` and `%` included,
+/// becomes `%XX` per UTF-8 byte, which keeps the escaping reversible.
+fn escape_part(part: &str) -> String {
+    let mut out = String::with_capacity(part.len());
+    for c in part.chars() {
+        if c.is_alphanumeric() || c == '-' || c == '.' {
+            out.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -146,8 +163,26 @@ mod tests {
     fn a_released_lease_leaves_nothing_to_reclaim() {
         let dir = tempfile::tempdir().unwrap();
         Lease::acquire(dir.path(), NAME, "id-1").unwrap().expect("lease").release();
-        assert!(!dir.path().join(NAME).exists(), "release removes the file");
         assert!(matches!(Lease::reclaim(dir.path(), NAME).unwrap(), Reclaim::NoLease));
+    }
+
+    /// The second session opened the file before the first released it — the interleaving in
+    /// which deleting the path after the unlock lost the second session's id.
+    #[test]
+    fn releasing_keeps_the_file_a_new_session_may_already_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Lease::acquire(dir.path(), NAME, "id-1").unwrap().expect("lease");
+        let mut second =
+            OpenOptions::new().read(true).write(true).open(dir.path().join(NAME)).unwrap();
+        first.release();
+        second.try_lock().expect("the first session no longer holds the lock");
+        second.set_len(0).unwrap();
+        second.write_all(b"id-2").unwrap();
+        drop(second);
+        match Lease::reclaim(dir.path(), NAME).unwrap() {
+            Reclaim::Reclaimed { debugger_id, .. } => assert_eq!(debugger_id, "id-2"),
+            _ => panic!("the second session's id must stay reachable by its file name"),
+        }
     }
 
     #[test]
@@ -164,6 +199,21 @@ mod tests {
     #[test]
     fn the_file_name_keeps_the_alias_readable_and_the_path_safe() {
         assert_eq!(Lease::file_name("localhost", 1550, "DefAlias"), NAME);
-        assert_eq!(Lease::file_name("10.0.0.5", 1550, "база/1"), "10.0.0.5_1550_база_1.lease");
+        assert_eq!(Lease::file_name("10.0.0.5", 1550, "база/1"), "10.0.0.5_1550_база%2F1.lease");
+    }
+
+    #[test]
+    fn distinct_endpoints_never_share_a_file() {
+        assert_ne!(Lease::file_name("h", 1550, "a b"), Lease::file_name("h", 1550, "a_b"));
+        assert_ne!(
+            Lease::file_name("h", 1550, "a_1550_b"),
+            Lease::file_name("h_1550_a", 1550, "b")
+        );
+        assert_ne!(Lease::file_name("h", 1550, "Alias"), Lease::file_name("h", 1550, "alias"));
+    }
+
+    #[test]
+    fn the_host_name_is_case_insensitive() {
+        assert_eq!(Lease::file_name("LocalHost", 1550, "DefAlias"), NAME);
     }
 }

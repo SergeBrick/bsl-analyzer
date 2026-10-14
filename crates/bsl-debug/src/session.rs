@@ -27,8 +27,13 @@ pub struct DebugSession {
     /// The target commands act on.
     stopped_target: Option<String>,
     /// Client and server can be stopped at once, so one slot cannot tell whether the target a
-    /// command is about to reach is still halted.
-    stopped_targets: std::collections::HashSet<String>,
+    /// command is about to reach is still halted. Ordered by stop, latest last: once the target
+    /// of the latest stop resumes, commands fall back to the one that stopped before it.
+    stopped_targets: Vec<String>,
+    /// Stops drained from the event queue but not yet returned by `wait_for_stop`, one per
+    /// target, latest last. Two targets can stop between two waits, and the earlier one is still
+    /// halted: dropping its stop would leave it with no id the caller could ever see.
+    unreported_stops: Vec<StopEvent>,
     last_stop: Option<StopEvent>,
     watches: Vec<String>,
     pending_eval_results: HashMap<String, Vec<u8>>,
@@ -87,6 +92,9 @@ pub struct DisconnectReport {
     /// resume them, and their client stays frozen.
     pub resumed: Vec<String>,
     pub warnings: Vec<String>,
+    /// Why `detachDebugUI` failed, when it did. The targets above were resumed regardless, and
+    /// the caller has to hear about both.
+    pub detach_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -238,7 +246,8 @@ impl DebugSession {
             auto_attach: config.auto_attach,
             breakpoints: Vec::new(),
             stopped_target: None,
-            stopped_targets: std::collections::HashSet::new(),
+            stopped_targets: Vec::new(),
+            unreported_stops: Vec::new(),
             last_stop: None,
             watches: Vec::new(),
             pending_eval_results: HashMap::new(),
@@ -288,7 +297,7 @@ impl DebugSession {
                 continue;
             }
             info!(target_id = %state.id, state = %state.state, "target was halted before attach");
-            self.stopped_targets.insert(state.id.clone());
+            self.mark_stopped(&state.id);
             if self.stopped_target.is_none() {
                 self.stopped_target = Some(state.id.clone());
             }
@@ -380,7 +389,7 @@ impl DebugSession {
         self.listener.last_error()
     }
 
-    pub fn disconnect(mut self) -> Result<DisconnectReport, ClientError> {
+    pub fn disconnect(mut self) -> DisconnectReport {
         let mut report = DisconnectReport::default();
 
         // Cleared first: a target resumed below would otherwise halt on one of these again, with
@@ -406,9 +415,7 @@ impl DebugSession {
                 .collect(),
             Err(e) => {
                 report.warnings.push(format!("getDbgAllTargetStates refused: {e}"));
-                let mut ids: Vec<String> = self.stopped_targets.iter().cloned().collect();
-                ids.sort();
-                ids
+                self.stopped_targets.clone()
             }
         };
         for id in halted {
@@ -426,12 +433,15 @@ impl DebugSession {
         }
         // On failure the lease stays: the registration may still be alive, and a later session
         // can then take it over.
-        self.client.detach()?;
+        if let Err(e) = self.client.detach() {
+            report.detach_error = Some(e.to_string());
+            return report;
+        }
         if let Some(lease) = self.lease.take() {
             lease.release();
         }
         info!(resumed = report.resumed.len(), "detached from debug server");
-        Ok(report)
+        report
     }
 
     pub fn set_breakpoint(
@@ -593,17 +603,16 @@ impl DebugSession {
     }
 
     pub fn wait_for_stop(&mut self, timeout: Duration) -> Result<Option<StopEvent>, ClientError> {
-        // The freshest queued stop wins: an older one describes a position the caller has
-        // already resumed past, and commands would then act somewhere else entirely.
-        let mut queued: Option<StopEvent> = None;
         while let Ok(event) = self.events.try_recv() {
             if let Some(stop) = self.handle_event(event)? {
-                queued = Some(stop);
+                self.queue_stop(stop);
             }
         }
-        if let Some(stop) = queued {
-            self.last_stop = Some(stop.clone());
-            return Ok(Some(stop));
+        // The freshest stop goes first. A stop of a target that has resumed since describes a
+        // position the caller is already past, and commands would act somewhere else entirely.
+        self.unreported_stops.retain(|s| self.stopped_targets.contains(&s.target_id));
+        if let Some(stop) = self.unreported_stops.pop() {
+            return Ok(Some(self.report_stop(stop)));
         }
 
         while let Some(target_id) = self.pending_suspended.pop_front() {
@@ -622,8 +631,7 @@ impl DebugSession {
             match self.events.try_recv() {
                 Ok(event) => {
                     if let Some(stop) = self.handle_event(event)? {
-                        self.last_stop = Some(stop.clone());
-                        return Ok(Some(stop));
+                        return Ok(Some(self.report_stop(stop)));
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
@@ -636,6 +644,35 @@ impl DebugSession {
                     return Ok(None);
                 }
             }
+        }
+    }
+
+    /// A newer stop of the same target supersedes the queued one.
+    fn queue_stop(&mut self, stop: StopEvent) {
+        self.unreported_stops.retain(|s| s.target_id != stop.target_id);
+        self.unreported_stops.push(stop);
+    }
+
+    fn report_stop(&mut self, stop: StopEvent) -> StopEvent {
+        self.unreported_stops.retain(|s| s.target_id != stop.target_id);
+        self.stopped_target = Some(stop.target_id.clone());
+        self.last_stop = Some(stop.clone());
+        stop
+    }
+
+    fn mark_stopped(&mut self, target_id: &str) {
+        self.stopped_targets.retain(|t| t != target_id);
+        self.stopped_targets.push(target_id.to_string());
+    }
+
+    /// The target is running again or gone; commands that named no target fall back to the
+    /// target that stopped most recently among those still halted.
+    fn mark_resumed(&mut self, target_id: &str) {
+        self.stopped_targets.retain(|t| t != target_id);
+        self.pending_suspended.retain(|t| t != target_id);
+        self.unreported_stops.retain(|s| s.target_id != target_id);
+        if self.stopped_target.as_deref() == Some(target_id) {
+            self.stopped_target = self.stopped_targets.last().cloned();
         }
     }
 
@@ -691,7 +728,7 @@ impl DebugSession {
         target: Option<&str>,
     ) -> Result<(), ClientError> {
         let target_id = match target {
-            Some(id) if self.stopped_targets.contains(id) => id.to_string(),
+            Some(id) if self.stopped_targets.iter().any(|t| t == id) => id.to_string(),
             Some(id) => {
                 let mut stopped: Vec<&str> =
                     self.stopped_targets.iter().map(|s| s.as_str()).collect();
@@ -712,12 +749,7 @@ impl DebugSession {
         };
 
         self.client.step(&target_id, action_str)?;
-
-        self.stopped_targets.remove(&target_id);
-        self.pending_suspended.retain(|t| t != &target_id);
-        if self.stopped_target.as_deref() == Some(target_id.as_str()) {
-            self.stopped_target = self.stopped_targets.iter().next().cloned();
-        }
+        self.mark_resumed(&target_id);
         Ok(())
     }
 
@@ -823,7 +855,11 @@ impl DebugSession {
 
             match self.events.try_recv() {
                 Ok(event) => {
-                    let _ = self.handle_event(event);
+                    // A stop that arrives while an evaluation is awaited is still a stop the
+                    // next `wait_for_stop` must report.
+                    if let Ok(Some(stop)) = self.handle_event(event) {
+                        self.queue_stop(stop);
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= deadline {
@@ -1010,11 +1046,7 @@ impl DebugSession {
             DebugEvent::TargetQuit { target_id } => {
                 info!(target_id, "target quit");
                 self.attached_targets.remove(&target_id);
-                self.stopped_targets.remove(&target_id);
-                self.pending_suspended.retain(|t| t != &target_id);
-                if self.stopped_target.as_deref() == Some(&target_id) {
-                    self.stopped_target = self.stopped_targets.iter().next().cloned();
-                }
+                self.mark_resumed(&target_id);
                 Ok(None)
             }
             DebugEvent::CallStackFormed {
@@ -1032,7 +1064,7 @@ impl DebugSession {
                     return Ok(None);
                 }
 
-                self.stopped_targets.insert(target_id.clone());
+                self.mark_stopped(&target_id);
                 self.stopped_target = Some(target_id.clone());
 
                 let module_id = ModuleId {
@@ -1121,7 +1153,7 @@ impl DebugSession {
                 module_object_id,
                 module_property_id,
             } => {
-                self.stopped_targets.insert(target_id.clone());
+                self.mark_stopped(&target_id);
                 self.stopped_target = Some(target_id.clone());
 
                 let module_id = ModuleId {
@@ -1184,7 +1216,8 @@ fn reclaim_dead_session(
         ))),
         Ok(Reclaim::NoLease) => Err(ClientError::AttachFailed(format!(
             "{}; no session of this user left an id for this endpoint, so the holder is another \
-             user, the Configurator or EDT; {expiry}",
+             user, the Configurator, EDT, or a session of this user that reached the same server \
+             under another host name; {expiry}",
             in_debug_message()
         ))),
         Err(e) => Err(ClientError::AttachFailed(format!(
@@ -1437,6 +1470,67 @@ mod tests {
         );
     }
 
+    fn stop_result(target: &str, target_type: &str) -> String {
+        format!(
+            concat!(
+                r#"<debugRDBGRequestResponse:result xsi:type="debugRDBGRequestResponse:DBGUIExtCmdInfoCallStackFormed">"#,
+                "<cmdID>callStackFormed</cmdID><targetID><id>{}</id><targetType>{}</targetType>",
+                "</targetID><stopByBP>true</stopByBP></debugRDBGRequestResponse:result>"
+            ),
+            target, target_type
+        )
+    }
+
+    /// Two stops arrive in one poll, so both sit in the event queue before the first wait: the
+    /// input on which only the latest one used to be reported.
+    #[test]
+    fn two_stops_queued_between_waits_are_both_reported_latest_first() {
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = served.clone();
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
+            "getDbgAllTargetStates" => (200, String::new()),
+            "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => (
+                200,
+                format!(
+                    concat!(
+                        r#"<response xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#,
+                        r#"xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+                        "{}{}</response>"
+                    ),
+                    stop_result(CLIENT_TARGET, "ManagedClient"),
+                    stop_result(SERVER_TARGET, "ServerEmulation")
+                ),
+            ),
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !served.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the stops were never polled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        let first = session.wait_for_stop(Duration::ZERO).unwrap().expect("a stop");
+        assert_eq!(first.target_id, SERVER_TARGET, "the latest stop comes first");
+        assert_eq!(session.stopped_count(), 2);
+
+        session.continue_target(None).expect("continue the latest stop");
+        assert!(server.position("step", SERVER_TARGET).is_some());
+        assert_eq!(
+            session.stopped_target(),
+            Some(CLIENT_TARGET),
+            "commands fall back to the target still halted"
+        );
+
+        let second = session.wait_for_stop(Duration::ZERO).unwrap().expect("the earlier stop");
+        assert_eq!(second.target_id, CLIENT_TARGET, "the earlier stop is not dropped");
+        session.continue_target(None).expect("continue the earlier stop");
+        assert!(server.position("step", CLIENT_TARGET).is_some());
+        assert_eq!(session.stopped_count(), 0);
+    }
+
     #[test]
     fn disconnect_clears_breakpoints_then_resumes_what_is_still_halted() {
         let server = FakeServer::start(Box::new(halted_server));
@@ -1446,7 +1540,8 @@ mod tests {
         let lease = session.lease_path().expect("a lease is held").to_path_buf();
         session.set_breakpoint("ОбщийМодуль.ТестОтладки", 4, None).unwrap();
 
-        let report = session.disconnect().expect("disconnect");
+        let report = session.disconnect();
+        assert_eq!(report.detach_error, None);
         assert_eq!(report.resumed, [SERVER_TARGET]);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
 
@@ -1462,7 +1557,11 @@ mod tests {
             "order: clear {clear}, resume {resume}, detach {detach}"
         );
         assert!(server.position("step", CLIENT_TARGET).is_none(), "a running target is left alone");
-        assert!(!lease.exists(), "a clean detach leaves nothing to take over");
+        let name = lease.file_name().unwrap().to_str().unwrap();
+        assert!(
+            matches!(Lease::reclaim(leases.path(), name).unwrap(), Reclaim::NoLease),
+            "a clean detach leaves nothing to take over"
+        );
     }
 
     #[test]

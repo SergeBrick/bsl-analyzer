@@ -308,7 +308,7 @@ fn handle_request(
             {
                 let mut guard = state.lock().unwrap();
                 if let Some(session) = guard.session.take() {
-                    if let Err(e) = session.disconnect() {
+                    if let Some(e) = session.disconnect().detach_error {
                         tracing::warn!(error = %e, "disconnect error");
                     }
                 }

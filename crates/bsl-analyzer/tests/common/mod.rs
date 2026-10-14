@@ -212,18 +212,20 @@ impl Lsp {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let cpu_before = self.server_cpu_ticks();
-            let message = self.wait_for_within(silence.min(remaining), |_| true);
+            let mut message = self.wait_for_within(silence.min(remaining), |_| true);
             let waited = started.elapsed();
+            // Judged before the ceiling: a message delivered in time may still be taken in
+            // past it when the test thread wakes late.
+            if let Some(message) = message.take_if(|message| predicate(message)) {
+                return message;
+            }
             assert!(
                 waited < busy_ceiling,
                 "waiting at {caller} for {waited:?}: total deadline elapsed for LSP child {}; recent messages: {}",
                 self.child.id(),
                 self.recent_methods(),
             );
-            if let Some(message) = message {
-                if predicate(&message) {
-                    return message;
-                }
+            if message.is_some() {
                 continue;
             }
             let cpu_after = self.server_cpu_ticks();

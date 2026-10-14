@@ -297,3 +297,22 @@ fn a_wait_whose_bound_has_run_out_still_takes_a_message_already_delivered() {
     );
     lsp.messages = original;
 }
+
+#[test]
+fn a_matching_message_taken_in_past_the_busy_ceiling_is_still_returned() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    let delivered = json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {}});
+    sender.send(delivered.clone()).unwrap();
+
+    // A zero ceiling has always run out by the time the message is taken in, as a late
+    // wake-up of the test thread leaves it under load.
+    assert_eq!(
+        lsp.wait_for_judging(Duration::ZERO, Duration::ZERO, |_| true),
+        delivered,
+        "a message delivered in time is judged, not lost to the ceiling"
+    );
+    lsp.messages = original;
+}

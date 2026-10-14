@@ -325,10 +325,16 @@ pub fn build_step_request(
     b.build()
 }
 
+/// The target goes in `<id>`, not in the `<targetID>` that `step` and the evaluations use: the
+/// debug server rejects `<targetID>` here with an XDTO error (HTTP 400) on 8.3.17 and 8.3.27.
 pub fn build_get_callstack_request(debugger_id: &str, infobase: &str, target_id: &str) -> Vec<u8> {
     let mut b = XmlRequestBuilder::new("RDBGGetCallStackRequest", debugger_id, infobase);
-    b.write_target_id_light("targetID", target_id);
+    b.write_target_id_light("id", target_id);
     b.build()
+}
+
+pub fn build_get_all_target_states_request(debugger_id: &str, infobase: &str) -> Vec<u8> {
+    XmlRequestBuilder::new("RDBGGetDbgAllTargetStatesRequest", debugger_id, infobase).build()
 }
 
 pub fn build_eval_expr_request(
@@ -502,6 +508,23 @@ mod tests {
             !s.contains("breakOnCondition"),
             "8.3.17 rejects the whole request over this element: {s}"
         );
+    }
+
+    #[test]
+    fn get_call_stack_names_the_target_in_an_id_element() {
+        let s = String::from_utf8(build_get_callstack_request("dbg", "db", "t-1")).unwrap();
+        assert!(
+            s.contains(r#"<id xmlns:dbg="http://v8.1c.ru/8.3/debugger/debugBaseData" xsi:type="dbg:DebugTargetIdLight"><id xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData">t-1</id></id>"#),
+            "the request must carry the target as <id>: {s}"
+        );
+        assert!(!s.contains("<targetID"), "the server refuses <targetID> in this request: {s}");
+    }
+
+    #[test]
+    fn get_all_target_states_is_a_bare_request() {
+        let s = String::from_utf8(build_get_all_target_states_request("dbg", "db")).unwrap();
+        assert!(s.contains(r#"xsi:type="RDBGGetDbgAllTargetStatesRequest""#), "{s}");
+        assert!(s.ends_with("<infoBaseAlias>db</infoBaseAlias></request>"), "{s}");
     }
 
     #[test]

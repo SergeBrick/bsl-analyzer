@@ -30,7 +30,7 @@ uri: bsl-analyzer://contract
 
 ```jsonc
 {
-  "contract_version": "3.4",
+  "contract_version": "3.5",
   "build_version": "0.2.80",
   "mcp": {
     "profiles": {

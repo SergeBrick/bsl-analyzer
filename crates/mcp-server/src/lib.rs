@@ -966,6 +966,9 @@ struct DebugParams {
     condition: Option<String>,
     /// `step`: `over`/`next`, `in`/`into`, or `out` (required).
     direction: Option<String>,
+    /// `continue`/`step`: id of the halted target to act on, as `attach` or `wait_stop` print it
+    /// (optional; default the target of the latest stop).
+    target: Option<String>,
     /// `wait_stop`: max seconds to wait for a stop event (optional).
     timeout_secs: Option<u64>,
     /// `locals`/`eval`: stack frame to evaluate in — frame 0 is the current frame, and the
@@ -1876,15 +1879,21 @@ impl McpServer {
                 .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             "continue" => {
-                tokio::task::spawn_blocking(move || tools::debug::debug_continue(&session))
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+                let target = p.target;
+                tokio::task::spawn_blocking(move || {
+                    tools::debug::debug_continue(&session, target.as_deref())
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             "step" => {
                 let direction = require(p.direction, "direction", "step")?;
-                tokio::task::spawn_blocking(move || tools::debug::debug_step(&session, &direction))
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+                let target = p.target;
+                tokio::task::spawn_blocking(move || {
+                    tools::debug::debug_step(&session, &direction, target.as_deref())
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             "wait_stop" => {
                 let timeout_secs = p.timeout_secs;
@@ -4979,6 +4988,8 @@ mod tool_descriptions {
               - port: `attach`: debugger port (default 1550).
               - stack_level: `locals`/`eval`: stack frame to evaluate in — frame 0 is the current frame, and the
             numbering matches the printed stack (optional, default 0).
+              - target: `continue`/`step`: id of the halted target to act on, as `attach` or `wait_stop` print it
+            (optional; default the target of the latest stop).
               - timeout_secs: `wait_stop`: max seconds to wait for a stop event (optional).
 
             ## diagnostics

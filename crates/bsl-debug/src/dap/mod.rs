@@ -353,6 +353,7 @@ fn do_attach(
         config_root,
         extensions: Vec::new(),
         auto_attach: vec!["Client".to_string(), "Server".to_string()],
+        lease_dir: None,
     };
 
     let session = DebugSession::connect(config)?;
@@ -571,6 +572,11 @@ fn spawn_event_listener(
                         types::StoppedEventReason::Exception,
                         Some(message.clone()),
                         Some("Paused on exception".to_string()),
+                    ),
+                    StopReason::Suspended => (
+                        types::StoppedEventReason::Pause,
+                        None,
+                        Some("Was paused before this debugger attached".to_string()),
                     ),
                 };
 

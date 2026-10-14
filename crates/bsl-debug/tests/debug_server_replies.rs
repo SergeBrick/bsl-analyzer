@@ -10,6 +10,7 @@ use std::time::Duration;
 use bsl_debug::session::{DebugConfig, DebugSession};
 
 const SERVER_TARGET: &str = "2a887b1e-1151-46c8-ab56-e0078edee53d";
+const CLIENT_TARGET: &str = "950b2b2e-bb8f-4a43-b9bf-1316114df630";
 const MODULE_OBJECT: &str = "5b0c1d3e-7a01-4c11-9a01-000000000001";
 const MODULE_PROPERTY: &str = "d5963243-262e-4398-b4d7-fb16d06484f6";
 /// `ОбщийМодуль.ОбщийМодуль1.Модуль.Процедура1()`, base64 as the server sends it.
@@ -152,6 +153,7 @@ fn connect(server: &FakeServer, root: &Path) -> DebugSession {
         config_root: root.to_path_buf(),
         extensions: Vec::new(),
         auto_attach: Vec::new(),
+        lease_dir: None,
     })
     .expect("attach")
 }
@@ -297,4 +299,93 @@ fn an_evaluation_error_carries_the_platform_text() {
         }
         Ok(value) => panic!("an evaluation error must not read as a value: {value:?}"),
     }
+}
+
+/// Targets of a file infobase as `getDbgTargets` lists them, and their run states as
+/// `getDbgAllTargetStates` reports them while the server target sits halted (state 32).
+fn halted_server(cmd: &str, body: &str) -> (u16, String) {
+    let target = |id: &str, kind: &str, state_num: u8, state: &str| {
+        format!(
+            concat!(
+                "<debugRDBGRequestResponse:item><targetID><id>{id}</id>",
+                "<infoBaseAlias>DefAlias</infoBaseAlias><targetType>{kind}</targetType>",
+                "</targetID><stateNum>{num}</stateNum><state>{state}</state>",
+                "</debugRDBGRequestResponse:item>"
+            ),
+            id = id,
+            kind = kind,
+            num = state_num,
+            state = state,
+        )
+    };
+    let response = |inner: String| {
+        format!(
+            concat!(
+                r#"<response xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" "#,
+                r#"xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+                "{inner}</response>"
+            ),
+            inner = inner
+        )
+    };
+    match cmd {
+        "getDbgTargets" => (
+            200,
+            response(format!(
+                concat!(
+                    "<debugRDBGRequestResponse:id><id>{client}</id><infoBaseAlias>DefAlias",
+                    "</infoBaseAlias><targetType>ManagedClient</targetType>",
+                    "</debugRDBGRequestResponse:id><debugRDBGRequestResponse:id><id>{server}</id>",
+                    "<infoBaseAlias>DefAlias</infoBaseAlias><targetType>ServerEmulation",
+                    "</targetType></debugRDBGRequestResponse:id>"
+                ),
+                client = CLIENT_TARGET,
+                server = SERVER_TARGET,
+            )),
+        ),
+        "getDbgAllTargetStates" => (
+            200,
+            response(
+                target(CLIENT_TARGET, "ManagedClient", 16, "Worked")
+                    + &target(SERVER_TARGET, "ServerEmulation", 32, "StopOnNextLine"),
+            ),
+        ),
+        "getCallStack" => (
+            200,
+            response(format!(
+                concat!(
+                    "<debugRDBGRequestResponse:callStack><moduleID><objectID>{object}</objectID>",
+                    "<propertyID>{property}</propertyID></moduleID><lineNo>1</lineNo>",
+                    "<presentation>{pres}</presentation><isFantom>false</isFantom>",
+                    "</debugRDBGRequestResponse:callStack>"
+                ),
+                object = MODULE_OBJECT,
+                property = MODULE_PROPERTY,
+                pres = PRESENTATION,
+            )),
+        ),
+        _ => quiet_server(cmd, body),
+    }
+}
+
+#[test]
+fn a_target_halted_before_the_attach_is_reported_and_can_be_resumed() {
+    let server = FakeServer::start(Box::new(halted_server));
+    let root = config_root();
+    let mut session = connect(&server, root.path());
+
+    let stop = session
+        .wait_for_stop(Duration::from_secs(1))
+        .unwrap()
+        .expect("a target the server reports halted is a stop, though its event went elsewhere");
+    assert_eq!(stop.target_id, SERVER_TARGET);
+    assert_eq!(stop.line, 1);
+    assert!(stop.module.ends_with("Module.bsl"), "resolved to the source: {}", stop.module);
+
+    session.continue_execution().expect("continue reaches the halted target");
+    let resumed = server
+        .bodies_of("step")
+        .into_iter()
+        .any(|b| b.contains(SERVER_TARGET) && b.contains("<action>Continue</action>"));
+    assert!(resumed, "a Continue went to the halted target: {:#?}", server.bodies_of("step"));
 }

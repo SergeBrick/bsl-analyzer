@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,16 +8,17 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::client::{ClientError, DebugClient};
+use crate::lease::{Lease, Reclaim};
 use crate::listener::EventListener;
 use crate::module_index::ModuleIndex;
 use crate::types::base::{CalcPathItem, ModuleId, StepAction, ViewInterface};
 use crate::types::events::DebugEvent;
-use crate::types::responses::{self, EvalPayload};
+use crate::types::responses::{self, AttachResult, EvalPayload};
 use crate::types::xml::BreakpointDef;
 
 pub struct DebugSession {
     client: Arc<DebugClient>,
-    _listener: EventListener,
+    listener: EventListener,
     events: mpsc::UnboundedReceiver<DebugEvent>,
     index: ModuleIndex,
     attached_targets: HashMap<String, String>,
@@ -35,6 +36,12 @@ pub struct DebugSession {
     /// its failure must not undo an attach that already happened.
     known_targets: Vec<TargetInfo>,
     setup_warnings: Vec<String>,
+    /// Halted before this session attached and not yet reported by `wait_for_stop`: the server
+    /// never replays their stop event, so nothing else would ever announce them.
+    pending_suspended: VecDeque<String>,
+    suspended_at_attach: Vec<String>,
+    lease: Option<Lease>,
+    reclaimed_dead_session: bool,
 }
 
 pub struct DebugConfig {
@@ -44,6 +51,10 @@ pub struct DebugConfig {
     pub config_root: PathBuf,
     pub extensions: Vec<(String, PathBuf)>,
     pub auto_attach: Vec<String>,
+    /// Where the debugger UI id of a live session is recorded, so that a session started after
+    /// this one died can take its registration over (see [`crate::lease`]). `None` disables both
+    /// the record and the takeover.
+    pub lease_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -53,13 +64,29 @@ pub struct StopEvent {
     pub module: String,
     pub line: u32,
     pub stack: Vec<FrameInfo>,
+    /// Why the position is unknown, when it is.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum StopReason {
     Breakpoint,
     Step,
-    Exception { message: String },
+    Exception {
+        message: String,
+    },
+    /// Halted before this session attached — typically by a debugger that went away without
+    /// resuming it. Its breakpoint or step is not known to this session.
+    Suspended,
+}
+
+/// What `disconnect` did besides detaching.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct DisconnectReport {
+    /// Targets resumed because they were halted: once the debugger is gone nothing else would
+    /// resume them, and their client stays frozen.
+    pub resumed: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -129,16 +156,55 @@ impl DebugSession {
             ModuleIndex::scan(&config.config_root, &ext_refs).map_err(ClientError::Debug)?;
         info!(modules = index.len(), "module index built");
 
-        let client =
-            Arc::new(DebugClient::new(&config.host, config.port, &debugger_id, &config.infobase));
+        let lease_name = Lease::file_name(&config.host, config.port, &config.infobase);
+        let mut setup_warnings: Vec<String> = Vec::new();
+        let mut client =
+            DebugClient::new(&config.host, config.port, &debugger_id, &config.infobase);
+        let mut lease = None;
+        let mut reclaimed_dead_session = false;
 
-        let result = client.attach()?;
-        match &result {
-            crate::types::responses::AttachResult::Ok => {
+        match client.attach()? {
+            AttachResult::Ok => {
                 info!("attached to debug server");
+                if let Some(dir) = &config.lease_dir {
+                    match Lease::acquire(dir, &lease_name, &debugger_id) {
+                        Ok(Some(held)) => lease = Some(held),
+                        Ok(None) => setup_warnings.push(
+                            "another live session of this user holds the debugger lease for this \
+                             endpoint; if this session dies without disconnect, a later one \
+                             cannot take its place"
+                                .into(),
+                        ),
+                        Err(e) => setup_warnings.push(format!("debugger lease not recorded: {e}")),
+                    }
+                }
             }
-            crate::types::responses::AttachResult::IBInDebug => {
-                info!("infobase already in debug mode — proceeding");
+            // Proceeding here used to look like a working session: every command after it is
+            // refused, and the event channel answers "UI+ - часть отладки не зарегистрирована",
+            // so no stop could ever arrive.
+            AttachResult::IBInDebug => {
+                let (held, previous_id) =
+                    reclaim_dead_session(config.lease_dir.as_deref(), &lease_name)?;
+                client =
+                    DebugClient::new(&config.host, config.port, &previous_id, &config.infobase);
+                match client.attach()? {
+                    AttachResult::Ok => {
+                        info!(previous_id, "took over the registration of a dead session");
+                        lease = Some(held);
+                        reclaimed_dead_session = true;
+                    }
+                    other => {
+                        // The holder is not the session the lease remembers, so the lease
+                        // describes nothing any more.
+                        held.release();
+                        return Err(ClientError::AttachFailed(format!(
+                            "{}; the id left by a previous session of this user was refused too \
+                             ({}), so the holder is someone else",
+                            in_debug_message(),
+                            other.error_message().unwrap_or("registered")
+                        )));
+                    }
+                }
             }
             other => {
                 return Err(ClientError::AttachFailed(
@@ -146,10 +212,10 @@ impl DebugSession {
                 ));
             }
         }
+        let client = Arc::new(client);
 
         // Both are conveniences the session works without, and the HTTP status of neither used to
         // be read at all: a server that refuses one must not now cost the caller the whole attach.
-        let mut setup_warnings: Vec<String> = Vec::new();
         if let Err(e) = client.init_settings() {
             setup_warnings.push(format!("initSettings refused: {e}"));
         }
@@ -165,7 +231,7 @@ impl DebugSession {
 
         let mut session = Self {
             client,
-            _listener: listener,
+            listener,
             events,
             index,
             attached_targets: HashMap::new(),
@@ -178,13 +244,57 @@ impl DebugSession {
             pending_eval_results: HashMap::new(),
             known_targets: Vec::new(),
             setup_warnings,
+            pending_suspended: VecDeque::new(),
+            suspended_at_attach: Vec::new(),
+            lease,
+            reclaimed_dead_session,
         };
 
         // `setAutoAttachSettings` only covers targets that start later, so a client that was
         // already running would never be attached and no breakpoint would ever be hit.
         session.attach_running_targets();
+        session.adopt_suspended_targets();
 
         Ok(session)
+    }
+
+    /// A target halted before this attach stays halted, and the server does not repeat its stop
+    /// event to a new debugger: unless it is found here, `wait_stop` times out forever and
+    /// `continue` has no target to act on, while the client stays frozen.
+    fn adopt_suspended_targets(&mut self) {
+        let states = match self.client.get_all_target_states() {
+            Ok(states) => states,
+            Err(e) => {
+                self.setup_warnings.push(format!(
+                    "getDbgAllTargetStates refused: {e}; a target halted before this attach \
+                     would go unnoticed"
+                ));
+                return;
+            }
+        };
+        for state in states {
+            if let Some(known) = self.known_targets.iter_mut().find(|k| k.id == state.id) {
+                known.state = state.state.clone();
+            }
+            if !responses::is_suspended_state(&state.state) {
+                continue;
+            }
+            if !self.attached_targets.contains_key(&state.id) {
+                self.setup_warnings.push(format!(
+                    "target {} ({}) is halted, but auto_attach leaves it out, so this session \
+                     cannot resume it",
+                    state.id, state.target_type
+                ));
+                continue;
+            }
+            info!(target_id = %state.id, state = %state.state, "target was halted before attach");
+            self.stopped_targets.insert(state.id.clone());
+            if self.stopped_target.is_none() {
+                self.stopped_target = Some(state.id.clone());
+            }
+            self.pending_suspended.push_back(state.id.clone());
+            self.suspended_at_attach.push(state.id);
+        }
     }
 
     fn attach_running_targets(&mut self) {
@@ -250,18 +360,78 @@ impl DebugSession {
         &self.setup_warnings
     }
 
-    pub fn disconnect(self) -> Result<(), ClientError> {
-        self._listener.stop();
-        // Whether a target left attached is why the thin client then refuses to close on
-        // WM_CLOSE is unestablished; this only makes the teardown symmetric.
+    /// Targets found halted when this session attached.
+    pub fn suspended_at_attach(&self) -> &[String] {
+        &self.suspended_at_attach
+    }
+
+    /// Whether this session re-registered under the id of a session that died holding the
+    /// infobase.
+    pub fn reclaimed_dead_session(&self) -> bool {
+        self.reclaimed_dead_session
+    }
+
+    pub fn lease_path(&self) -> Option<&Path> {
+        self.lease.as_ref().map(|l| l.path())
+    }
+
+    /// Why polling the event channel fails, while it does.
+    pub fn event_channel_error(&self) -> Option<String> {
+        self.listener.last_error()
+    }
+
+    pub fn disconnect(mut self) -> Result<DisconnectReport, ClientError> {
+        let mut report = DisconnectReport::default();
+
+        // Cleared first: a target resumed below would otherwise halt on one of these again, with
+        // no debugger left to resume it.
+        if !self.breakpoints.is_empty() {
+            if let Err(e) = self.client.set_breakpoints(&[]) {
+                report.warnings.push(format!("breakpoints not cleared: {e}"));
+            }
+            self.breakpoints.clear();
+        }
+
+        // A target left halted keeps its client frozen after the debugger is gone. The server's
+        // own state list is the authority; the session's set is only a fallback, since a target
+        // in it may have been resumed by someone else meanwhile.
+        let halted: Vec<String> = match self.client.get_all_target_states() {
+            Ok(states) => states
+                .into_iter()
+                .filter(|s| {
+                    responses::is_suspended_state(&s.state)
+                        && self.attached_targets.contains_key(&s.id)
+                })
+                .map(|s| s.id)
+                .collect(),
+            Err(e) => {
+                report.warnings.push(format!("getDbgAllTargetStates refused: {e}"));
+                let mut ids: Vec<String> = self.stopped_targets.iter().cloned().collect();
+                ids.sort();
+                ids
+            }
+        };
+        for id in halted {
+            match self.client.step(&id, "Continue") {
+                Ok(()) => report.resumed.push(id),
+                Err(e) => report.warnings.push(format!("target {id} not resumed: {e}")),
+            }
+        }
+
+        self.listener.stop();
         for id in self.attached_targets.keys() {
             if let Err(e) = self.client.detach_targets(&[id.as_str()]) {
                 debug!(target_id = %id, error = %e, "detaching a target on disconnect failed");
             }
         }
+        // On failure the lease stays: the registration may still be alive, and a later session
+        // can then take it over.
         self.client.detach()?;
-        info!("detached from debug server");
-        Ok(())
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
+        info!(resumed = report.resumed.len(), "detached from debug server");
+        Ok(report)
     }
 
     pub fn set_breakpoint(
@@ -436,6 +606,16 @@ impl DebugSession {
             return Ok(Some(stop));
         }
 
+        while let Some(target_id) = self.pending_suspended.pop_front() {
+            // Resumed meanwhile — by this session's `continue` or by the target ending.
+            if !self.stopped_targets.contains(&target_id) {
+                continue;
+            }
+            let stop = self.suspended_stop(target_id, timeout);
+            self.last_stop = Some(stop.clone());
+            return Ok(Some(stop));
+        }
+
         let deadline = std::time::Instant::now() + timeout;
 
         loop {
@@ -459,8 +639,70 @@ impl DebugSession {
         }
     }
 
+    /// Where a target halted before this attach stands. Only `getCallStack` can say: the stop
+    /// event that carried the position went to the debugger that halted it.
+    ///
+    /// The wait for that answer is the caller's `wait_stop` budget, capped: the halt itself is
+    /// already known, and only its position is being waited for.
+    fn suspended_stop(&mut self, target_id: String, budget: Duration) -> StopEvent {
+        self.stopped_target = Some(target_id.clone());
+        let wait = budget.clamp(Duration::from_secs(1), crate::client::CALL_STACK_TIMEOUT);
+        let (stack, detail) = match self.call_stack_within(&target_id, wait) {
+            Ok(stack) if !stack.is_empty() => (stack, None),
+            Ok(_) => (
+                Vec::new(),
+                Some(
+                    "the debug server answered the call-stack request with nothing (both 8.3.17 \
+                     and 8.3.27 do so at times); locals, eval and continue work regardless"
+                        .to_string(),
+                ),
+            ),
+            Err(e) => (
+                Vec::new(),
+                Some(format!(
+                    "call stack unavailable: {e}; locals, eval and continue work regardless"
+                )),
+            ),
+        };
+        let (module, line) = stack
+            .first()
+            .map(|f| {
+                let module = if f.module_path.is_empty() {
+                    f.module_name.clone()
+                } else {
+                    f.module_path.clone()
+                };
+                (module, f.line)
+            })
+            .unwrap_or_default();
+        StopEvent { reason: StopReason::Suspended, target_id, module, line, stack, detail }
+    }
+
     pub fn step(&mut self, action: StepAction) -> Result<(), ClientError> {
-        let target_id = self.require_stopped_target()?.to_string();
+        self.step_target(action, None)
+    }
+
+    /// `target` picks one of the halted targets explicitly; without it the command goes to the
+    /// target of the latest stop. Two targets can be halted at once — one left over from before
+    /// the attach and one this session stopped — and only an id tells them apart.
+    pub fn step_target(
+        &mut self,
+        action: StepAction,
+        target: Option<&str>,
+    ) -> Result<(), ClientError> {
+        let target_id = match target {
+            Some(id) if self.stopped_targets.contains(id) => id.to_string(),
+            Some(id) => {
+                let mut stopped: Vec<&str> =
+                    self.stopped_targets.iter().map(|s| s.as_str()).collect();
+                stopped.sort_unstable();
+                return Err(ClientError::TargetNotStopped {
+                    target: id.to_string(),
+                    stopped: if stopped.is_empty() { "none".into() } else { stopped.join(", ") },
+                });
+            }
+            None => self.require_stopped_target()?.to_string(),
+        };
 
         let action_str = match action {
             StepAction::Next => "Step",
@@ -472,6 +714,7 @@ impl DebugSession {
         self.client.step(&target_id, action_str)?;
 
         self.stopped_targets.remove(&target_id);
+        self.pending_suspended.retain(|t| t != &target_id);
         if self.stopped_target.as_deref() == Some(target_id.as_str()) {
             self.stopped_target = self.stopped_targets.iter().next().cloned();
         }
@@ -480,6 +723,10 @@ impl DebugSession {
 
     pub fn continue_execution(&mut self) -> Result<(), ClientError> {
         self.step(StepAction::Continue)
+    }
+
+    pub fn continue_target(&mut self, target: Option<&str>) -> Result<(), ClientError> {
+        self.step_target(StepAction::Continue, target)
     }
 
     /// The target commands act on, and only while it is still halted: the debug server answers
@@ -495,8 +742,19 @@ impl DebugSession {
 
     pub fn call_stack(&self) -> Result<Vec<FrameInfo>, ClientError> {
         let target_id = self.require_stopped_target()?;
+        self.call_stack_of(target_id)
+    }
 
-        let frames = self.client.get_call_stack(target_id)?;
+    fn call_stack_of(&self, target_id: &str) -> Result<Vec<FrameInfo>, ClientError> {
+        self.call_stack_within(target_id, crate::client::CALL_STACK_TIMEOUT)
+    }
+
+    fn call_stack_within(
+        &self,
+        target_id: &str,
+        wait: Duration,
+    ) -> Result<Vec<FrameInfo>, ClientError> {
+        let frames = self.client.get_call_stack(target_id, wait)?;
 
         Ok(frames
             .into_iter()
@@ -753,6 +1011,7 @@ impl DebugSession {
                 info!(target_id, "target quit");
                 self.attached_targets.remove(&target_id);
                 self.stopped_targets.remove(&target_id);
+                self.pending_suspended.retain(|t| t != &target_id);
                 if self.stopped_target.as_deref() == Some(&target_id) {
                     self.stopped_target = self.stopped_targets.iter().next().cloned();
                 }
@@ -851,6 +1110,7 @@ impl DebugSession {
                     module: stop_module,
                     line: stop_line,
                     stack,
+                    detail: None,
                 }))
             }
             DebugEvent::RuntimeException {
@@ -883,6 +1143,7 @@ impl DebugSession {
                     module: module_path,
                     line: line_no,
                     stack,
+                    detail: None,
                 }))
             }
             DebugEvent::ExprEvaluated { result_id, raw_xml } => {
@@ -891,5 +1152,420 @@ impl DebugSession {
                 Ok(None)
             }
         }
+    }
+}
+
+fn in_debug_message() -> String {
+    "the infobase is held by another debugger (the debug server answered `ibInDebug`): commands \
+     from this one would be refused and no stop would ever reach it"
+        .to_string()
+}
+
+/// The registration that holds the infobase may be one this user's own earlier session left
+/// behind when it died; its id, re-registered, takes that place at once instead of after the
+/// server's minute of patience, and keeps whatever that session left halted resumable.
+fn reclaim_dead_session(
+    lease_dir: Option<&Path>,
+    lease_name: &str,
+) -> Result<(Lease, String), ClientError> {
+    let expiry = "a holder that died without detaching is dropped by the debug server after about \
+                  a minute without polling; a target it left halted can stay frozen even then, \
+                  and only restarting that client recovers it";
+    let Some(dir) = lease_dir else {
+        return Err(ClientError::AttachFailed(format!("{}; {expiry}", in_debug_message())));
+    };
+    match Lease::reclaim(dir, lease_name) {
+        Ok(Reclaim::Reclaimed { lease, debugger_id }) => Ok((lease, debugger_id)),
+        Ok(Reclaim::HeldByLiveSession) => Err(ClientError::AttachFailed(format!(
+            "{}; the holder is another live debug session of this user (lease {}): disconnect \
+             it first",
+            in_debug_message(),
+            dir.join(lease_name).display()
+        ))),
+        Ok(Reclaim::NoLease) => Err(ClientError::AttachFailed(format!(
+            "{}; no session of this user left an id for this endpoint, so the holder is another \
+             user, the Configurator or EDT; {expiry}",
+            in_debug_message()
+        ))),
+        Err(e) => Err(ClientError::AttachFailed(format!(
+            "{}; the lease of a previous session could not be read ({e}); {expiry}",
+            in_debug_message()
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The session against a scripted debug server: answers are recorded traffic, the order and
+    //! content of the requests the session sends are what is asserted.
+
+    use super::*;
+    use crate::types::responses::recorded;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    const SERVER_TARGET: &str = "2a887b1e-1151-46c8-ab56-e0078edee53d";
+    const CLIENT_TARGET: &str = "950b2b2e-bb8f-4a43-b9bf-1316114df630";
+
+    const REGISTERED: &str = concat!(
+        r#"<response xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+        "<debugRDBGRequestResponse:result>registered</debugRDBGRequestResponse:result></response>"
+    );
+    const IB_IN_DEBUG: &str = concat!(
+        r#"<response xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+        "<debugRDBGRequestResponse:result>ibInDebug</debugRDBGRequestResponse:result></response>"
+    );
+    const NOT_REGISTERED: &str = concat!(
+        r#"<exception xmlns="http://v8.1c.ru/8.2/virtual-resource-system" reason="400">"#,
+        r#"<descr xmlns="http://v8.1c.ru/8.1/data/core">Ошибка при выполнении запроса POST к ресурсу /e1crdbg/rdbg:"#,
+        "\nUI+ - часть отладки не зарегистрирована</descr></exception>"
+    );
+
+    fn targets_xml() -> String {
+        format!(
+            concat!(
+                r#"<response xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+                "<debugRDBGRequestResponse:id><id>{}</id><infoBaseAlias>DefAlias</infoBaseAlias>",
+                "<targetType>ManagedClient</targetType></debugRDBGRequestResponse:id>",
+                "<debugRDBGRequestResponse:id><id>{}</id><infoBaseAlias>DefAlias</infoBaseAlias>",
+                "<targetType>ServerEmulation</targetType></debugRDBGRequestResponse:id></response>"
+            ),
+            CLIENT_TARGET, SERVER_TARGET
+        )
+    }
+
+    type Script = dyn Fn(&str, &str) -> (u16, String) + Send + Sync;
+
+    /// A debug server that answers by script and records every request but the event polls.
+    struct FakeServer {
+        port: u16,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl FakeServer {
+        fn start(script: Box<Script>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let script: Arc<Script> = Arc::from(script);
+            let log = requests.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let script = script.clone();
+                    let log = log.clone();
+                    std::thread::spawn(move || serve(stream, &*script, &log));
+                }
+            });
+            Self { port, requests }
+        }
+
+        fn commands(&self) -> Vec<(String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn position(&self, cmd: &str, body_part: &str) -> Option<usize> {
+            self.commands().iter().position(|(c, b)| c == cmd && b.contains(body_part))
+        }
+    }
+
+    fn serve(stream: std::net::TcpStream, script: &Script, log: &Mutex<Vec<(String, String)>>) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        let mut length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut body = vec![0u8; length];
+        let _ = reader.read_exact(&mut body);
+        let body = String::from_utf8_lossy(&body).to_string();
+        let cmd = request_line
+            .split("cmd=")
+            .nth(1)
+            .map(|rest| rest.split(['&', ' ']).next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let (status, answer) = if cmd == "pingDebugUIParams" {
+            std::thread::sleep(Duration::from_millis(20));
+            script(&cmd, &body)
+        } else {
+            log.lock().unwrap().push((cmd.clone(), body.clone()));
+            script(&cmd, &body)
+        };
+        let reason = if status < 300 { "OK" } else { "Bad Request" };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{answer}",
+            answer.len()
+        );
+        let mut stream = stream;
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    /// The common answers of a server whose server-side target is halted.
+    fn halted_server(cmd: &str, _body: &str) -> (u16, String) {
+        match cmd {
+            "attachDebugUI" => (200, REGISTERED.into()),
+            "getDbgTargets" => (200, targets_xml()),
+            "getDbgAllTargetStates" => {
+                (200, recorded::ALL_TARGET_STATES_WITH_A_HALTED_TARGET.into())
+            }
+            "getCallStack" => (200, recorded::GET_CALL_STACK.into()),
+            "pingDebugUIParams" => (204, String::new()),
+            _ => (200, String::new()),
+        }
+    }
+
+    fn config_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "Configuration.xml",
+            "<?xml version=\"1.0\"?><MetaDataObject><Configuration \
+             uuid=\"00000000-0000-0000-0000-0000000000c0\"></Configuration></MetaDataObject>",
+        );
+        write(
+            "CommonModules/ТестОтладки.xml",
+            "<?xml version=\"1.0\"?><MetaDataObject><CommonModule \
+             uuid=\"5b0c1d3e-7a01-4c11-9a01-000000000001\"></CommonModule></MetaDataObject>",
+        );
+        write("CommonModules/ТестОтладки/Ext/Module.bsl", "Функция Посчитать(Знач Н) Экспорт\n");
+        dir
+    }
+
+    fn connect(
+        server: &FakeServer,
+        root: &Path,
+        lease_dir: Option<&Path>,
+    ) -> Result<DebugSession, ClientError> {
+        DebugSession::connect(DebugConfig {
+            host: "127.0.0.1".into(),
+            port: server.port,
+            infobase: "DefAlias".into(),
+            config_root: root.to_path_buf(),
+            extensions: Vec::new(),
+            auto_attach: Vec::new(),
+            lease_dir: lease_dir.map(Path::to_path_buf),
+        })
+    }
+
+    #[test]
+    fn a_target_halted_before_the_attach_is_reported_and_can_be_continued() {
+        let server = FakeServer::start(Box::new(halted_server));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+
+        assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
+        let states: Vec<(&str, &str)> =
+            session.known_targets().iter().map(|t| (t.id.as_str(), t.state.as_str())).collect();
+        assert!(states.contains(&(SERVER_TARGET, "StopOnNextLine")), "{states:?}");
+        assert!(states.contains(&(CLIENT_TARGET, "Worked")), "{states:?}");
+
+        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the halt is reported");
+        assert!(matches!(stop.reason, StopReason::Suspended), "{:?}", stop.reason);
+        assert_eq!(stop.target_id, SERVER_TARGET);
+        assert_eq!(stop.line, 4);
+        assert!(stop.module.ends_with("Module.bsl"), "resolved to the source: {}", stop.module);
+        assert!(stop.detail.is_none(), "{:?}", stop.detail);
+        let stack_request = server.position("getCallStack", SERVER_TARGET).expect("stack asked");
+        assert!(
+            server.commands()[stack_request].1.contains("<id xmlns:dbg="),
+            "getCallStack names the target in <id>: {:?}",
+            server.commands()[stack_request]
+        );
+
+        session.continue_execution().expect("continue reaches the halted target");
+        let step = server.position("step", SERVER_TARGET).expect("a step request for it");
+        assert!(server.commands()[step].1.contains("<action>Continue</action>"));
+        assert_eq!(session.stopped_count(), 0);
+        assert!(
+            session.wait_for_stop(Duration::from_millis(100)).unwrap().is_none(),
+            "a resumed target is not reported again"
+        );
+    }
+
+    #[test]
+    fn a_halt_without_a_call_stack_is_still_reported_and_resumable() {
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+            if cmd == "getCallStack" {
+                (204, String::new())
+            } else {
+                halted_server(cmd, body)
+            }
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+
+        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the halt is reported");
+        assert!(matches!(stop.reason, StopReason::Suspended));
+        assert_eq!(stop.target_id, SERVER_TARGET);
+        let detail = stop.detail.expect("an unknown position says why");
+        assert!(detail.contains("continue work regardless"), "{detail}");
+        session.continue_execution().expect("resumable without a position");
+        assert!(server.position("step", SERVER_TARGET).is_some());
+    }
+
+    #[test]
+    fn continue_names_the_halted_targets_when_asked_for_another() {
+        let server = FakeServer::start(Box::new(halted_server));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+
+        let err = session.continue_target(Some(CLIENT_TARGET)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(CLIENT_TARGET) && text.contains(SERVER_TARGET), "{text}");
+
+        session.continue_target(Some(SERVER_TARGET)).expect("the halted one by id");
+        assert!(
+            session.wait_for_stop(Duration::from_millis(50)).unwrap().is_none(),
+            "a target resumed before it was reported is not reported afterwards"
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_breakpoints_then_resumes_what_is_still_halted() {
+        let server = FakeServer::start(Box::new(halted_server));
+        let root = config_root();
+        let leases = tempfile::tempdir().unwrap();
+        let mut session = connect(&server, root.path(), Some(leases.path())).expect("attach");
+        let lease = session.lease_path().expect("a lease is held").to_path_buf();
+        session.set_breakpoint("ОбщийМодуль.ТестОтладки", 4, None).unwrap();
+
+        let report = session.disconnect().expect("disconnect");
+        assert_eq!(report.resumed, [SERVER_TARGET]);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        let clear = server
+            .commands()
+            .iter()
+            .rposition(|(c, b)| c == "setBreakpoints" && !b.contains("<bpInfo>"))
+            .expect("an empty breakpoint list is sent");
+        let resume = server.position("step", SERVER_TARGET).expect("the halted target resumed");
+        let detach = server.position("detachDebugUI", "").expect("detached");
+        assert!(
+            clear < resume && resume < detach,
+            "order: clear {clear}, resume {resume}, detach {detach}"
+        );
+        assert!(server.position("step", CLIENT_TARGET).is_none(), "a running target is left alone");
+        assert!(!lease.exists(), "a clean detach leaves nothing to take over");
+    }
+
+    #[test]
+    fn an_infobase_held_by_a_dead_session_of_this_user_is_taken_over() {
+        let leases = tempfile::tempdir().unwrap();
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+            if cmd == "attachDebugUI" {
+                if body.contains("<idOfDebuggerUI>dead-session-id</idOfDebuggerUI>") {
+                    (200, REGISTERED.into())
+                } else {
+                    (200, IB_IN_DEBUG.into())
+                }
+            } else {
+                halted_server(cmd, body)
+            }
+        }));
+        let name_for_port = Lease::file_name("127.0.0.1", server.port, "DefAlias");
+        // What a killed process leaves: the file, without the lock.
+        drop(Lease::acquire(leases.path(), &name_for_port, "dead-session-id").unwrap());
+
+        let root = config_root();
+        let mut session = connect(&server, root.path(), Some(leases.path())).expect("taken over");
+        assert!(session.reclaimed_dead_session());
+        let later = server.commands().into_iter().skip_while(|(c, _)| c == "attachDebugUI");
+        for (cmd, body) in later {
+            assert!(
+                body.is_empty() || body.contains("dead-session-id"),
+                "{cmd} must go out under the dead session's id: {body}"
+            );
+        }
+        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("its halt");
+        assert_eq!(stop.target_id, SERVER_TARGET);
+        session.continue_execution().unwrap();
+    }
+
+    #[test]
+    fn an_infobase_held_by_someone_else_refuses_the_attach_instead_of_faking_one() {
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+            if cmd == "attachDebugUI" {
+                (200, IB_IN_DEBUG.into())
+            } else {
+                halted_server(cmd, body)
+            }
+        }));
+        let root = config_root();
+        let leases = tempfile::tempdir().unwrap();
+        let err = match connect(&server, root.path(), Some(leases.path())) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("ibInDebug must not produce a session"),
+        };
+        assert!(err.contains("ibInDebug"), "{err}");
+        assert!(err.contains("no session of this user"), "{err}");
+        assert!(server.position("attachDebugUI", "").is_some());
+        assert!(
+            server.position("getDbgTargets", "").is_none(),
+            "nothing past the refusal: {:?}",
+            server.commands()
+        );
+    }
+
+    #[test]
+    fn a_live_session_of_this_user_is_not_displaced() {
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+            if cmd == "attachDebugUI" {
+                (200, IB_IN_DEBUG.into())
+            } else {
+                halted_server(cmd, body)
+            }
+        }));
+        let leases = tempfile::tempdir().unwrap();
+        let name = Lease::file_name("127.0.0.1", server.port, "DefAlias");
+        let _live = Lease::acquire(leases.path(), &name, "live-id").unwrap().expect("lease");
+        let root = config_root();
+        let err = match connect(&server, root.path(), Some(leases.path())) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a live holder must not be displaced"),
+        };
+        assert!(err.contains("another live debug session"), "{err}");
+        assert!(
+            server.commands().iter().all(|(_, b)| !b.contains("live-id")),
+            "the live session's id is never sent"
+        );
+    }
+
+    #[test]
+    fn a_refused_event_channel_is_reported() {
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+            if cmd == "pingDebugUIParams" {
+                (400, NOT_REGISTERED.into())
+            } else {
+                halted_server(cmd, body)
+            }
+        }));
+        let root = config_root();
+        let session = connect(&server, root.path(), None).expect("attach");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            if let Some(e) = session.event_channel_error() {
+                break e;
+            }
+            assert!(std::time::Instant::now() < deadline, "the refusal never surfaced");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(error.contains("часть отладки не зарегистрирована"), "{error}");
     }
 }

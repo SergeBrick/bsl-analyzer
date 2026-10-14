@@ -75,6 +75,16 @@ pub struct DebugTarget {
     pub state: String,
 }
 
+/// Whether a `DbgTargetState` from `getDbgAllTargetStates` means the target is halted and waits
+/// for a debugger command.
+///
+/// A target halted on a breakpoint reports `StopOnNextLine` (state number 32) on both 8.3.17 and
+/// 8.3.27, a running one `Worked` (16); there is no state literally called "stopped". `Evaluating`
+/// is a halted target busy with an expression and resumes the same way.
+pub fn is_suspended_state(state: &str) -> bool {
+    matches!(state, "StopOnNextLine" | "Evaluating")
+}
+
 /// Targets come back under a per-command wrapper — `<…:id>` from `getDbgTargets`, `<…:item>`
 /// from `step` — and the fields sit one level deeper in the second shape, inside `<targetID>`.
 /// Depth carries both: depth 2 starts a target whatever it is called, and only leaves at depth
@@ -416,6 +426,39 @@ fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Recorded debug server answers (03.10.2026, 8.3.27.2214) shared by the parser and session tests.
+#[cfg(test)]
+pub(crate) mod recorded {
+    /// `getDbgAllTargetStates` while the server target was halted on a breakpoint by a debugger
+    /// that then detached without resuming it.
+    pub(crate) const ALL_TARGET_STATES_WITH_A_HALTED_TARGET: &str = concat!(
+        r#"<response xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+        "<debugRDBGRequestResponse:item><targetIDStr>SwqBgY</targetIDStr><targetID>",
+        "<id>950b2b2e-bb8f-4a43-b9bf-1316114df630</id><seanceNo>2</seanceNo>",
+        "<infoBaseAlias>DefAlias</infoBaseAlias><isServerInfoBase>undefined</isServerInfoBase>",
+        "<targetType>ManagedClient</targetType></targetID><stateNum>16</stateNum>",
+        "<state>Worked</state></debugRDBGRequestResponse:item>",
+        "<debugRDBGRequestResponse:item><targetIDStr>SwqBgZ</targetIDStr><targetID>",
+        "<id>2a887b1e-1151-46c8-ab56-e0078edee53d</id><seanceNo>2</seanceNo>",
+        "<infoBaseAlias>DefAlias</infoBaseAlias><isServerInfoBase>undefined</isServerInfoBase>",
+        "<targetType>ServerEmulation</targetType></targetID><stateNum>32</stateNum>",
+        "<state>StopOnNextLine</state></debugRDBGRequestResponse:item></response>",
+    );
+
+    /// `getCallStack` for that halted target; the presentation is base64 wrapped across lines.
+    pub(crate) const GET_CALL_STACK: &str = concat!(
+        "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        r#"<response xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+        "<debugRDBGRequestResponse:callStack><moduleIDStr>QEGBtT4dDFsB</moduleIDStr><moduleID>",
+        "<objectID>5b0c1d3e-7a01-4c11-9a01-000000000001</objectID>",
+        "<propertyID>d5963243-262e-4398-b4d7-fb16d06484f6</propertyID>",
+        "<version>0f84ca11bff27b429159133d0f8b574500000000</version></moduleID><lineNo>4</lineNo>",
+        "<presentation>0J7QsdGJ0LjQudCc0L7QtNGD0LvRjC7QotC10YHRgtCe0YLQu9Cw0LTQutC4LtCc\r\n",
+        "0L7QtNGD0LvRjC7Qn9C+0YHRh9C40YLQsNGC0Ywo0J0gPSAp</presentation>",
+        "<isFantom>false</isFantom></debugRDBGRequestResponse:callStack></response>",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     //! Every document below is recorded traffic (27.09.2026, 8.3.17.1549 and 8.3.27.2214),
@@ -470,6 +513,44 @@ mod tests {
         assert_eq!(targets[0].infobase_alias, "DefAlias");
         assert_eq!(targets[0].state, "Worked");
         assert_eq!(targets[1].target_type, "ManagedClient");
+    }
+
+    #[test]
+    fn all_target_states_carry_the_run_state_of_each_target() {
+        let targets = parse_targets(recorded::ALL_TARGET_STATES_WITH_A_HALTED_TARGET.as_bytes());
+        assert_eq!(targets.len(), 2, "two targets, got {targets:?}");
+        assert_eq!(targets[0].state, "Worked");
+        assert!(!is_suspended_state(&targets[0].state), "a running target is not halted");
+        assert_eq!(targets[1].id, "2a887b1e-1151-46c8-ab56-e0078edee53d");
+        assert_eq!(targets[1].target_type, "ServerEmulation");
+        assert_eq!(targets[1].state, "StopOnNextLine");
+        assert!(is_suspended_state(&targets[1].state), "a breakpoint halt reads StopOnNextLine");
+    }
+
+    #[test]
+    fn suspended_states_are_the_halted_ones_only() {
+        for state in ["StopOnNextLine", "Evaluating"] {
+            assert!(is_suspended_state(state), "{state} is halted");
+        }
+        for state in ["Worked", "WaitDebugger", "Registered", "NotRegistered", "Terminating", ""] {
+            assert!(!is_suspended_state(state), "{state} is not a halt a Continue can resume");
+        }
+    }
+
+    #[test]
+    fn get_call_stack_answer_gives_the_halted_position() {
+        let frames = parse_call_stack(recorded::GET_CALL_STACK.as_bytes());
+        assert_eq!(frames.len(), 1, "one frame, got {frames:?}");
+        assert_eq!(frames[0].line_no, 4);
+        assert_eq!(frames[0].module_object_id, "5b0c1d3e-7a01-4c11-9a01-000000000001");
+        assert_eq!(frames[0].module_property_id, "d5963243-262e-4398-b4d7-fb16d06484f6");
+        // Unlike the stop event, this answer leaves the argument values out of the presentation.
+        assert_eq!(frames[0].presentation, "ОбщийМодуль.ТестОтладки.Модуль.Посчитать(Н = )");
+    }
+
+    #[test]
+    fn get_call_stack_with_no_content_has_no_frames() {
+        assert!(parse_call_stack(b"").is_empty(), "HTTP 204 carries no body and no frames");
     }
 
     #[test]

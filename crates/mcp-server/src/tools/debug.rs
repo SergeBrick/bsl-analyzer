@@ -67,6 +67,9 @@ pub fn debug_attach(
         config_root: root.clone(),
         extensions: ext_pairs,
         auto_attach: attach_types.clone(),
+        // The OS temp directory is per user, and so is the takeover: a session may inherit only
+        // a registration the same user's dead session left behind.
+        lease_dir: Some(std::env::temp_dir().join("bsl-analyzer-debug")),
     };
     let session = DebugSession::connect(config)
         .map_err(|e| McpError::internal_error(format!("Failed to connect: {e}"), None))?;
@@ -78,6 +81,14 @@ pub fn debug_attach(
     let _ = writeln!(out, "Config root: {} ({root_origin})", root.display());
     let _ = writeln!(out, "Modules indexed: {}", session.module_count());
     let _ = writeln!(out, "Auto-attach: {}", attach_types.join(", "));
+    if session.reclaimed_dead_session() {
+        let lease = session.lease_path().map(|p| p.display().to_string()).unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "Took over the registration of an earlier session of this user that ended without \
+             disconnect (lease {lease})"
+        );
+    }
     for warning in session.setup_warnings() {
         let _ = writeln!(out, "Warning: {warning}");
     }
@@ -92,14 +103,27 @@ pub fn debug_attach(
     } else {
         let _ = writeln!(out, "Available targets: {}", targets.len());
         for t in &targets {
-            // `getDbgTargets` carries no run state — only the `step` response does — so printing
-            // an empty one would invent a field this answer does not have.
+            // The state comes from `getDbgAllTargetStates`; when that was refused it is empty,
+            // and printing it would invent a field no answer had.
             let state =
                 if t.state.is_empty() { String::new() } else { format!(", state {}", t.state) };
             let _ =
                 writeln!(out, "- {} {} (alias {}{state})", t.target_type, t.id, t.infobase_alias);
         }
         let _ = writeln!(out, "Attached: {} of {}", session.attached_count(), targets.len());
+    }
+    let halted = session.suspended_at_attach();
+    if !halted.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nHalted before this attach: {} — its client is frozen until resumed. wait_stop \
+             shows where; continue resumes it (`target` picks one by id).",
+            halted.len()
+        );
+        for id in halted {
+            let kind = session.target_type_of(id).unwrap_or("type unknown");
+            let _ = writeln!(out, "- {id} ({kind})");
+        }
     }
     *guard = Some(session);
     Ok(text_within_budget(out, max_output_tokens, TARGETS_NOTE))
@@ -151,8 +175,22 @@ pub fn debug_disconnect(
     let mut guard = session_mutex.lock().unwrap();
     let session =
         guard.take().ok_or_else(|| McpError::invalid_params("No active debug session", None))?;
-    let _ = session.disconnect();
-    Ok(CallToolResult::success(vec![ContentBlock::text("Debug session disconnected")]))
+    let report = session
+        .disconnect()
+        .map_err(|e| McpError::internal_error(format!("Failed to disconnect: {e}"), None))?;
+    let mut out = String::from("Debug session disconnected");
+    if !report.resumed.is_empty() {
+        let _ = write!(
+            out,
+            "\nResumed {} halted target(s) first, so their clients are not left frozen: {}",
+            report.resumed.len(),
+            report.resumed.join(", ")
+        );
+    }
+    for warning in &report.warnings {
+        let _ = write!(out, "\nWarning: {warning}");
+    }
+    Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
 }
 
 pub fn debug_set_breakpoint(
@@ -213,12 +251,13 @@ pub fn debug_remove_breakpoint(
 
 pub fn debug_continue(
     session_mutex: &Arc<Mutex<Option<DebugSession>>>,
+    target: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let mut guard = session_mutex.lock().unwrap();
     let session =
         guard.as_mut().ok_or_else(|| McpError::invalid_params("No active debug session", None))?;
     session
-        .continue_execution()
+        .continue_target(target)
         .map_err(|e| McpError::internal_error(format!("Failed to continue: {e}"), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text("Execution continued")]))
 }
@@ -226,6 +265,7 @@ pub fn debug_continue(
 pub fn debug_step(
     session_mutex: &Arc<Mutex<Option<DebugSession>>>,
     action: &str,
+    target: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
     let mut guard = session_mutex.lock().unwrap();
     let session =
@@ -242,7 +282,7 @@ pub fn debug_step(
         }
     };
     session
-        .step(step_action)
+        .step_target(step_action, target)
         .map_err(|e| McpError::internal_error(format!("Failed to step: {e}"), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(format!("Step {action}"))]))
 }
@@ -269,10 +309,15 @@ pub fn debug_wait_stop(
                     let _ = writeln!(out, "Exception: {message}\n");
                     "exception"
                 }
+                bsl_debug::session::StopReason::Suspended => "halted before this attach",
             };
             let _ = writeln!(out, "Stopped (reason: {reason})");
-            let _ = writeln!(out, "- Module: {}", event.module);
-            let _ = writeln!(out, "- Line: {}", event.line);
+            if let Some(detail) = &event.detail {
+                let _ = writeln!(out, "- Position unknown: {detail}");
+            } else {
+                let _ = writeln!(out, "- Module: {}", event.module);
+                let _ = writeln!(out, "- Line: {}", event.line);
+            }
             let target_kind =
                 session.target_type_of(&event.target_id).unwrap_or("type unknown").to_string();
             let _ = writeln!(out, "- Target: {} ({target_kind})", event.target_id);
@@ -291,9 +336,19 @@ pub fn debug_wait_stop(
             }
             Ok(text_within_budget(out, max_output_tokens, STACK_NOTE))
         }
-        None => Ok(CallToolResult::success(vec![ContentBlock::text(
-            "Timeout — no stop event received",
-        )])),
+        None => {
+            let mut out = String::from("Timeout — no stop event received");
+            // A debugger the server no longer counts as registered receives no event at all; a
+            // bare timeout would read as "the code did not run".
+            if let Some(error) = session.event_channel_error() {
+                let _ = write!(
+                    out,
+                    "\nThe debug server refuses this debugger's event channel, so no stop can \
+                     arrive: {error}\nDisconnect and attach again."
+                );
+            }
+            Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        }
     }
 }
 

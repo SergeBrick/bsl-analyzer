@@ -1,8 +1,10 @@
 use crate::define_metadata;
 use crate::metadata::*;
-use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Fix, TextEdit};
 use hir::{Body, Expr, ExprId, IdConversion, Name, Stmt, StmtId};
+use ide_db::TextRange;
 use stdx::case::CaseExt;
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -57,6 +59,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
 
     let item_tree = ctx.item_tree();
     let module_bodies = ctx.module_bodies();
+    let root = ctx.parse().syntax_node();
 
     let mut diagnostics = Vec::new();
 
@@ -74,12 +77,101 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
                 severity: ctx.severity(code),
                 range: proc.name_range(),
                 tags: ctx.tags(code),
-                fixes: vec![],
+                fixes: insert_guard_fix(&root, proc.source_range()),
             });
         }
     }
 
     diagnostics
+}
+
+/// Inserts `Если ОбменДанными.Загрузка Тогда Возврат; КонецЕсли;` as the first
+/// statement of the handler, after its local `Перем` declarations (they must precede
+/// every statement), indented like the body. Manual: during data exchange the
+/// handler then stops running its logic, which is the point of the check but still
+/// a change of behaviour the author has to accept.
+fn insert_guard_fix(root: &SyntaxNode, source_range: TextRange) -> Vec<Fix> {
+    let Some(method) = root
+        .descendants()
+        .find(|node| node.text_range() == source_range && node.kind() == SyntaxKind::PROCEDURE_DEF)
+    else {
+        return Vec::new();
+    };
+    let english = method
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == SyntaxKind::KW_PROCEDURE)
+        .is_some_and(|keyword| keyword.text().is_ascii());
+
+    let first_statement = method
+        .children()
+        .find(|node| node.kind() == SyntaxKind::STMT_LIST)
+        .and_then(|list| list.children().find(|stmt| stmt.kind() != SyntaxKind::VAR_DEF));
+
+    let Line { start, indent, newline } = match first_statement {
+        Some(stmt) => {
+            // A statement sharing its line with the header or another statement has
+            // no line of its own to put the guard above.
+            let Some(line) = stmt.first_token().and_then(|token| own_line(&token)) else {
+                return Vec::new();
+            };
+            line
+        }
+        None => {
+            let Some(line) = method.last_token().and_then(|token| own_line(&token)) else {
+                return Vec::new();
+            };
+            Line { indent: "\t".to_string(), ..line }
+        }
+    };
+
+    let unit = if indent.is_empty() || indent.contains('\t') { "\t" } else { indent.as_str() };
+    let (if_kw, condition, then_kw, return_kw, end_if) = if english {
+        ("If", "DataExchange.Load", "Then", "Return;", "EndIf;")
+    } else {
+        ("Если", "ОбменДанными.Загрузка", "Тогда", "Возврат;", "КонецЕсли;")
+    };
+    let guard = format!(
+        "{indent}{if_kw} {condition} {then_kw}{newline}\
+         {indent}{unit}{return_kw}{newline}\
+         {indent}{end_if}{newline}"
+    );
+    vec![Fix::manual(
+        format!("Добавить проверку {condition}"),
+        vec![TextEdit { range: TextRange::empty(start), new_text: guard }],
+    )]
+}
+
+struct Line {
+    start: TextSize,
+    indent: String,
+    /// Line break of the line above, so the inserted lines follow the file's style.
+    newline: String,
+}
+
+/// The line `token` begins, when only whitespace precedes it on that line.
+fn own_line(token: &SyntaxToken) -> Option<Line> {
+    let mut indent = String::new();
+    let mut start = token.text_range().start();
+    let mut prev = token.prev_token();
+    while let Some(candidate) = prev {
+        match candidate.kind() {
+            SyntaxKind::WHITESPACE if !candidate.text().contains(['\n', '\r']) => {
+                indent.insert_str(0, candidate.text());
+                start = candidate.text_range().start();
+                prev = candidate.prev_token();
+            }
+            SyntaxKind::NEWLINE => {
+                // The lexer leaves the `\r` of a CRLF break in the token before `\n`.
+                let crlf = candidate.text().contains('\r')
+                    || candidate.prev_token().is_some_and(|before| before.text().ends_with('\r'));
+                let newline = if crlf { "\r\n" } else { "\n" }.to_string();
+                return Some(Line { start, indent, newline });
+            }
+            _ => return None,
+        }
+    }
+    Some(Line { start, indent, newline: "\n".to_string() })
 }
 
 fn is_applicable_module(ctx: &DiagnosticsContext) -> bool {

@@ -1,10 +1,11 @@
 use crate::define_metadata;
 use crate::metadata::*;
 use crate::utils::platform_event_handlers as peh;
-use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Fix, TextEdit};
 use ide_db::TextRange;
 use rustc_hash::FxHashSet;
 use stdx::case::CaseExt;
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::CodeSmell,
@@ -154,8 +155,11 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         mdo_type: metadata.mdo.as_ref().map(|mdo| mdo.mdo_type),
     };
 
+    let root = ctx.parse().syntax_node();
+    let string_literals = string_literal_texts(&root);
+
     for (_, proc) in item_tree.procedures() {
-        if let Some(diag) = check_method_unused(
+        if let Some(mut diag) = check_method_unused(
             &proc.name,
             proc.name_range,
             proc.is_export,
@@ -166,12 +170,13 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             code,
             ctx,
         ) {
+            diag.fixes = remove_method_fix(&root, proc.source_range, &proc.name, &string_literals);
             diagnostics.push(diag);
         }
     }
 
     for (_, func) in item_tree.functions() {
-        if let Some(diag) = check_method_unused(
+        if let Some(mut diag) = check_method_unused(
             &func.name,
             func.name_range,
             func.is_export,
@@ -182,11 +187,169 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             code,
             ctx,
         ) {
+            diag.fixes = remove_method_fix(&root, func.source_range, &func.name, &string_literals);
             diagnostics.push(diag);
         }
     }
 
     diagnostics
+}
+
+/// Deletes the method together with the doc comment directly above it and the rest
+/// of its closing line. Manual: the method may still be reached by its name in a
+/// string (`Выполнить`, a handler bound by name in another module), which the
+/// analysis cannot see. When the name does appear in a string literal of the module,
+/// no fix is offered at all.
+fn remove_method_fix(
+    root: &SyntaxNode,
+    source_range: TextRange,
+    name: &hir::Name,
+    string_literals: &[String],
+) -> Vec<Fix> {
+    let name_lower = name.as_str().fold_lower();
+    if string_literals.iter().any(|literal| mentions_identifier(literal, &name_lower)) {
+        return Vec::new();
+    }
+    let Some(method) = root.descendants().find(|node| {
+        node.text_range() == source_range
+            && matches!(node.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF)
+    }) else {
+        return Vec::new();
+    };
+    let (Some(first), Some(last)) = (method.first_token(), method.last_token()) else {
+        return Vec::new();
+    };
+    let Some(mut start) = line_start(&first) else { return Vec::new() };
+    let mut blank_above = true;
+    let mut above = line_above(&first);
+    while let Some(line) = above {
+        match line {
+            LineAbove::Comment(comment) => {
+                start = line_start(&comment).unwrap_or(start);
+                above = line_above(&comment);
+            }
+            LineAbove::Blank => break,
+            LineAbove::Code => {
+                blank_above = false;
+                break;
+            }
+        }
+    }
+
+    // The closing keyword's own line: trailing blanks, a trailing comment, its break.
+    let mut end = last.text_range().end();
+    let mut next = last.next_token();
+    while let Some(token) = next.clone() {
+        match token.kind() {
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => {
+                end = token.text_range().end();
+                next = token.next_token();
+            }
+            SyntaxKind::NEWLINE => {
+                end = token.text_range().end();
+                next = token.next_token();
+                break;
+            }
+            _ => break,
+        }
+    }
+    // One blank line below goes too when one stays above, so the removal leaves a
+    // single blank line rather than two.
+    if blank_above {
+        let mut probe = next;
+        while let Some(token) = probe {
+            match token.kind() {
+                SyntaxKind::WHITESPACE => probe = token.next_token(),
+                SyntaxKind::NEWLINE => {
+                    end = token.text_range().end();
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    vec![Fix::manual(
+        format!("Удалить неиспользуемый метод \"{}\"", name.as_str()),
+        vec![TextEdit { range: TextRange::new(start, end), new_text: String::new() }],
+    )]
+}
+
+enum LineAbove {
+    Comment(SyntaxToken),
+    Blank,
+    Code,
+}
+
+/// What stands on the line above the one `token` begins. `None` at the top of the
+/// file; a comment counts only when it owns its line.
+fn line_above(token: &SyntaxToken) -> Option<LineAbove> {
+    let mut prev = token.prev_token();
+    while let Some(candidate) = prev.clone() {
+        match candidate.kind() {
+            SyntaxKind::WHITESPACE => prev = candidate.prev_token(),
+            SyntaxKind::NEWLINE => break,
+            _ => return Some(LineAbove::Code),
+        }
+    }
+    let newline = prev?;
+    let mut prev = newline.prev_token();
+    while let Some(candidate) = prev.clone() {
+        if candidate.kind() == SyntaxKind::WHITESPACE {
+            prev = candidate.prev_token();
+        } else {
+            break;
+        }
+    }
+    let Some(token) = prev else { return Some(LineAbove::Blank) };
+    match token.kind() {
+        SyntaxKind::NEWLINE => Some(LineAbove::Blank),
+        SyntaxKind::COMMENT if line_start(&token).is_some() => Some(LineAbove::Comment(token)),
+        _ => Some(LineAbove::Code),
+    }
+}
+
+/// Start of the line `token` begins, when only whitespace precedes it on that line.
+fn line_start(token: &SyntaxToken) -> Option<TextSize> {
+    let mut start = token.text_range().start();
+    let mut prev = token.prev_token();
+    while let Some(candidate) = prev {
+        match candidate.kind() {
+            SyntaxKind::WHITESPACE => {
+                start = candidate.text_range().start();
+                prev = candidate.prev_token();
+            }
+            SyntaxKind::NEWLINE => return Some(start),
+            _ => return None,
+        }
+    }
+    Some(start)
+}
+
+fn string_literal_texts(root: &SyntaxNode) -> Vec<String> {
+    root.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| {
+            matches!(
+                token.kind(),
+                SyntaxKind::STRING
+                    | SyntaxKind::STRING_START
+                    | SyntaxKind::STRING_PART
+                    | SyntaxKind::STRING_TAIL
+            )
+        })
+        .map(|token| token.text().fold_lower())
+        .collect()
+}
+
+/// `name_lower` occurs in `text` as a whole identifier, not as a part of a longer one.
+fn mentions_identifier(text: &str, name_lower: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name_lower).any(|(at, found)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + found.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

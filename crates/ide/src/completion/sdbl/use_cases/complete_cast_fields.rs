@@ -172,6 +172,7 @@ mod tests {
             code_series: bsl_metadata::CodeSeries::default(),
             constant_type: None,
             register_records: vec![],
+            max_ext_dimension_count: None,
             uuid: None,
             object_belonging: bsl_metadata::ObjectBelonging::Own,
             extended_configuration_object: None,

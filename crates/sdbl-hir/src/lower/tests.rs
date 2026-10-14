@@ -1702,6 +1702,7 @@ fn test_join_paren_field_resolution() {
         code_series: bsl_metadata::CodeSeries::default(),
         constant_type: None,
         register_records: vec![],
+        max_ext_dimension_count: None,
         uuid: None,
         object_belonging: bsl_metadata::ObjectBelonging::Own,
         extended_configuration_object: None,
@@ -2586,10 +2587,12 @@ fn every_virtual_table_shape_inherits_the_provisional_marks_of_its_register() {
         (VirtualTableType::SliceFirst, &["Период"]),
         (VirtualTableType::Balance, &[]),
         (VirtualTableType::Turnovers, &["Период", "Регистратор", "НомерСтроки"]),
-        (VirtualTableType::BalanceAndTurnovers, &["Период", "Регистратор"]),
+        (VirtualTableType::BalanceAndTurnovers, &["Период", "Регистратор", "НомерСтроки"]),
+        (VirtualTableType::DrCrTurnovers, &[]),
         (VirtualTableType::RecordsWithExtDimensions, &[]),
-        (VirtualTableType::ExtDimensionDr, &[]),
         (VirtualTableType::ExtDimensions, &[]),
+        (VirtualTableType::ScheduleData, &[]),
+        (VirtualTableType::AdjustedEffectivePeriod, &[]),
         (VirtualTableType::Changes, &[]),
     ];
 

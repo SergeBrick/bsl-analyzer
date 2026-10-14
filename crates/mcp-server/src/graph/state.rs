@@ -7723,14 +7723,16 @@ mod tests {
             read_covered: owed.keys.clone(),
             ..Default::default()
         };
-        let install = |graph: &GraphState| {
-            let prepared = graph
+        let prepare = || {
+            graph
                 .prepare_snapshot_pool(
                     published.generation,
                     published.fingerprint,
                     published.force_stale,
                 )
-                .expect("the published artefact prepares");
+                .expect("the published artefact prepares")
+        };
+        let install = |prepared| {
             graph.install_prepared_snapshot(
                 prepared,
                 published.clone(),
@@ -7742,8 +7744,9 @@ mod tests {
         };
 
         // 1. The artefact moved under the install.
+        let prepared = prepare();
         graph.refused_installs.store(1, Ordering::SeqCst);
-        let refused = install(&graph);
+        let refused = install(prepared);
         assert!(
             !matches!(refused, crate::workspace_lease::LeaseOperationOutcome::Applied(())),
             "the fixture needs this install to be refused",
@@ -7755,8 +7758,9 @@ mod tests {
         );
 
         // 2. The lease could not be taken.
+        let prepared = prepare();
         let held = lease.hold_file_lock_for_test();
-        let refused = install(&graph);
+        let refused = install(prepared);
         assert!(
             !matches!(refused, crate::workspace_lease::LeaseOperationOutcome::Applied(())),
             "the fixture needs the held lease to refuse this install",
@@ -7769,8 +7773,10 @@ mod tests {
         );
 
         // 3. The lease is gone for good: another owner took the workspace.
+        let prepared = prepare();
         let _newer = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
-        let refused = install(&graph);
+        assert!(!lease.owns_caches_now(), "the previous owner observes the takeover");
+        let refused = install(prepared);
         assert!(
             !matches!(refused, crate::workspace_lease::LeaseOperationOutcome::Applied(())),
             "the fixture needs the superseded lease to refuse this install",

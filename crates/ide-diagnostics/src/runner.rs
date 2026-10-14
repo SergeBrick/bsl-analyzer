@@ -69,6 +69,7 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::FieldsFromJoinsWithoutIsNull,
     DiagnosticCode::FullOuterJoinQuery,
     DiagnosticCode::IncorrectUseLikeInQuery,
+    DiagnosticCode::InvalidVirtualTableParameters,
     DiagnosticCode::JoinWithSubQuery,
     DiagnosticCode::JoinWithVirtualTable,
     DiagnosticCode::LogicalOrInJoinQuerySection,
@@ -346,6 +347,10 @@ pub(crate) const SDBL_DISPATCH: &[(DiagnosticCode, crate::sdbl_utils::SdblDispat
     ),
     (DiagnosticCode::FullOuterJoinQuery, handlers::full_outer_join_query::dispatch),
     (DiagnosticCode::IncorrectUseLikeInQuery, handlers::incorrect_use_like_in_query::dispatch),
+    (
+        DiagnosticCode::InvalidVirtualTableParameters,
+        handlers::invalid_virtual_table_parameters::dispatch,
+    ),
     (DiagnosticCode::JoinWithSubQuery, handlers::join_with_sub_query::dispatch),
     (DiagnosticCode::JoinWithVirtualTable, handlers::join_with_virtual_table::dispatch),
     (

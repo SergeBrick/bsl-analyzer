@@ -240,10 +240,23 @@ mod tests {
         );
     }
 
+    /// A slice of an information register lists every field the platform gives it, so the
+    /// gate is on there too.
     #[test]
-    fn negative_register_virtual_table_gate_off() {
+    fn positive_unknown_field_on_register_slice() {
         check_with_designer(
             "ВЫБРАТЬ Т.НетТакогоПоля ИЗ РегистрСведений.РегистрСведений1.СрезПоследних КАК Т",
+            expect![[r#"
+                UnknownFieldInQuery @ 3:31..3:44
+                  message: Поле "НетТакогоПоля" не найдено в таблице "РегистрСведений.РегистрСведений1.СрезПоследних" запроса
+                  severity: Blocker"#]],
+        );
+    }
+
+    #[test]
+    fn negative_valid_dimension_on_register_slice() {
+        check_with_designer(
+            "ВЫБРАТЬ Т.Справочник1, Т.Период ИЗ РегистрСведений.РегистрСведений1.СрезПоследних КАК Т",
             expect![[r#""#]],
         );
     }

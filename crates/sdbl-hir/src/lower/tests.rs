@@ -2587,10 +2587,12 @@ fn every_virtual_table_shape_inherits_the_provisional_marks_of_its_register() {
         (VirtualTableType::SliceFirst, &["Период"]),
         (VirtualTableType::Balance, &[]),
         (VirtualTableType::Turnovers, &["Период", "Регистратор", "НомерСтроки"]),
-        (VirtualTableType::BalanceAndTurnovers, &["Период", "Регистратор"]),
+        (VirtualTableType::BalanceAndTurnovers, &["Период", "Регистратор", "НомерСтроки"]),
+        (VirtualTableType::DrCrTurnovers, &[]),
         (VirtualTableType::RecordsWithExtDimensions, &[]),
-        (VirtualTableType::ExtDimensionDr, &[]),
         (VirtualTableType::ExtDimensions, &[]),
+        (VirtualTableType::ScheduleData, &[]),
+        (VirtualTableType::AdjustedEffectivePeriod, &[]),
         (VirtualTableType::Changes, &[]),
     ];
 

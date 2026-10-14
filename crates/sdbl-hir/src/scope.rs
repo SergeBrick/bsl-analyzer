@@ -46,6 +46,13 @@ struct ScopeFrame {
     tables: FxHashMap<String, TableRef>,
 
     temp_tables: FxHashMap<String, TempTableDef>,
+
+    /// A bare column name that this frame does not offer is not looked up further out.
+    opaque: bool,
+
+    /// The frame holds the select list's outputs: a name it offers is that output, whatever
+    /// the output's type.
+    outputs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +77,22 @@ impl<'a> Scope<'a> {
 
     pub fn push_frame(&mut self) {
         self.frames.push(ScopeFrame::default());
+    }
+
+    /// A frame whose bare column names never reach the enclosing query: the parameter list of
+    /// a virtual table, where a condition can only speak of the table's own fields. Without the
+    /// barrier, `Счет` in the condition of the second balance table of a join resolved against
+    /// the first one and was reported ambiguous.
+    pub fn push_opaque_frame(&mut self) {
+        self.frames.push(ScopeFrame { opaque: true, ..ScopeFrame::default() });
+    }
+
+    /// A frame for the outputs of a select list, read by `УПОРЯДОЧИТЬ ПО` and `ИТОГИ`. An output
+    /// of unknown type (a parameter, an expression the lowering does not type) still owns its
+    /// name; looking past it reached the sources and reported an ambiguity the platform does
+    /// not see.
+    pub fn push_outputs_frame(&mut self, opaque: bool) {
+        self.frames.push(ScopeFrame { opaque, outputs: true, ..ScopeFrame::default() });
     }
 
     pub fn pop_frame(&mut self) {
@@ -158,6 +181,13 @@ impl<'a> Scope<'a> {
         // platform may not expose cannot be one of the two occurrences that make a bare name
         // ambiguous.
         for frame in self.frames.iter().rev() {
+            if frame.outputs {
+                if let Some(field) = Self::output_named(frame, column_name) {
+                    // An output that is itself ambiguous was reported where it is written.
+                    return if field.ty == SdblType::Error { SdblType::Unknown } else { field.ty };
+                }
+            }
+
             let mut found_type: Option<SdblType> = None;
             let mut provisional_type: Option<SdblType> = None;
 
@@ -179,9 +209,21 @@ impl<'a> Scope<'a> {
             if let Some(ty) = found_type.or(provisional_type) {
                 return ty;
             }
+            if frame.opaque {
+                break;
+            }
         }
 
         SdblType::Unknown
+    }
+
+    fn output_named(frame: &ScopeFrame, column_name: &str) -> Option<FieldDef> {
+        frame
+            .tables
+            .values()
+            .filter_map(|table| table.metadata.as_ref())
+            .find_map(|resolved| resolved.fields().iter().find(|f| f.matches_name(column_name)))
+            .cloned()
     }
 
     fn column_is_provisional_in_table(&self, table: &TableRef, column_name: &str) -> bool {
@@ -203,6 +245,9 @@ impl<'a> Scope<'a> {
     /// point the reader at a source the reference could not have meant.
     pub fn find_tables_with_column(&self, column_name: &str) -> Vec<String> {
         for frame in self.frames.iter().rev() {
+            if frame.outputs && Self::output_named(frame, column_name).is_some() {
+                return Vec::new();
+            }
             let mut result = Vec::new();
             for table in frame.tables.values() {
                 let Some(resolved) = table.metadata.as_ref() else { continue };
@@ -216,6 +261,9 @@ impl<'a> Scope<'a> {
             if !result.is_empty() {
                 result.sort();
                 return result;
+            }
+            if frame.opaque {
+                break;
             }
         }
 

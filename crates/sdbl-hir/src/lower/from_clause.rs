@@ -1,6 +1,9 @@
 use crate::diagnostics::SdblDiagnostic;
 use crate::hir::{FieldDef, Name, ResolvedTable, TableRef};
-use crate::standard_fields::{is_virtual_table_name, virtual_table_type};
+use crate::standard_fields::{
+    is_parameterized_virtual_table, register_has_open_table_set, register_table_kinds,
+    register_table_of_path, virtual_table_parameters, ParameterSlot, VirtualTableType,
+};
 use crate::SdblType;
 use bsl_metadata::{is_standard_attribute_name, MdoType};
 use stdx::case::CaseExt;
@@ -42,7 +45,7 @@ impl LoweringContext<'_> {
 
             if let Some(table_ref) = ds.table_ref() {
                 let parts = self.parse_table_name(&table_ref);
-                if parts.last().is_some_and(|name| is_virtual_table_name(name)) {
+                if is_parameterized_virtual_table(&parts) {
                     self.report_virtual_table_join(&parts, table_ref.syntax().text_range());
                 }
             }
@@ -59,7 +62,10 @@ impl LoweringContext<'_> {
         parts: &[impl AsRef<str>],
         range: TextRange,
     ) {
-        let Some(kind) = parts.last().and_then(|name| virtual_table_type(name.as_ref())) else {
+        // Root-aware: a suffix is a virtual table only under a register kind that owns it,
+        // and the stored `Субконто` / `Изменения` tables take no parameters.
+        let Some((_, kind)) = register_table_of_path(parts).filter(|(_, vt)| vt.takes_parameters())
+        else {
             return;
         };
         let table_name = parts.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(".");
@@ -137,17 +143,10 @@ impl LoweringContext<'_> {
         let parts = self.parse_table_name(table_ref);
         let full_name = parts.join(".");
 
-        let is_virtual = parts.last().map(|p| is_virtual_table_name(p)).unwrap_or(false);
+        let register_table = register_table_of_path(&parts);
+        let is_virtual = is_parameterized_virtual_table(&parts);
 
-        let (_metadata, mut resolved) = self.resolve_table(&parts, table_ref.syntax().text_range());
-
-        if is_virtual {
-            if let Some(vt_type) = parts.last().and_then(|p| virtual_table_type(p)) {
-                if let Some(r) = resolved.take() {
-                    resolved = Some(Self::transform_for_virtual_table(r, vt_type));
-                }
-            }
-        }
+        let (_metadata, resolved) = self.resolve_table(&parts, table_ref.syntax().text_range());
 
         let ident_ranges: Vec<TextRange> = table_ref
             .syntax()
@@ -205,40 +204,36 @@ impl LoweringContext<'_> {
         let virtual_table_params = if is_virtual {
             tracing::debug!(table_name = %full_name, "Lowering virtual table parameters");
 
-            let has_vt_scope = if let Some(ref r) = resolved {
-                let dims = r.dimensions();
-                if !dims.is_empty() {
-                    self.scope.push_frame();
-                    let dim_table = TableRef {
-                        parts: Vec::new(),
-                        full_name: String::new(),
-                        alias: None,
-                        metadata: Some(ResolvedTable::Metadata {
-                            mdo_type: MdoType::AccumulationRegister,
-                            name: String::new(),
-                            fields: dims.to_vec(),
-                            field_model_complete: false,
-                        }),
-                        is_virtual_table: false,
-                        virtual_table_params: Vec::new(),
-                        subquery: Vec::new(),
-                        range: table_ref.syntax().text_range(),
-                    };
-                    let dim_range = dim_table.range;
-                    if let Some(alias) = self.scope.add_table(dim_table) {
-                        self.diagnostics
-                            .push(SdblDiagnostic::DuplicateAlias { alias, range: dim_range });
-                    }
-                    true
-                } else {
-                    false
+            // A condition inside the parameters speaks only of the table's own fields, so the
+            // frame is opaque whether or not those fields are known.
+            self.scope.push_opaque_frame();
+            if let Some(ref r) = resolved {
+                let own_table = TableRef {
+                    parts: Vec::new(),
+                    full_name: String::new(),
+                    alias: None,
+                    metadata: Some(ResolvedTable::Metadata {
+                        mdo_type: register_table
+                            .map(|(mdo_type, _)| mdo_type)
+                            .unwrap_or(MdoType::AccumulationRegister),
+                        name: String::new(),
+                        fields: r.fields().to_vec(),
+                        field_model_complete: false,
+                    }),
+                    is_virtual_table: false,
+                    virtual_table_params: Vec::new(),
+                    subquery: Vec::new(),
+                    range: table_ref.syntax().text_range(),
+                };
+                let own_range = own_table.range;
+                if let Some(alias) = self.scope.add_table(own_table) {
+                    self.diagnostics
+                        .push(SdblDiagnostic::DuplicateAlias { alias, range: own_range });
                 }
-            } else {
-                false
-            };
+            }
 
-            let vt_type = parts.last().and_then(|p| virtual_table_type(p));
-            let has_periodicity = vt_type.map(|vt| vt.has_periodicity()).unwrap_or(false);
+            let has_periodicity =
+                register_table.map(|(_, vt)| vt.has_periodicity()).unwrap_or(false);
 
             let param_nodes: Vec<_> = table_ref
                 .syntax()
@@ -304,17 +299,21 @@ impl LoweringContext<'_> {
                 })
                 .collect();
 
-            if has_vt_scope {
-                self.scope.pop_frame();
-            }
+            self.scope.pop_frame();
 
             params
         } else {
             Vec::new()
         };
 
-        if is_virtual {
-            self.check_virtual_table_params(&full_name, &virtual_table_params, table_ref.syntax());
+        if let Some((mdo_type, vt_type)) = register_table.filter(|_| is_virtual) {
+            self.check_virtual_table_params(
+                &full_name,
+                mdo_type,
+                vt_type,
+                &virtual_table_params,
+                table_ref.syntax(),
+            );
         }
 
         TableRef {
@@ -381,11 +380,19 @@ impl LoweringContext<'_> {
             return self.resolve_external_data_source(parts, range);
         }
 
-        let tabular_section_name = if parts.len() == 3 && !is_virtual_table_name(&parts[2]) {
-            Some(parts[2].as_str())
-        } else {
-            None
-        };
+        let is_register = matches!(
+            mdo_type,
+            MdoType::InformationRegister
+                | MdoType::AccumulationRegister
+                | MdoType::AccountingRegister
+                | MdoType::CalculationRegister
+        );
+
+        // Under a register the third segment names one of the register's own tables; under any
+        // other root it names a tabular section.
+        let tabular_section_name =
+            if parts.len() == 3 && !is_register { Some(parts[2].as_str()) } else { None };
+        let register_table = register_table_of_path(parts).map(|(_, table)| table);
 
         if let Some(resolver) = self.resolver {
             let exists = match mdo_type {
@@ -431,13 +438,30 @@ impl LoweringContext<'_> {
         }
 
         let full_name_for_logging = parts.join(".");
-        let is_register = matches!(
-            mdo_type,
-            MdoType::InformationRegister
-                | MdoType::AccumulationRegister
-                | MdoType::AccountingRegister
-                | MdoType::CalculationRegister
-        );
+
+        if is_register
+            && parts.len() == 3
+            && !self.register_owns_table(mdo_type, object_name, register_table)
+        {
+            // The register itself was found above when a resolver is present, so the table is
+            // what is missing — unless the kind names tables the platform does not fix.
+            if self.resolver.is_some() && !register_has_open_table_set(mdo_type) {
+                self.diagnostics.push(SdblDiagnostic::QueryToMissingMetadata {
+                    table_name: full_name_for_logging,
+                    range,
+                });
+                return (Some(mdo_type), None);
+            }
+            return (
+                Some(mdo_type),
+                Some(ResolvedTable::Metadata {
+                    mdo_type,
+                    name: object_name.clone(),
+                    fields: Vec::new(),
+                    field_model_complete: false,
+                }),
+            );
+        }
 
         tracing::debug!(
             full_name = %full_name_for_logging,
@@ -449,9 +473,13 @@ impl LoweringContext<'_> {
             "resolve_table: Starting field resolution"
         );
 
-        if is_register && tabular_section_name.is_none() {
-            let resolved =
-                self.build_register_resolved(mdo_type, object_name, &full_name_for_logging);
+        if is_register {
+            let resolved = self.build_register_resolved(
+                mdo_type,
+                object_name,
+                &full_name_for_logging,
+                register_table,
+            );
             return (Some(mdo_type), resolved);
         }
 
@@ -485,13 +513,44 @@ impl LoweringContext<'_> {
         (Some(mdo_type), Some(resolved))
     }
 
+    /// Whether the register named by a three-segment path has the table its last segment
+    /// names. `table` is the segment already classified against the register KIND; what is left
+    /// to ask is the one property of the register itself that removes tables: a turnovers-only
+    /// accumulation register has no balance.
+    fn register_owns_table(
+        &self,
+        mdo_type: MdoType,
+        object_name: &str,
+        table: Option<VirtualTableType>,
+    ) -> bool {
+        let Some(table) = table else {
+            return false;
+        };
+        debug_assert!(register_table_kinds(mdo_type).contains(&table));
+        if mdo_type != MdoType::AccumulationRegister
+            || !matches!(table, VirtualTableType::Balance | VirtualTableType::BalanceAndTurnovers)
+        {
+            return true;
+        }
+        let register_type = self
+            .resolver
+            .and_then(|resolver| resolver.resolve_register(mdo_type, object_name))
+            .and_then(|register| register.register_type());
+        register_type != Some(bsl_metadata::AccumulationRegisterType::Turnovers)
+    }
+
     fn build_register_resolved(
         &self,
         mdo_type: MdoType,
         object_name: &str,
         full_name: &str,
+        table: Option<VirtualTableType>,
     ) -> Option<ResolvedTable> {
         let register = self.resolver?.resolve_register(mdo_type, object_name)?;
+
+        if mdo_type == MdoType::AccountingRegister {
+            return Some(self.build_accounting_register_table(&register, table));
+        }
 
         let mut dimensions = Vec::new();
         for dim in register.dimensions() {
@@ -584,7 +643,7 @@ impl LoweringContext<'_> {
             "Built Register resolved table"
         );
 
-        Some(ResolvedTable::Register {
+        let main = ResolvedTable::Register {
             mdo_type,
             name: object_name.to_string(),
             fields,
@@ -592,6 +651,10 @@ impl LoweringContext<'_> {
             resources,
             attributes,
             field_model_complete,
+        };
+        Some(match table {
+            Some(table) => Self::transform_for_virtual_table(main, table),
+            None => main,
         })
     }
 
@@ -752,33 +815,59 @@ impl LoweringContext<'_> {
     ) -> ResolvedTable {
         use crate::standard_fields::VirtualTableType;
 
-        let ResolvedTable::Register { mdo_type, name, dimensions, resources, attributes, .. } =
-            resolved
+        let ResolvedTable::Register {
+            mdo_type,
+            name,
+            dimensions,
+            resources,
+            attributes,
+            field_model_complete: main_complete,
+            ..
+        } = resolved
         else {
             return resolved;
         };
 
+        // The shapes below are exhaustive only for the register kind whose table they model
+        // (ITS «Язык запросов», гл. 3, разделы 97-106 and the slice tables); the same suffix
+        // reached through another kind keeps the old, silent verdict.
+        let complete_for = |kind: MdoType| main_complete && mdo_type == kind;
+
+        let derive = |suffix_ru: &str, suffix_en: &str| -> Vec<FieldDef> {
+            resources
+                .iter()
+                .map(|r| {
+                    FieldDef::new_with_names(
+                        format!("{}{suffix_ru}", r.name),
+                        Some(format!("{}{suffix_en}", r.name_en.as_deref().unwrap_or(&r.name))),
+                        r.ty.clone(),
+                        false,
+                    )
+                })
+                .collect()
+        };
+
         match vt_type {
             VirtualTableType::Turnovers => {
-                let new_resources: Vec<FieldDef> = resources
-                    .iter()
-                    .map(|r| {
-                        FieldDef::new_with_names(
-                            format!("{}Оборот", r.name),
-                            r.name_en.as_ref().map(|en| format!("{}Turnover", en)),
-                            r.ty.clone(),
-                            false,
-                        )
-                    })
-                    .collect();
+                let mut new_resources = derive("Оборот", "Turnover");
+                new_resources.extend(derive("Приход", "Receipt"));
+                new_resources.extend(derive("Расход", "Expense"));
 
                 let mut fields = vec![
                     FieldDef::standard("Период", "Period", SdblType::Date),
                     FieldDef::standard("Регистратор", "Recorder", SdblType::AnyRef),
                     FieldDef::standard("НомерСтроки", "LineNumber", SdblType::number()),
                 ];
+                super::register_tables::period_breakdown_fields(&mut fields);
                 fields.extend(dimensions.iter().cloned());
                 fields.extend(new_resources.iter().cloned());
+                // The reference lists no attributes here, yet code shipped in a typical
+                // configuration selects a turnovers-register attribute from this table. Until
+                // that is settled against the platform, the attributes are offered, provisionally.
+                fields.extend(attributes.iter().cloned().map(|mut field| {
+                    field.provisional = true;
+                    field
+                }));
 
                 ResolvedTable::Register {
                     mdo_type,
@@ -787,21 +876,11 @@ impl LoweringContext<'_> {
                     dimensions,
                     resources: new_resources,
                     attributes: Vec::new(),
-                    field_model_complete: false,
+                    field_model_complete: complete_for(MdoType::AccumulationRegister),
                 }
             }
             VirtualTableType::Balance => {
-                let new_resources: Vec<FieldDef> = resources
-                    .iter()
-                    .map(|r| {
-                        FieldDef::new_with_names(
-                            format!("{}Остаток", r.name),
-                            r.name_en.as_ref().map(|en| format!("{}Balance", en)),
-                            r.ty.clone(),
-                            false,
-                        )
-                    })
-                    .collect();
+                let new_resources = derive("Остаток", "Balance");
 
                 let mut fields = Vec::new();
                 fields.extend(dimensions.iter().cloned());
@@ -814,36 +893,22 @@ impl LoweringContext<'_> {
                     dimensions,
                     resources: new_resources,
                     attributes: Vec::new(),
-                    field_model_complete: false,
+                    field_model_complete: complete_for(MdoType::AccumulationRegister),
                 }
             }
             VirtualTableType::BalanceAndTurnovers => {
-                let mut new_resources = Vec::new();
-                for r in &resources {
-                    new_resources.push(FieldDef::new_with_names(
-                        format!("{}НачальныйОстаток", r.name),
-                        r.name_en.as_ref().map(|en| format!("{}OpeningBalance", en)),
-                        r.ty.clone(),
-                        false,
-                    ));
-                    new_resources.push(FieldDef::new_with_names(
-                        format!("{}Оборот", r.name),
-                        r.name_en.as_ref().map(|en| format!("{}Turnover", en)),
-                        r.ty.clone(),
-                        false,
-                    ));
-                    new_resources.push(FieldDef::new_with_names(
-                        format!("{}КонечныйОстаток", r.name),
-                        r.name_en.as_ref().map(|en| format!("{}ClosingBalance", en)),
-                        r.ty.clone(),
-                        false,
-                    ));
-                }
+                let mut new_resources = derive("НачальныйОстаток", "OpeningBalance");
+                new_resources.extend(derive("Оборот", "Turnover"));
+                new_resources.extend(derive("Приход", "Receipt"));
+                new_resources.extend(derive("Расход", "Expense"));
+                new_resources.extend(derive("КонечныйОстаток", "ClosingBalance"));
 
                 let mut fields = vec![
                     FieldDef::standard("Период", "Period", SdblType::Date),
                     FieldDef::standard("Регистратор", "Recorder", SdblType::AnyRef),
+                    FieldDef::standard("НомерСтроки", "LineNumber", SdblType::number()),
                 ];
+                super::register_tables::period_breakdown_fields(&mut fields);
                 fields.extend(dimensions.iter().cloned());
                 fields.extend(new_resources.iter().cloned());
 
@@ -854,7 +919,7 @@ impl LoweringContext<'_> {
                     dimensions,
                     resources: new_resources,
                     attributes: Vec::new(),
-                    field_model_complete: false,
+                    field_model_complete: complete_for(MdoType::AccumulationRegister),
                 }
             }
             VirtualTableType::SliceLast | VirtualTableType::SliceFirst => {
@@ -875,7 +940,7 @@ impl LoweringContext<'_> {
                     dimensions,
                     resources,
                     attributes,
-                    field_model_complete: false,
+                    field_model_complete: complete_for(MdoType::InformationRegister),
                 }
             }
             _ => ResolvedTable::Register {
@@ -1277,6 +1342,8 @@ impl LoweringContext<'_> {
     fn check_virtual_table_params(
         &mut self,
         table_name: &str,
+        mdo_type: MdoType,
+        vt_type: VirtualTableType,
         params: &[crate::hir::ExprHir],
         table_ref_node: &syntax::SyntaxNode,
     ) {
@@ -1300,13 +1367,142 @@ impl LoweringContext<'_> {
         // "Without parameters" means no argument was actually passed: a call
         // like СрезПоследних(&Период, ) names the period and already addresses
         // the diagnostic's concern; only all-blank argument lists are flagged.
-        let has_argument = params.iter().any(|p| !matches!(p, ExprHir::Missing { .. }));
+        // A data-composition argument such as `{(&Период)}` is an argument too, although it
+        // lowers to nothing.
+        let has_argument = params.iter().any(|p| !matches!(p, ExprHir::Missing { .. }))
+            || table_ref_node
+                .children()
+                .any(|child| child.kind() == syntax::SyntaxKind::SDBL_QUERY_EXTENSION);
         if !has_argument {
             self.diagnostics.push(SdblDiagnostic::VirtualTableCallWithoutParameters {
                 table_name: table_name.to_string(),
                 expected_params: vec!["Период".to_string(), "Условие".to_string()],
                 range,
             });
+        }
+
+        let Some(slots) = virtual_table_parameters(mdo_type, vt_type) else {
+            return;
+        };
+        let Some(arguments) = call_arguments(table_ref_node) else {
+            return;
+        };
+
+        // The platform reads parameters by position, so one surplus comma shifts every later
+        // argument into the wrong slot — and it answers that with «Неверные параметры», not with
+        // a field error. Typical cause: a condition split by a comma instead of `И`.
+        if arguments.len() > slots.len() {
+            let range =
+                arguments[slots.len()].as_ref().map(|node| node.text_range()).unwrap_or(range);
+            self.diagnostics.push(SdblDiagnostic::InvalidVirtualTableParameters {
+                table_name: table_name.to_string(),
+                problem: crate::diagnostics::VirtualTableParameterProblem::TooMany {
+                    passed: arguments.len(),
+                    allowed: slots.iter().map(|slot| slot.name().to_string()).collect(),
+                },
+                range,
+            });
+            return;
+        }
+
+        for (index, (argument, slot)) in arguments.iter().zip(slots.iter()).enumerate() {
+            let (ParameterSlot::Value(slot_name), Some(argument)) = (slot, argument) else {
+                continue;
+            };
+            if is_condition(argument) {
+                self.diagnostics.push(SdblDiagnostic::InvalidVirtualTableParameters {
+                    table_name: table_name.to_string(),
+                    problem: crate::diagnostics::VirtualTableParameterProblem::ConditionAsValue {
+                        position: index + 1,
+                        slot: slot_name.to_string(),
+                    },
+                    range: argument.text_range(),
+                });
+            }
+        }
+    }
+}
+
+/// The arguments of a virtual-table call as the text spells them: one entry per comma-separated
+/// position, `None` for an empty one.
+///
+/// Read from the commas of the call itself rather than from the lowered parameter list, which
+/// keeps only the expression kinds it lowers and so can drop or add an entry. `None` when the
+/// call did not parse cleanly — a recovered argument list says nothing reliable about
+/// positions, and a template macro such as `#ВременнаяТаблица1` is exactly such a list.
+fn call_arguments(table_ref: &syntax::SyntaxNode) -> Option<Vec<Option<syntax::SyntaxNode>>> {
+    use syntax::{NodeOrToken, SyntaxKind};
+
+    if table_ref.descendants().any(|node| node.kind() == SyntaxKind::ERROR) {
+        return None;
+    }
+    let mut arguments = Vec::new();
+    let mut current: Option<syntax::SyntaxNode> = None;
+    let mut inside = false;
+    for element in table_ref.children_with_tokens() {
+        match element {
+            NodeOrToken::Token(token) => match token.kind() {
+                SyntaxKind::L_PAREN if !inside => inside = true,
+                SyntaxKind::COMMA if inside => arguments.push(current.take()),
+                SyntaxKind::R_PAREN if inside => {
+                    arguments.push(current.take());
+                    return Some(arguments);
+                }
+                kind if inside && !kind.is_trivia() => return None,
+                _ => {}
+            },
+            NodeOrToken::Node(node) if inside => match node.kind() {
+                SyntaxKind::SDBL_MISSING_ARG | SyntaxKind::SDBL_QUERY_EXTENSION => {}
+                _ if current.is_some() => return None,
+                _ => current = Some(node),
+            },
+            NodeOrToken::Node(_) => {}
+        }
+    }
+    None
+}
+
+/// A predicate where a value is expected: the platform cannot read a comparison as a date, a
+/// list of ext-dimension kinds or a row count, so it rejects the call. Only the TOP of the
+/// expression is asked — a `ВЫБОР` whose branches compare things still yields a value.
+///
+/// The tree wraps every operand in one node per precedence level (`&Период` is an OR node
+/// holding an AND node holding …), so the top is found by walking down the wrappers that
+/// carry a single child and no operator of their own.
+fn is_condition(argument: &syntax::SyntaxNode) -> bool {
+    use syntax::SyntaxKind;
+    let mut node = argument.clone();
+    loop {
+        let kind = node.kind();
+        match kind {
+            SyntaxKind::SDBL_COMPARISON_EXPR
+            | SyntaxKind::SDBL_NOT_EXPR
+            | SyntaxKind::SDBL_IN_EXPR
+            | SyntaxKind::SDBL_BETWEEN_EXPR
+            | SyntaxKind::SDBL_LIKE_EXPR
+            | SyntaxKind::SDBL_IS_NULL_EXPR => return true,
+            SyntaxKind::SDBL_LOGICAL_OR_EXPR
+            | SyntaxKind::SDBL_LOGICAL_AND_EXPR
+            | SyntaxKind::SDBL_ADDITIVE_EXPR
+            | SyntaxKind::SDBL_MULTIPLICATIVE_EXPR => {
+                let has_operator = node
+                    .children_with_tokens()
+                    .filter_map(|element| element.into_token())
+                    .any(|token| !token.kind().is_trivia());
+                let mut children = node.children();
+                let only = children.next();
+                if has_operator || children.next().is_some() {
+                    return matches!(
+                        kind,
+                        SyntaxKind::SDBL_LOGICAL_OR_EXPR | SyntaxKind::SDBL_LOGICAL_AND_EXPR
+                    );
+                }
+                match only {
+                    Some(child) => node = child,
+                    None => return false,
+                }
+            }
+            _ => return false,
         }
     }
 }

@@ -399,6 +399,20 @@ impl ModuleIndex {
                 .and_then(|n| n.to_str())
                 .and_then(bsl_conventions::conventional_of);
 
+            // Only the configuration's own kinds: an object or manager module file at the root
+            // of `Ext` belongs to no object, and its kind label is no name of anything.
+            use bsl_conventions::ConventionalName as Conv;
+            if !matches!(
+                kind,
+                Some(
+                    Conv::ManagedApplicationModule
+                        | Conv::SessionModule
+                        | Conv::ExternalConnectionModule
+                        | Conv::OrdinaryApplicationModule
+                )
+            ) {
+                continue;
+            }
             let property_id = match property_id_for_module("", kind) {
                 Some(id) => id,
                 None => continue,
@@ -613,6 +627,20 @@ mod case_parity_tests {
             );
             assert!(index.all_names().contains(&label), "{label} должен быть в all_names()");
         }
+    }
+
+    #[test]
+    fn an_object_module_at_the_ext_root_names_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        root_with_config(root, "Configuration.xml");
+        write(&root.join("Ext/ObjectModule.bsl"), "//");
+        write(&root.join("Ext/SessionModule.bsl"), "//");
+
+        let index = ModuleIndex::scan(root, &[]).unwrap();
+
+        assert!(index.resolve_name("МодульОбъекта").is_none(), "{:?}", index.all_names());
+        assert!(index.resolve_name("МодульСеанса").is_some(), "{:?}", index.all_names());
     }
 
     /// В семействах одиночных модулей вид даёт КАТАЛОГ, а не имя файла:

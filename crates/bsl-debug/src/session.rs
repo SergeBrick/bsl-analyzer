@@ -34,6 +34,9 @@ pub struct DebugSession {
     /// target, latest last. Two targets can stop between two waits, and the earlier one is still
     /// halted: dropping its stop would leave it with no id the caller could ever see.
     unreported_stops: Vec<StopEvent>,
+    /// Sent a step and not stopped since: their next stop is that step's end, even on a line
+    /// that carries a breakpoint, since `stopByBP` cannot tell the two apart.
+    stepping_targets: Vec<String>,
     last_stop: Option<StopEvent>,
     watches: Vec<String>,
     pending_eval_results: HashMap<String, Vec<u8>>,
@@ -48,6 +51,12 @@ pub struct DebugSession {
     lease: Option<Lease>,
     reclaimed_dead_session: bool,
 }
+
+/// The target types a front end attaches when its caller names none. A FILE infobase produces
+/// `ManagedClient` and `ServerEmulation` and nothing else, so leaving those two out makes
+/// file-mode debugging attach nothing at all.
+pub const DEFAULT_AUTO_ATTACH: &[&str] =
+    &["Client", "ManagedClient", "Server", "ServerEmulation", "HTTPService"];
 
 pub struct DebugConfig {
     pub host: String,
@@ -248,6 +257,7 @@ impl DebugSession {
             stopped_target: None,
             stopped_targets: Vec::new(),
             unreported_stops: Vec::new(),
+            stepping_targets: Vec::new(),
             last_stop: None,
             watches: Vec::new(),
             pending_eval_results: HashMap::new(),
@@ -289,9 +299,13 @@ impl DebugSession {
                 continue;
             }
             if !self.attached_targets.contains_key(&state.id) {
+                let why = if self.auto_attach_allows(&state.target_type) {
+                    "attaching it failed"
+                } else {
+                    "auto_attach leaves it out"
+                };
                 self.setup_warnings.push(format!(
-                    "target {} ({}) is halted, but auto_attach leaves it out, so this session \
-                     cannot resume it",
+                    "target {} ({}) is halted, but {why}, so this session cannot resume it",
                     state.id, state.target_type
                 ));
                 continue;
@@ -665,12 +679,25 @@ impl DebugSession {
         self.stopped_targets.push(target_id.to_string());
     }
 
+    /// Records a stop event of the server and says whether it ends a step this session sent. The
+    /// event describes this halt itself, so an announcement of the same target as halted before
+    /// the attach would report it a second time and is dropped.
+    fn record_stop_event(&mut self, target_id: &str) -> bool {
+        self.mark_stopped(target_id);
+        self.stopped_target = Some(target_id.to_string());
+        self.pending_suspended.retain(|t| t != target_id);
+        let stepped = self.stepping_targets.iter().any(|t| t == target_id);
+        self.stepping_targets.retain(|t| t != target_id);
+        stepped
+    }
+
     /// The target is running again or gone; commands that named no target fall back to the
     /// target that stopped most recently among those still halted.
     fn mark_resumed(&mut self, target_id: &str) {
         self.stopped_targets.retain(|t| t != target_id);
         self.pending_suspended.retain(|t| t != target_id);
         self.unreported_stops.retain(|s| s.target_id != target_id);
+        self.stepping_targets.retain(|t| t != target_id);
         if self.stopped_target.as_deref() == Some(target_id) {
             self.stopped_target = self.stopped_targets.last().cloned();
         }
@@ -750,6 +777,9 @@ impl DebugSession {
 
         self.client.step(&target_id, action_str)?;
         self.mark_resumed(&target_id);
+        if !matches!(action, StepAction::Continue) {
+            self.stepping_targets.push(target_id);
+        }
         Ok(())
     }
 
@@ -1064,8 +1094,7 @@ impl DebugSession {
                     return Ok(None);
                 }
 
-                self.mark_stopped(&target_id);
-                self.stopped_target = Some(target_id.clone());
+                let stepped = self.record_stop_event(&target_id);
 
                 let module_id = ModuleId {
                     extension: module_extension,
@@ -1092,16 +1121,20 @@ impl DebugSession {
                     )
                 });
 
-                // `stopByBP` stays true after a step too, so only the position can tell the two
-                // apart: a stop is a breakpoint stop exactly where this session put one. A
-                // breakpoint removed between the stop and this classification reads as a step.
+                // `stopByBP` stays true after a step too, so the session's own record tells the
+                // two apart: the end of a step this session sent is a step even on a breakpoint
+                // line, and any other stop is a breakpoint stop exactly where this session put
+                // one. A breakpoint removed between the stop and this classification reads as a
+                // step.
                 let reason_at = if line_no > 0 && !module_id.object_id.is_empty() {
                     Some((module_id.clone(), line_no))
                 } else {
                     innermost
                 };
                 let reason = match &reason_at {
-                    Some((mid, line)) if self.breakpoint_at(mid, *line) => StopReason::Breakpoint,
+                    Some((mid, line)) if !stepped && self.breakpoint_at(mid, *line) => {
+                        StopReason::Breakpoint
+                    }
                     _ => StopReason::Step,
                 };
 
@@ -1153,8 +1186,7 @@ impl DebugSession {
                 module_object_id,
                 module_property_id,
             } => {
-                self.mark_stopped(&target_id);
-                self.stopped_target = Some(target_id.clone());
+                self.record_stop_event(&target_id);
 
                 let module_id = ModuleId {
                     extension: module_extension,
@@ -1529,6 +1561,137 @@ mod tests {
         session.continue_target(None).expect("continue the earlier stop");
         assert!(server.position("step", CLIENT_TARGET).is_some());
         assert_eq!(session.stopped_count(), 0);
+    }
+
+    fn ping_response(results: &str) -> String {
+        format!(
+            concat!(
+                r#"<response xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#,
+                r#"xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
+                "{}</response>"
+            ),
+            results
+        )
+    }
+
+    /// A stop of the server target on line 4 of `ОбщийМодуль.ТестОтладки`, `stopByBP` set as
+    /// the platform sets it after a step too.
+    fn stop_on_line_4() -> String {
+        format!(
+            concat!(
+                r#"<debugRDBGRequestResponse:result xsi:type="debugRDBGRequestResponse:DBGUIExtCmdInfoCallStackFormed">"#,
+                "<cmdID>callStackFormed</cmdID><targetID><id>{}</id>",
+                "<targetType>ServerEmulation</targetType></targetID>",
+                "<callStack><moduleID><objectID>5b0c1d3e-7a01-4c11-9a01-000000000001</objectID>",
+                "<propertyID>{}</propertyID></moduleID><lineNo>4</lineNo></callStack>",
+                "<stopByBP>true</stopByBP></debugRDBGRequestResponse:result>"
+            ),
+            SERVER_TARGET,
+            crate::constants::PROPERTY_MODULE
+        )
+    }
+
+    fn wait_until(flag: &std::sync::atomic::AtomicBool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the event was never polled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// The target halted before the attach then reports a stop of its own: the input on which
+    /// the leftover announcement used to report the same halt a second time.
+    #[test]
+    fn a_real_stop_replaces_the_halted_before_attach_announcement() {
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = served.clone();
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
+            "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                (200, ping_response(&stop_on_line_4()))
+            }
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+        assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
+        wait_until(&served);
+
+        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the reported stop");
+        assert!(!matches!(stop.reason, StopReason::Suspended), "{:?}", stop.reason);
+        assert!(
+            session.wait_for_stop(Duration::from_millis(50)).unwrap().is_none(),
+            "one halt is reported once"
+        );
+    }
+
+    /// The step lands on the breakpoint line, and a later Continue reaches the same line: the
+    /// first stop ends a step, the second is the breakpoint — the positive control that keeps
+    /// the classification from passing by always answering `Step`.
+    #[test]
+    fn a_step_ending_on_a_breakpoint_line_is_a_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let steps = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let (s, d) = (steps.clone(), delivered.clone());
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
+            "step" => {
+                s.fetch_add(1, SeqCst);
+                (200, String::new())
+            }
+            "pingDebugUIParams" if d.load(SeqCst) < s.load(SeqCst) => {
+                d.fetch_add(1, SeqCst);
+                (200, ping_response(&stop_on_line_4()))
+            }
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+        session.set_breakpoint("ОбщийМодуль.ТестОтладки", 4, None).unwrap();
+        session.wait_for_stop(Duration::ZERO).unwrap().expect("halted before the attach");
+
+        session.step(StepAction::Next).unwrap();
+        let stepped = session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("step end");
+        assert!(matches!(stepped.reason, StopReason::Step), "{:?}", stepped.reason);
+
+        session.continue_execution().unwrap();
+        let hit = session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("breakpoint");
+        assert!(matches!(hit.reason, StopReason::Breakpoint), "{:?}", hit.reason);
+    }
+
+    /// Both front ends attach by this list, and a file infobase reports only these two types.
+    #[test]
+    fn the_default_target_types_attach_a_file_infobase() {
+        let server = FakeServer::start(Box::new(halted_server));
+        let root = config_root();
+        let session = DebugSession::connect(DebugConfig {
+            host: "127.0.0.1".into(),
+            port: server.port,
+            infobase: "DefAlias".into(),
+            config_root: root.path().to_path_buf(),
+            extensions: Vec::new(),
+            auto_attach: DEFAULT_AUTO_ATTACH.iter().map(|t| t.to_string()).collect(),
+            lease_dir: None,
+        })
+        .expect("attach");
+
+        assert_eq!(session.attached_count(), 2, "{:?}", session.setup_warnings());
+        assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
+    }
+
+    #[test]
+    fn a_halted_target_that_failed_to_attach_is_not_blamed_on_auto_attach() {
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| match cmd {
+            "attachDetachDbgTargets" => (400, NOT_REGISTERED.into()),
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let session = connect(&server, root.path(), None).expect("attach");
+
+        assert!(session.suspended_at_attach().is_empty());
+        let warnings = session.setup_warnings().join("\n");
+        assert!(warnings.contains("attaching it failed"), "{warnings}");
+        assert!(!warnings.contains("auto_attach leaves it out"), "{warnings}");
     }
 
     #[test]

@@ -1,14 +1,9 @@
 use crate::tools::response::text_within_budget;
-use bsl_debug::session::{DebugConfig, DebugSession};
+use bsl_debug::session::{DebugConfig, DebugSession, DEFAULT_AUTO_ATTACH};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData as McpError;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
-
-/// A FILE infobase produces `ManagedClient` and `ServerEmulation` and nothing else, so leaving
-/// those two out made file-mode debugging attach nothing at all.
-const DEFAULT_AUTO_ATTACH: &[&str] =
-    &["Client", "ManagedClient", "Server", "ServerEmulation", "HTTPService"];
 
 /// A deep stack, a frame full of locals, or an evaluated collection has no size of its own,
 /// so the state-reading actions render through the output budget.
@@ -177,10 +172,17 @@ pub fn debug_disconnect(
     let session =
         guard.take().ok_or_else(|| McpError::invalid_params("No active debug session", None))?;
     let report = session.disconnect();
-    let mut out = match &report.detach_error {
-        Some(e) => format!("Failed to disconnect: {e}"),
-        None => String::from("Debug session disconnected"),
-    };
+    let mut out = String::from("Debug session disconnected");
+    // The session is gone either way, so a refused detach is reported, not failed: the server
+    // refuses it when it has already dropped this debugger, and a registration that is still
+    // alive expires once nothing polls for it.
+    if let Some(e) = &report.detach_error {
+        let _ = write!(
+            out,
+            "\nWarning: the debug server refused detachDebugUI: {e}; a registration it still \
+             keeps expires after about a minute without polling"
+        );
+    }
     if !report.resumed.is_empty() {
         let _ = write!(
             out,
@@ -191,9 +193,6 @@ pub fn debug_disconnect(
     }
     for warning in &report.warnings {
         let _ = write!(out, "\nWarning: {warning}");
-    }
-    if report.detach_error.is_some() {
-        return Err(McpError::internal_error(out, None));
     }
     Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
 }

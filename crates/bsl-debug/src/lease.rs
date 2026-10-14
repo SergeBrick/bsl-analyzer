@@ -104,12 +104,13 @@ impl Lease {
     }
 }
 
-/// Letters, digits, `-` and `.` stay readable; every other character, `_` and `%` included,
-/// becomes `%XX` per UTF-8 byte, which keeps the escaping reversible.
+/// Lowercase letters, digits, `-` and `.` stay readable; every other character becomes `%XX`
+/// per UTF-8 byte. `_` and `%` are escaped, which keeps the escaping reversible, and so are
+/// uppercase letters, which keeps two names apart on a case-insensitive file system.
 fn escape_part(part: &str) -> String {
     let mut out = String::with_capacity(part.len());
     for c in part.chars() {
-        if c.is_alphanumeric() || c == '-' || c == '.' {
+        if (c.is_alphanumeric() && !c.is_uppercase()) || c == '-' || c == '.' {
             out.push(c);
         } else {
             let mut buf = [0u8; 4];
@@ -125,7 +126,7 @@ fn escape_part(part: &str) -> String {
 mod tests {
     use super::*;
 
-    const NAME: &str = "localhost_1550_DefAlias.lease";
+    const NAME: &str = "localhost_1550_%44ef%41lias.lease";
 
     #[test]
     fn a_lease_of_a_live_session_is_not_reclaimed() {
@@ -210,6 +211,18 @@ mod tests {
             Lease::file_name("h_1550_a", 1550, "b")
         );
         assert_ne!(Lease::file_name("h", 1550, "Alias"), Lease::file_name("h", 1550, "alias"));
+    }
+
+    /// NTFS and APFS fold case, so names that differ only by it would open one file there.
+    #[test]
+    fn aliases_differing_by_case_stay_apart_when_the_file_system_folds_case() {
+        for (a, b) in [("Alias", "alias"), ("ИБ", "иб"), ("a%41", "aA")] {
+            assert_ne!(
+                Lease::file_name("h", 1550, a).to_lowercase(),
+                Lease::file_name("h", 1550, b).to_lowercase(),
+                "{a} / {b}"
+            );
+        }
     }
 
     #[test]

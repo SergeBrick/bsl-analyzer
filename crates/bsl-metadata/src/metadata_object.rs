@@ -469,6 +469,10 @@ pub struct MetadataObject {
     pub constant_type: Option<AttributeType>,
     #[serde(default)]
     pub register_records: Vec<(MdoType, Name)>,
+    /// `МаксКоличествоСубконто` of a chart of accounts; `None` for every other kind. The
+    /// accounting registers kept on the chart expose exactly this many `Субконто<N>` fields.
+    #[serde(default)]
+    pub max_ext_dimension_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<Uuid>,
     #[serde(default)]
@@ -837,6 +841,7 @@ impl MetadataObject {
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
             register_records: Vec::new(),
+            max_ext_dimension_count: None,
             uuid: None,
             object_belonging: crate::ObjectBelonging::Own,
             extended_configuration_object: None,
@@ -864,6 +869,7 @@ impl MetadataObject {
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
             register_records: Vec::new(),
+            max_ext_dimension_count: None,
             uuid: None,
             object_belonging: crate::ObjectBelonging::Own,
             extended_configuration_object: None,
@@ -878,6 +884,10 @@ impl MetadataObject {
 
     pub fn set_register_records(&mut self, records: Vec<(MdoType, Name)>) {
         self.register_records = records;
+    }
+
+    pub fn set_max_ext_dimension_count(&mut self, count: Option<u32>) {
+        self.max_ext_dimension_count = count;
     }
 
     /// Apply an extension overlay onto this object, replacing same-named members,

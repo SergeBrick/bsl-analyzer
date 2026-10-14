@@ -1204,5 +1204,96 @@ mod tests {
         assert!(coa.find_attribute("Код").is_some());
         assert!(coa.find_attribute("Наименование").is_some());
         assert!(coa.find_attribute("Порядок").is_some());
+        assert_eq!(coa.max_ext_dimension_count, None, "the property is absent from this XML");
+    }
+
+    #[test]
+    fn chart_of_accounts_reads_max_ext_dimension_count() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <ChartOfAccounts uuid="11111111-1111-1111-1111-111111111111">
+        <Properties>
+            <Name>План1</Name>
+            <MaxExtDimensionCount>3</MaxExtDimensionCount>
+        </Properties>
+    </ChartOfAccounts>
+</MetaDataObject>"#;
+
+        let coa = parse_chart_of_accounts_xml(xml).unwrap();
+        assert_eq!(coa.max_ext_dimension_count, Some(3));
+    }
+
+    /// The shape of an accounting register's query tables follows from four properties — the
+    /// correspondence flag, the chart of accounts, and each dimension's and resource's balance
+    /// flag — so all four must survive the parse. Other register kinds have none of them and
+    /// must report "unknown", not "false".
+    #[test]
+    fn accounting_register_reads_the_properties_its_query_tables_depend_on() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+    <AccountingRegister uuid="22222222-2222-2222-2222-222222222222">
+        <Properties>
+            <Name>План1</Name>
+            <ChartOfAccounts>ChartOfAccounts.План1</ChartOfAccounts>
+            <Correspondence>true</Correspondence>
+        </Properties>
+        <ChildObjects>
+            <Dimension uuid="33333333-3333-3333-3333-333333333331">
+                <Properties>
+                    <Name>Измерение1</Name>
+                    <Type><v8:Type>xs:string</v8:Type></Type>
+                    <Balance>true</Balance>
+                </Properties>
+            </Dimension>
+            <Dimension uuid="33333333-3333-3333-3333-333333333332">
+                <Properties>
+                    <Name>Измерение2</Name>
+                    <Type><v8:Type>xs:string</v8:Type></Type>
+                    <Balance>false</Balance>
+                </Properties>
+            </Dimension>
+            <Resource uuid="33333333-3333-3333-3333-333333333333">
+                <Properties>
+                    <Name>Ресурс1</Name>
+                    <Type><v8:Type>xs:decimal</v8:Type></Type>
+                    <Balance>true</Balance>
+                </Properties>
+            </Resource>
+            <Resource uuid="33333333-3333-3333-3333-333333333334">
+                <Properties>
+                    <Name>Ресурс2</Name>
+                    <Type><v8:Type>xs:decimal</v8:Type></Type>
+                    <Balance>false</Balance>
+                </Properties>
+            </Resource>
+        </ChildObjects>
+    </AccountingRegister>
+</MetaDataObject>"#;
+
+        let register = parse_accounting_register_xml(xml).unwrap();
+        assert_eq!(register.correspondence(), Some(true));
+        assert_eq!(register.chart_of_accounts(), Some("План1"));
+        let balance = |name: &str| {
+            register.dimensions().iter().find(|d| d.name() == name).and_then(|d| d.balance())
+        };
+        assert_eq!(balance("Измерение1"), Some(true));
+        assert_eq!(balance("Измерение2"), Some(false));
+        let resource_balance = |name: &str| {
+            register.resources().iter().find(|r| r.name() == name).and_then(|r| r.balance())
+        };
+        assert_eq!(resource_balance("Ресурс1"), Some(true));
+        assert_eq!(resource_balance("Ресурс2"), Some(false));
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <AccumulationRegister uuid="44444444-4444-4444-4444-444444444444">
+        <Properties>
+            <Name>Остатки1</Name>
+        </Properties>
+    </AccumulationRegister>
+</MetaDataObject>"#;
+        let register = parse_accumulation_register_xml(xml).unwrap();
+        assert_eq!(register.correspondence(), None);
+        assert_eq!(register.chart_of_accounts(), None);
     }
 }

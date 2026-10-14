@@ -18,13 +18,34 @@ pub struct RegisterResource {
     #[serde(default)]
     type_str: String,
 
+    /// `Балансовый` of an accounting-register resource; `None` for every other register kind.
+    /// A non-balance resource of a correspondence register is named by its sides (`<Ресурс>Дт`)
+    /// and is the only kind that has the correspondent-turnover fields (`<Ресурс>КорОборот`).
+    #[serde(default)]
+    balance: Option<bool>,
+
     #[serde(skip)]
     attr_type: Option<crate::metadata_object::AttributeType>,
 }
 
 impl RegisterResource {
     pub fn new(uuid: Uuid, name: impl Into<String>) -> Self {
-        Self { uuid, name: name.into(), name_en: None, type_str: String::new(), attr_type: None }
+        Self {
+            uuid,
+            name: name.into(),
+            name_en: None,
+            type_str: String::new(),
+            balance: None,
+            attr_type: None,
+        }
+    }
+
+    pub fn balance(&self) -> Option<bool> {
+        self.balance
+    }
+
+    pub fn set_balance(&mut self, balance: Option<bool>) {
+        self.balance = balance;
     }
 
     pub fn uuid(&self) -> &Uuid {
@@ -201,6 +222,17 @@ pub struct Register {
 
     #[serde(rename = "commonAttributesOpen", default)]
     common_attributes_open: bool,
+
+    /// `ПоддержкаКорреспонденции` of an accounting register; `None` for other kinds. It decides
+    /// whether the records carry one account (`Счет`, `ВидДвижения`) or two (`СчетДт`, `СчетКт`).
+    #[serde(rename = "correspondence", default)]
+    correspondence: Option<bool>,
+
+    /// Name of the chart of accounts an accounting register is kept on, without the
+    /// `ChartOfAccounts.` prefix. Its `МаксКоличествоСубконто` fixes how many `Субконто<N>`
+    /// fields the register's query tables have.
+    #[serde(rename = "chartOfAccounts", default)]
+    chart_of_accounts: Option<String>,
 }
 
 impl Register {
@@ -306,6 +338,14 @@ impl Register {
         self.common_attributes_open = applied.open;
     }
 
+    pub fn correspondence(&self) -> Option<bool> {
+        self.correspondence
+    }
+
+    pub fn chart_of_accounts(&self) -> Option<&str> {
+        self.chart_of_accounts.as_deref()
+    }
+
     /// Overlay an extension's adopted copy of this register onto the base: merge
     /// dimensions, resources, and attributes by name (1C lets an extension add new
     /// measurements/resources/attributes to a borrowed register, or replace a
@@ -379,6 +419,7 @@ impl Register {
     /// heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
         self.name.capacity()
+            + self.chart_of_accounts.as_ref().map_or(0, String::capacity)
             + stdx::heap::vec_bytes::<Dimension>(self.dimensions.len())
             + self.dimensions.iter().map(Dimension::estimated_heap_size).sum::<usize>()
             + stdx::heap::vec_bytes::<RegisterResource>(self.resources.len())
@@ -433,6 +474,8 @@ pub struct RegisterBuilder {
     recorder_subordinate: bool,
     enable_totals_slice_first: bool,
     enable_totals_slice_last: bool,
+    correspondence: Option<bool>,
+    chart_of_accounts: Option<String>,
 }
 
 impl RegisterBuilder {
@@ -513,6 +556,16 @@ impl RegisterBuilder {
         self
     }
 
+    pub fn correspondence(mut self, correspondence: Option<bool>) -> Self {
+        self.correspondence = correspondence;
+        self
+    }
+
+    pub fn chart_of_accounts(mut self, chart_of_accounts: Option<String>) -> Self {
+        self.chart_of_accounts = chart_of_accounts;
+        self
+    }
+
     pub fn build(self) -> Register {
         Register {
             uuid: self.uuid.unwrap_or_else(Uuid::new_v4),
@@ -530,6 +583,8 @@ impl RegisterBuilder {
             enable_totals_slice_last: self.enable_totals_slice_last,
             common_attributes: Vec::new(),
             common_attributes_open: false,
+            correspondence: self.correspondence,
+            chart_of_accounts: self.chart_of_accounts,
         }
     }
 }

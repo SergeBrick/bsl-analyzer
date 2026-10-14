@@ -53,6 +53,16 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
     let enable_totals_slice_first = child_bool(props, "EnableTotalsSliceFirst");
     let enable_totals_slice_last = child_bool(props, "EnableTotalsSliceLast");
     let register_type_str = child_text(props, "RegisterType").map(|s| s.to_string());
+    let (correspondence, chart_of_accounts) = if mdo_type == MdoType::AccountingRegister {
+        (
+            optional_bool(props, "Correspondence"),
+            child_text(props, "ChartOfAccounts")
+                .and_then(|raw| raw.split_once('.'))
+                .map(|(_, name)| name.to_string()),
+        )
+    } else {
+        (None, None)
+    };
 
     let mut attributes = Vec::new();
     match mdo_type {
@@ -105,6 +115,8 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
         .register_type(register_type)
         .enable_totals_slice_first(enable_totals_slice_first)
         .enable_totals_slice_last(enable_totals_slice_last)
+        .correspondence(correspondence)
+        .chart_of_accounts(chart_of_accounts)
         .build();
 
     tracing::debug!(
@@ -141,6 +153,7 @@ fn parse_dimension_node(node: roxmltree::Node<'_, '_>) -> Result<Dimension> {
         .deny_incomplete_values(deny_incomplete_values)
         .master(master)
         .indexing(indexing)
+        .balance(optional_bool(props, "Balance"))
         .build();
 
     if let Some(type_node) = find_child(props, "Type") {
@@ -164,6 +177,7 @@ fn parse_resource_node(node: roxmltree::Node<'_, '_>) -> Result<RegisterResource
     let _span = tracing::debug_span!("parse_resource", resource_name = %name).entered();
 
     let mut resource = RegisterResource::new(resource_uuid, name);
+    resource.set_balance(optional_bool(props, "Balance"));
 
     let type_node = find_child(props, "Type")
         .ok_or_else(|| MetadataError::InvalidFormat("Resource missing Type".to_string()))?;
@@ -200,6 +214,12 @@ fn parse_register_attr_node(
 
     attributes.push(attribute);
     Ok(())
+}
+
+/// A boolean property that only some register kinds carry: absent stays `None`, so a consumer
+/// can tell "the XML says no" from "this kind has no such property".
+fn optional_bool(props: roxmltree::Node<'_, '_>, tag: &str) -> Option<bool> {
+    child_text(props, tag).map(|text| text.trim().eq_ignore_ascii_case("true"))
 }
 
 fn parse_periodicity(periodicity: Option<&str>, mdo_type: MdoType) -> Option<RegisterPeriodicity> {

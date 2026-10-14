@@ -4,7 +4,7 @@ use crate::metadata_object::{Attribute, AttributeType, MdoType, MetadataObject};
 use crate::tabular_section::{TabularSection, TabularSectionAttribute};
 use std::str::FromStr;
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_uuid, parse_xml};
+use super::helpers::{child_text, child_u32, find_child, find_mdo_element, parse_uuid, parse_xml};
 use super::standard_attributes::{
     add_business_process_standard_attributes, add_catalog_standard_attributes,
     add_chart_of_accounts_standard_attributes, add_chart_of_calculation_types_standard_attributes,
@@ -203,6 +203,9 @@ fn parse_metadata_object_xml(xml: &str, mdo_type: MdoType) -> Result<MetadataObj
     }
     if mdo_type == MdoType::Document {
         mdo.set_register_records(parse_register_records(props_node));
+    }
+    if mdo_type == MdoType::ChartOfAccounts {
+        mdo.set_max_ext_dimension_count(child_u32(props_node, "MaxExtDimensionCount"));
     }
     for attr in attributes {
         mdo.add_attribute(attr);

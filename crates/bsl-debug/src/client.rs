@@ -47,8 +47,11 @@ pub enum ClientError {
 
 impl DebugClient {
     pub fn new(host: &str, port: u16, debugger_id: &str, infobase: &str) -> Self {
-        let client =
-            Client::builder().user_agent("1CV8").build().expect("failed to create HTTP client");
+        let client = Client::builder()
+            .user_agent("1CV8")
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to create HTTP client");
 
         Self {
             client,
@@ -278,7 +281,7 @@ impl DebugClient {
             Err(e) if e.is_timeout() => {
                 return Err(ClientError::Timeout {
                     cmd: cmd.to_string(),
-                    secs: timeout.map(|t| t.as_secs()).unwrap_or_default(),
+                    secs: timeout.unwrap_or(REQUEST_TIMEOUT).as_secs(),
                 })
             }
             Err(e) => return Err(e.into()),
@@ -298,6 +301,10 @@ impl DebugClient {
 }
 
 pub const CALL_STACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Set on the HTTP client rather than left to its default, so that a timeout message can name
+/// the wait it reports.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn server_error(cmd: &str, status: u16, data: &[u8]) -> ClientError {
     let message = responses::exception_descr(data).unwrap_or_else(|| {

@@ -34,9 +34,11 @@ pub struct DebugSession {
     /// target, latest last. Two targets can stop between two waits, and the earlier one is still
     /// halted: dropping its stop would leave it with no id the caller could ever see.
     unreported_stops: Vec<StopEvent>,
-    /// Sent a step and not stopped since: their next stop is that step's end, even on a line
-    /// that carries a breakpoint, since `stopByBP` cannot tell the two apart.
-    stepping_targets: Vec<String>,
+    /// Sent a step and not stopped since. `stopByBP` cannot tell a step's end from a breakpoint,
+    /// so the step itself is the record to classify their next stop by.
+    steps_in_flight: Vec<StepInFlight>,
+    /// Call-stack depth of each halted target at its stop, where the stop carried a stack.
+    stop_depths: HashMap<String, usize>,
     last_stop: Option<StopEvent>,
     watches: Vec<String>,
     pending_eval_results: HashMap<String, Vec<u8>>,
@@ -104,6 +106,32 @@ pub struct DisconnectReport {
     /// Why `detachDebugUI` failed, when it did. The targets above were resumed regardless, and
     /// the caller has to hear about both.
     pub detach_error: Option<String>,
+}
+
+/// A step sent to a target, kept until the target's next stop.
+#[derive(Debug, Clone)]
+struct StepInFlight {
+    target_id: String,
+    action: StepAction,
+    /// Call-stack depth where the step started, when the stop it started from carried a stack.
+    start_depth: Option<usize>,
+}
+
+impl StepInFlight {
+    /// Whether a stop at `depth` lies deeper than this step can end, so a breakpoint, not the
+    /// step, stopped the target there. Without both depths the stop is taken as the step's end.
+    fn overshot(&self, depth: usize) -> bool {
+        let Some(start) = self.start_depth else { return false };
+        if depth == 0 {
+            return false;
+        }
+        match self.action {
+            StepAction::Next => depth > start,
+            StepAction::StepIn => depth > start + 1,
+            StepAction::StepOut => depth >= start,
+            StepAction::Continue => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -257,7 +285,8 @@ impl DebugSession {
             stopped_target: None,
             stopped_targets: Vec::new(),
             unreported_stops: Vec::new(),
-            stepping_targets: Vec::new(),
+            steps_in_flight: Vec::new(),
+            stop_depths: HashMap::new(),
             last_stop: None,
             watches: Vec::new(),
             pending_eval_results: HashMap::new(),
@@ -679,16 +708,23 @@ impl DebugSession {
         self.stopped_targets.push(target_id.to_string());
     }
 
-    /// Records a stop event of the server and says whether it ends a step this session sent. The
-    /// event describes this halt itself, so an announcement of the same target as halted before
-    /// the attach would report it a second time and is dropped.
-    fn record_stop_event(&mut self, target_id: &str) -> bool {
+    /// Records a stop event of the server and hands back the step this session sent to the
+    /// target, if one was in flight. The event describes this halt itself, so an announcement of
+    /// the same target as halted before the attach would report it a second time and is dropped.
+    fn record_stop_event(&mut self, target_id: &str, depth: Option<usize>) -> Option<StepInFlight> {
         self.mark_stopped(target_id);
         self.stopped_target = Some(target_id.to_string());
         self.pending_suspended.retain(|t| t != target_id);
-        let stepped = self.stepping_targets.iter().any(|t| t == target_id);
-        self.stepping_targets.retain(|t| t != target_id);
-        stepped
+        self.record_depth(target_id, depth);
+        let at = self.steps_in_flight.iter().position(|s| s.target_id == target_id)?;
+        Some(self.steps_in_flight.remove(at))
+    }
+
+    fn record_depth(&mut self, target_id: &str, depth: Option<usize>) {
+        match depth {
+            Some(depth) => self.stop_depths.insert(target_id.to_string(), depth),
+            None => self.stop_depths.remove(target_id),
+        };
     }
 
     /// The target is running again or gone; commands that named no target fall back to the
@@ -697,7 +733,8 @@ impl DebugSession {
         self.stopped_targets.retain(|t| t != target_id);
         self.pending_suspended.retain(|t| t != target_id);
         self.unreported_stops.retain(|s| s.target_id != target_id);
-        self.stepping_targets.retain(|t| t != target_id);
+        self.steps_in_flight.retain(|s| s.target_id != target_id);
+        self.stop_depths.remove(target_id);
         if self.stopped_target.as_deref() == Some(target_id) {
             self.stopped_target = self.stopped_targets.last().cloned();
         }
@@ -707,11 +744,21 @@ impl DebugSession {
     /// event that carried the position went to the debugger that halted it.
     ///
     /// The wait for that answer is the caller's `wait_stop` budget, capped: the halt itself is
-    /// already known, and only its position is being waited for.
+    /// already known, and only its position is being waited for. A caller that gives no time at
+    /// all gets the halt at once, without the position.
     fn suspended_stop(&mut self, target_id: String, budget: Duration) -> StopEvent {
         self.stopped_target = Some(target_id.clone());
-        let wait = budget.clamp(Duration::from_secs(1), crate::client::CALL_STACK_TIMEOUT);
-        let (stack, detail) = match self.call_stack_within(&target_id, wait) {
+        let wait = budget.min(crate::client::CALL_STACK_TIMEOUT);
+        let answer = if wait.is_zero() {
+            Err("call stack not requested: wait_stop was given no time to wait for it; \
+                 stack_trace asks for it, and locals, eval and continue work regardless"
+                .to_string())
+        } else {
+            self.call_stack_within(&target_id, wait).map_err(|e| {
+                format!("call stack unavailable: {e}; locals, eval and continue work regardless")
+            })
+        };
+        let (stack, detail) = match answer {
             Ok(stack) if !stack.is_empty() => (stack, None),
             Ok(_) => (
                 Vec::new(),
@@ -721,13 +768,9 @@ impl DebugSession {
                         .to_string(),
                 ),
             ),
-            Err(e) => (
-                Vec::new(),
-                Some(format!(
-                    "call stack unavailable: {e}; locals, eval and continue work regardless"
-                )),
-            ),
+            Err(detail) => (Vec::new(), Some(detail)),
         };
+        self.record_depth(&target_id, (!stack.is_empty()).then_some(stack.len()));
         let (module, line) = stack
             .first()
             .map(|f| {
@@ -776,9 +819,10 @@ impl DebugSession {
         };
 
         self.client.step(&target_id, action_str)?;
+        let start_depth = self.stop_depths.get(&target_id).copied();
         self.mark_resumed(&target_id);
         if !matches!(action, StepAction::Continue) {
-            self.stepping_targets.push(target_id);
+            self.steps_in_flight.push(StepInFlight { target_id, action, start_depth });
         }
         Ok(())
     }
@@ -1094,7 +1138,8 @@ impl DebugSession {
                     return Ok(None);
                 }
 
-                let stepped = self.record_stop_event(&target_id);
+                let depth = call_stack.len();
+                let step = self.record_stop_event(&target_id, (depth > 0).then_some(depth));
 
                 let module_id = ModuleId {
                     extension: module_extension,
@@ -1124,17 +1169,21 @@ impl DebugSession {
                 // `stopByBP` stays true after a step too, so the session's own record tells the
                 // two apart: the end of a step this session sent is a step even on a breakpoint
                 // line, and any other stop is a breakpoint stop exactly where this session put
-                // one. A breakpoint removed between the stop and this classification reads as a
-                // step.
+                // one. A stop deeper than the step could end — inside a call it stepped over —
+                // is no step end. A breakpoint removed between the stop and this classification
+                // reads as a step.
                 let reason_at = if line_no > 0 && !module_id.object_id.is_empty() {
                     Some((module_id.clone(), line_no))
                 } else {
                     innermost
                 };
-                let reason = match &reason_at {
-                    Some((mid, line)) if !stepped && self.breakpoint_at(mid, *line) => {
-                        StopReason::Breakpoint
-                    }
+                let at_breakpoint = matches!(
+                    &reason_at,
+                    Some((mid, line)) if self.breakpoint_at(mid, *line)
+                );
+                let reason = match step {
+                    Some(step) if !step.overshot(depth) => StopReason::Step,
+                    _ if at_breakpoint => StopReason::Breakpoint,
                     _ => StopReason::Step,
                 };
 
@@ -1186,7 +1235,7 @@ impl DebugSession {
                 module_object_id,
                 module_property_id,
             } => {
-                self.record_stop_event(&target_id);
+                self.record_stop_event(&target_id, None);
 
                 let module_id = ModuleId {
                     extension: module_extension,
@@ -1441,7 +1490,8 @@ mod tests {
         assert!(states.contains(&(SERVER_TARGET, "StopOnNextLine")), "{states:?}");
         assert!(states.contains(&(CLIENT_TARGET, "Worked")), "{states:?}");
 
-        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the halt is reported");
+        let stop =
+            session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("the halt is reported");
         assert!(matches!(stop.reason, StopReason::Suspended), "{:?}", stop.reason);
         assert_eq!(stop.target_id, SERVER_TARGET);
         assert_eq!(stop.line, 4);
@@ -1476,7 +1526,8 @@ mod tests {
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
 
-        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the halt is reported");
+        let stop =
+            session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("the halt is reported");
         assert!(matches!(stop.reason, StopReason::Suspended));
         assert_eq!(stop.target_id, SERVER_TARGET);
         let detail = stop.detail.expect("an unknown position says why");
@@ -1577,17 +1628,34 @@ mod tests {
     /// A stop of the server target on line 4 of `ОбщийМодуль.ТестОтладки`, `stopByBP` set as
     /// the platform sets it after a step too.
     fn stop_on_line_4() -> String {
+        stop_with_frames(&[4])
+    }
+
+    /// A stop of the server target with frames in `ОбщийМодуль.ТестОтладки` on `lines`, given
+    /// outermost first as the server sends them; the last one is where execution stands.
+    fn stop_with_frames(lines: &[u32]) -> String {
+        let frames: String = lines
+            .iter()
+            .map(|line| {
+                format!(
+                    concat!(
+                        "<callStack><moduleID>",
+                        "<objectID>5b0c1d3e-7a01-4c11-9a01-000000000001</objectID>",
+                        "<propertyID>{}</propertyID></moduleID><lineNo>{}</lineNo></callStack>"
+                    ),
+                    crate::constants::PROPERTY_MODULE,
+                    line
+                )
+            })
+            .collect();
         format!(
             concat!(
                 r#"<debugRDBGRequestResponse:result xsi:type="debugRDBGRequestResponse:DBGUIExtCmdInfoCallStackFormed">"#,
                 "<cmdID>callStackFormed</cmdID><targetID><id>{}</id>",
-                "<targetType>ServerEmulation</targetType></targetID>",
-                "<callStack><moduleID><objectID>5b0c1d3e-7a01-4c11-9a01-000000000001</objectID>",
-                "<propertyID>{}</propertyID></moduleID><lineNo>4</lineNo></callStack>",
+                "<targetType>ServerEmulation</targetType></targetID>{}",
                 "<stopByBP>true</stopByBP></debugRDBGRequestResponse:result>"
             ),
-            SERVER_TARGET,
-            crate::constants::PROPERTY_MODULE
+            SERVER_TARGET, frames
         )
     }
 
@@ -1648,7 +1716,7 @@ mod tests {
         let root = config_root();
         let mut session = connect(&server, root.path(), None).expect("attach");
         session.set_breakpoint("ОбщийМодуль.ТестОтладки", 4, None).unwrap();
-        session.wait_for_stop(Duration::ZERO).unwrap().expect("halted before the attach");
+        session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("halted before the attach");
 
         session.step(StepAction::Next).unwrap();
         let stepped = session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("step end");
@@ -1677,6 +1745,57 @@ mod tests {
 
         assert_eq!(session.attached_count(), 2, "{:?}", session.setup_warnings());
         assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
+    }
+
+    /// The step over line 1 runs into a call whose breakpoint on line 4 halts it one frame
+    /// deeper than the step started: that halt is the breakpoint's, not the step's end.
+    #[test]
+    fn a_breakpoint_inside_a_stepped_over_call_is_a_breakpoint() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let stepped = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (s, d) = (stepped.clone(), delivered.clone());
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
+            "step" => {
+                s.store(true, SeqCst);
+                (200, String::new())
+            }
+            "pingDebugUIParams" if s.load(SeqCst) && !d.swap(true, SeqCst) => {
+                (200, ping_response(&stop_with_frames(&[1, 4])))
+            }
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+        session.set_breakpoint("ОбщийМодуль.ТестОтладки", 4, None).unwrap();
+        let start = session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("halted");
+        assert_eq!(start.stack.len(), 1, "the step starts one frame deep");
+
+        session.step(StepAction::Next).unwrap();
+        let hit = session.wait_for_stop(Duration::from_secs(5)).unwrap().expect("breakpoint");
+        assert_eq!(hit.stack.len(), 2);
+        assert!(matches!(hit.reason, StopReason::Breakpoint), "{:?}", hit.reason);
+    }
+
+    /// `getCallStack` that never answers in time: a caller that gives `wait_stop` no time still
+    /// gets the known halt at once.
+    #[test]
+    fn a_zero_wait_reports_a_halt_before_the_attach_without_waiting_for_its_stack() {
+        let server = FakeServer::start(Box::new(|cmd: &str, body: &str| {
+            if cmd == "getCallStack" {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            halted_server(cmd, body)
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+
+        let started = std::time::Instant::now();
+        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the halt is reported");
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(matches!(stop.reason, StopReason::Suspended));
+        let detail = stop.detail.expect("an unknown position says why");
+        assert!(detail.contains("not requested"), "{detail}");
     }
 
     #[test]

@@ -304,21 +304,13 @@ impl Lsp {
         let pid = self.child.id();
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
             let pending = self.pending.lock().unwrap().pop_front();
-            match pending.map(Ok).unwrap_or_else(|| self.messages.recv_timeout(remaining)) {
-                Ok(message) => {
-                    if std::time::Instant::now() >= deadline {
-                        // Arrived past this wait's bound: not ours to judge, but still
-                        // the next wait's to see.
-                        self.pending.lock().unwrap().push_front(message);
-                        return None;
-                    }
-                    self.note_seen(&message);
-                    if predicate(&message) {
-                        return Some(message);
-                    }
-                }
+            // A zero remainder still polls once: what has already arrived is not silence.
+            let message = match pending.map(Ok).unwrap_or_else(|| {
+                self.messages
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            }) {
+                Ok(message) => message,
                 Err(mpsc::RecvTimeoutError::Timeout) => return None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!(
@@ -326,6 +318,15 @@ impl Lsp {
                         self.recent_methods()
                     )
                 }
+            };
+            self.note_seen(&message);
+            if predicate(&message) {
+                return Some(message);
+            }
+            // Checked after the message, not before: unrelated traffic cannot stretch the
+            // wait, and nothing taken in is dropped unjudged.
+            if std::time::Instant::now() >= deadline {
+                return None;
             }
         }
     }

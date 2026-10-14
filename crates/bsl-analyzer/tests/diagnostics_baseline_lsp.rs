@@ -280,3 +280,20 @@ fn a_server_request_reusing_the_client_id_is_not_taken_for_its_response() {
     assert_eq!(answer, response, "the server request with the same id is skipped");
     lsp.messages = original;
 }
+
+#[test]
+fn a_wait_whose_bound_has_run_out_still_takes_a_message_already_delivered() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    let delivered = json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {}});
+    sender.send(delivered.clone()).unwrap();
+
+    assert_eq!(
+        lsp.wait_for_within(Duration::ZERO, |_| true),
+        Some(delivered),
+        "a message that already arrived is not silence, however short the wait"
+    );
+    lsp.messages = original;
+}

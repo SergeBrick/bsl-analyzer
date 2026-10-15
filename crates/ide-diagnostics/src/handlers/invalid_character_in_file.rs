@@ -49,7 +49,12 @@ fn replacement_for(ch: char) -> Option<&'static str> {
 /// where the program does not see the text; manual in a string literal (the value
 /// changes: a non-breaking space may be exactly what the code searches for) and in
 /// an error token (the replacement changes how the line parses).
-fn token_fix(kind: SyntaxKind, text: &str, start: TextSize) -> Option<Fix<LocalRange>> {
+fn token_fix(
+    kind: SyntaxKind,
+    text: &str,
+    start: TextSize,
+    string_text: bool,
+) -> Option<Fix<LocalRange>> {
     let edits: Vec<TextEdit<LocalRange>> = text
         .char_indices()
         .filter_map(|(offset, ch)| {
@@ -64,11 +69,15 @@ fn token_fix(kind: SyntaxKind, text: &str, start: TextSize) -> Option<Fix<LocalR
     if edits.is_empty() {
         return None;
     }
-    Some(match kind {
-        SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => {
-            Fix::safe("Заменить недопустимые символы", edits)
-        }
-        _ => Fix::manual("Заменить недопустимые символы (меняет текст программы)", edits),
+    // A `//` token between the parts of a multiline literal is the literal's
+    // text, not a comment the program ignores. Replacing a character there
+    // changes the value, so the fix stays manual.
+    let invisible =
+        matches!(kind, SyntaxKind::WHITESPACE) || (kind == SyntaxKind::COMMENT && !string_text);
+    Some(if invisible {
+        Fix::safe("Заменить недопустимые символы", edits)
+    } else {
+        Fix::manual("Заменить недопустимые символы (меняет текст программы)", edits)
     })
 }
 
@@ -131,7 +140,10 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
                         InvalidCharType::IllegalDash
                     };
 
-                    let fix = token_fix(token.kind(), text, token.text_range().start());
+                    let string_text = token.kind() == SyntaxKind::COMMENT
+                        && syntax::comment_token_is_string_text(&token);
+                    let fix =
+                        token_fix(token.kind(), text, token.text_range().start(), string_text);
                     diagnostics.push(create_diagnostic(
                         LocalRange::of_detached_node(token.text_range()),
                         char_type,

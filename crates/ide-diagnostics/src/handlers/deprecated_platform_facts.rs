@@ -152,6 +152,13 @@ fn call_compile_env(ctx: &BodyContext) -> EnvFlags {
     if env.is_empty() {
         return EnvFlags::EMPTY;
     }
+    // An undecidable module-level `#Если` poisons `preproc_env` to empty. That is
+    // "the region could not be decided", not "the method compiles nowhere":
+    // intersecting would erase the directive's known environments and the gate
+    // would offer a replacement that does not compile in them.
+    if decl.preproc_env.is_empty() {
+        return env;
+    }
     env.intersection(decl.preproc_env)
 }
 

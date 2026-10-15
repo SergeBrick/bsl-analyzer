@@ -326,6 +326,35 @@ fn illegal_characters_in_a_comment_are_replaced_safely() {
 }
 
 #[test]
+fn illegal_character_in_a_multiline_string_comment_line_is_manual() {
+    // A continuation line that starts with `//` (no `|`) is a COMMENT token, but
+    // it is text of the literal. A safe fix would change that value unattended.
+    let source = "Процедура Тест()\n    Т = \"первая\n    // вторая\u{00A0}строка\n    |конец\";\nКонецПроцедуры\n";
+    let diagnostics = module_diagnostics(source, Project::default());
+    assert_eq!(
+        fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile),
+        "InvalidCharacterInFile @ 3:5 Заменить недопустимые символы (меняет текст программы) [fix_all=false]\n\
+         Процедура Тест()\n    Т = \"первая\n    // вторая строка\n    |конец\";\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn an_undecidable_region_does_not_erase_the_directive_environment() {
+    let client = "#Если Линукс Тогда\n&НаКлиенте\nПроцедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n#КонецЕсли\n";
+    let client_diags = form_module_diagnostics(client);
+    assert_eq!(
+        fixes_of(client, &client_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 4:12 no fix"
+    );
+
+    let server = "#Если Линукс Тогда\n&НаСервере\nПроцедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n#КонецЕсли\n";
+    let server_diags = form_module_diagnostics(server);
+    let fixes = fixes_of(server, &server_diags, DiagnosticCode::DeprecatedPlatformApi);
+    assert!(fixes.contains("Дата = ТекущаяДатаСеанса();"), "got: {fixes}");
+    assert!(fixes.contains("[fix_all=false]"), "got: {fixes}");
+}
+
+#[test]
 fn illegal_character_in_a_string_is_a_manual_fix() {
     // A non-breaking space inside a literal may be exactly what the code looks for.
     let source = "Процедура Тест(Текст)\n    Текст = СтрЗаменить(Текст, \"\u{00A0}\", \"\");\nКонецПроцедуры\n";

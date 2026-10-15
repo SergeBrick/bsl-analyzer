@@ -8142,6 +8142,53 @@ fn file_path_lookup_uses_explicit_root_and_does_not_fallback_from_it() {
     assert_eq!(root1_metadata.module_type, bsl_metadata::ModuleType::Unknown);
 }
 
+#[test]
+fn late_file_root_registration_invalidates_metadata_memo() {
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(5);
+    let mut bsl_files = FileSet::new();
+    bsl_files.insert(file_id, VfsPath::new("/ws/Documents/Заказ/Ext/ObjectModule.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(bsl_files));
+    let first = crate::queries::module_metadata_query(&db, base_db::FileIdInput::new(&db, file_id));
+    assert_eq!(first.module_type, bsl_metadata::ModuleType::ObjectModule);
+
+    let mut other_files = FileSet::new();
+    other_files.insert(file_id, VfsPath::new("/ws/CommonModules/Общий/Ext/Module.bsl"));
+    db.set_source_root(SourceRootId(1), SourceRoot::new_local(other_files));
+    db.set_file_source_root(file_id, SourceRootId(1));
+
+    let after = crate::queries::module_metadata_query(&db, base_db::FileIdInput::new(&db, file_id));
+    assert_eq!(
+        after.module_type,
+        bsl_metadata::ModuleType::CommonModule,
+        "a registration that appears after the fallback lookup must invalidate the memo"
+    );
+    assert_eq!(
+        crate::vfs_helpers::get_file_path(&db, file_id),
+        Some(std::path::PathBuf::from("/ws/CommonModules/Общий/Ext/Module.bsl"))
+    );
+}
+
+#[test]
+fn late_bsl_root_registration_invalidates_metadata_memo() {
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(5);
+    let before =
+        crate::queries::module_metadata_query(&db, base_db::FileIdInput::new(&db, file_id));
+    assert_eq!(before.module_type, bsl_metadata::ModuleType::Unknown);
+
+    let mut bsl_files = FileSet::new();
+    bsl_files.insert(file_id, VfsPath::new("/ws/CommonModules/Общий/Ext/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(bsl_files));
+
+    let after = crate::queries::module_metadata_query(&db, base_db::FileIdInput::new(&db, file_id));
+    assert_eq!(
+        after.module_type,
+        bsl_metadata::ModuleType::CommonModule,
+        "publishing the BSL root after a miss must invalidate the memo"
+    );
+}
+
 fn borrowed_form(db: &RootDatabaseImpl, file: FileId) -> Option<Arc<bsl_metadata::Form>> {
     crate::queries::module_metadata_query(db, base_db::FileIdInput::new(db, file)).form.clone()
 }

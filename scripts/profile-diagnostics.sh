@@ -86,6 +86,7 @@ DIAGNOSTICS=(
     IncorrectUseOfStrTemplate
     InternetAccess
     InvalidCharacterInFile
+    InvalidVirtualTableParameters
     IsInRoleMethod
     JoinWithSubQuery
     JoinWithVirtualTable

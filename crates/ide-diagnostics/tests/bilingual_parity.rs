@@ -356,6 +356,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "SDBL field resolution diagnostic; requires configuration metadata fixture",
     ),
     (
+        DiagnosticCode::InvalidVirtualTableParameters,
+        "SDBL virtual-table argument list; message names the table and the parameter by design",
+    ),
+    (
         DiagnosticCode::UnlimitedLengthStringUsageInQuery,
         "SDBL field-type diagnostic; requires configuration metadata fixture",
     ),
@@ -628,7 +632,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 199, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 200, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

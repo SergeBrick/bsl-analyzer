@@ -220,6 +220,45 @@ impl LoweringContext<'_> {
         }
     }
 
+    /// Pushes a frame holding the select list's output columns; the caller pops it.
+    ///
+    /// A bare name after `УПОРЯДОЧИТЬ ПО` or in `ИТОГИ` is first of all a result column.
+    /// Resolving it against the sources instead finds the same name in two joined tables and
+    /// reports an ambiguity the platform does not see. `opaque` closes the frame for clauses
+    /// that cannot reach the sources at all.
+    pub(super) fn push_select_outputs_frame(
+        &mut self,
+        select: &SelectHir,
+        opaque: bool,
+        range: text_size::TextRange,
+    ) {
+        self.scope.push_outputs_frame(opaque);
+        let outputs = crate::hir::TableRef {
+            parts: Vec::new(),
+            full_name: String::new(),
+            alias: None,
+            metadata: Some(crate::hir::ResolvedTable::TempTable {
+                name: String::new(),
+                fields: select
+                    .fields
+                    .iter()
+                    .filter_map(|field| {
+                        field
+                            .alias_or_name()
+                            .map(|name| crate::hir::FieldDef::new(name.as_str(), field.ty.clone()))
+                    })
+                    .collect(),
+                field_model_complete: false,
+            }),
+            is_virtual_table: false,
+            virtual_table_params: Vec::new(),
+            subquery: Vec::new(),
+            range,
+        };
+        // A fresh frame: there is nothing for the outputs to collide with.
+        let _ = self.scope.add_table(outputs);
+    }
+
     pub(super) fn lower_totals_by_clause(
         &mut self,
         query_node: &syntax::SyntaxNode,
@@ -230,6 +269,10 @@ impl LoweringContext<'_> {
         else {
             return;
         };
+
+        // `ИТОГИ` speaks of the result columns only: a bare name there is a select output, never
+        // a source field.
+        self.push_select_outputs_frame(select, true, totals_clause.text_range());
 
         let mut after_by = false;
 
@@ -285,6 +328,8 @@ impl LoweringContext<'_> {
                 _ => {}
             }
         }
+
+        self.scope.pop_frame();
     }
 
     pub(super) fn lower_drop_query(&mut self, drop_query: &syntax::SyntaxNode) {

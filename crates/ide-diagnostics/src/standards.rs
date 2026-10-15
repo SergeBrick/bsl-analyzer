@@ -238,6 +238,7 @@ pub fn standards(code: DiagnosticCode) -> &'static [u16] {
         DiagnosticCode::QueryParseError => &[437],
         DiagnosticCode::QueryToMissingMetadata => &[],
         DiagnosticCode::UnknownFieldInQuery => &[],
+        DiagnosticCode::InvalidVirtualTableParameters => &[],
         DiagnosticCode::UnlimitedLengthStringUsageInQuery => &[432],
         DiagnosticCode::RefOveruse => &[654],
         DiagnosticCode::SelectTopWithoutOrderBy => &[412],

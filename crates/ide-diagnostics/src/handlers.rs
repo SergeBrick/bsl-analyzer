@@ -78,6 +78,7 @@ pub mod incorrect_use_like_in_query;
 pub mod incorrect_use_of_str_template;
 pub mod internet_access;
 pub mod invalid_character_in_file;
+pub mod invalid_virtual_table_parameters;
 pub mod is_in_role_method;
 pub mod join_with_sub_query;
 pub mod join_with_virtual_table;
@@ -416,6 +417,9 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::AmbiguousFieldInQuery => Some(&ambiguous_field_in_query::METADATA),
         DiagnosticCode::DuplicateAliasInQuery => Some(&duplicate_alias_in_query::METADATA),
         DiagnosticCode::UnknownFieldInQuery => Some(&unknown_field_in_query::METADATA),
+        DiagnosticCode::InvalidVirtualTableParameters => {
+            Some(&invalid_virtual_table_parameters::METADATA)
+        }
         DiagnosticCode::UnlimitedLengthStringUsageInQuery => {
             Some(&unlimited_length_string_usage_in_query::METADATA)
         }

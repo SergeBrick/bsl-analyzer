@@ -206,3 +206,72 @@ fn incomplete_method_is_not_offered() {
     let code = "Процедура Тест()\n    А = 1;\n";
     assert!(assists_at(code, "Тест").is_empty());
 }
+
+#[test]
+fn function_called_from_a_string_is_not_offered() {
+    for call in ["Итог = Вычислить(\"Проверить()\");", "Выполнить(\"Итог = Проверить ();\");"]
+    {
+        let code = with_caller(call);
+        assert!(
+            assists_at(&code, "Проверить()\n    А").is_empty(),
+            "offered although `{call}` calls it from a string"
+        );
+    }
+
+    // Control: the name in a string that does not call it — a notification handler name.
+    let code = with_caller("Оповещение = Новый ОписаниеОповещения(\"Проверить\", ЭтотОбъект);");
+    assert_eq!(assists_at(&code, "Проверить()\n    А").len(), 1);
+}
+
+const BASE: FileId = FileId(0);
+const EXTENSION: FileId = FileId(1);
+
+/// A common module `Общий` in the configuration and its body in an extension.
+fn with_extension(base: &str, extension: &str) -> Analysis {
+    let mut db = RootDatabaseImpl::new();
+    let mut file_set = FileSet::default();
+    file_set.insert(BASE, VfsPath::new("/base/CommonModules/Общий/Ext/Module.bsl"));
+    file_set.insert(EXTENSION, VfsPath::new("/ext/CommonModules/Общий/Ext/Module.bsl"));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for (file, text) in [(BASE, base), (EXTENSION, extension)] {
+        db.set_file_source_root(file, SourceRootId(0));
+        db.set_file_text(file, text);
+    }
+    Analysis::from_database(db)
+}
+
+fn assists_in(analysis: &Analysis, file: FileId, code: &str, anchor: &str) -> Vec<Assist> {
+    let offset = code.find(anchor).unwrap_or_else(|| panic!("anchor {anchor:?} not in source"));
+    analysis.code_actions(file, TextRange::empty(TextSize::from(offset as u32)))
+}
+
+#[test]
+fn method_an_extension_intercepts_is_not_offered() {
+    let base = "Процедура Записать() Экспорт\n    А = 1;\nКонецПроцедуры\n\n\
+                Процедура Прочитать() Экспорт\n    А = 1;\nКонецПроцедуры\n";
+    for annotation in ["&После", "&Перед", "&Вместо", "&ИзменениеИКонтроль"]
+    {
+        let extension = format!(
+            "#Область Перехват\n{annotation}(\"ЗАПИСАТЬ\")\n\
+             Процедура Расш_Записать()\n    А = 2;\nКонецПроцедуры\n#КонецОбласти\n"
+        );
+        let analysis = with_extension(base, &extension);
+        assert!(
+            assists_in(&analysis, BASE, base, "Записать()").is_empty(),
+            "offered although {annotation} intercepts it"
+        );
+        // The interceptor's own kind is bound to the method it intercepts.
+        assert!(
+            assists_in(&analysis, EXTENSION, &extension, "Расш_Записать").is_empty(),
+            "offered on the {annotation} interceptor itself"
+        );
+        // Control: the method of the same module nobody intercepts is offered.
+        assert_eq!(assists_in(&analysis, BASE, base, "Прочитать()").len(), 1);
+    }
+
+    // Control: a plain method of the extension body is offered.
+    let extension = "Процедура Расш_Свой()\n    А = 2;\nКонецПроцедуры\n";
+    let analysis = with_extension(base, extension);
+    assert_eq!(assists_in(&analysis, EXTENSION, extension, "Расш_Свой").len(), 1);
+    assert_eq!(assists_in(&analysis, BASE, base, "Записать()").len(), 1);
+}

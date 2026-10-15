@@ -1,7 +1,7 @@
 use hir::Semantics;
 use ide_assists::{Assist, AssistId, FileEdit, SourceChange, TextEdit};
 use ide_db::RootDatabase;
-use syntax::ast::{AstNode, FunctionDef};
+use syntax::ast::{AstNode, FunctionDef, ProcedureDef};
 use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize};
 use vfs::FileId;
 
@@ -16,9 +16,12 @@ use crate::references::find_references_in_file;
 ///
 /// The reverse is offered only when nothing depends on the function returning a value:
 /// it has no `Возврат <выражение>` (a procedure does not compile one), no call in the
-/// module uses its result (a procedure call is not an expression), and it is not
-/// `Экспорт` — callers in other modules are not searched here, so an exported function
-/// is never converted.
+/// module uses its result (a procedure call is not an expression), no string in the module
+/// calls it (`Вычислить("Имя()")`), and it is not `Экспорт` — callers in other modules are
+/// not searched here, so an exported function is never converted.
+///
+/// Neither direction is offered for a method an extension binds by name, nor for an
+/// extension's interceptor itself: see [`bound_by_extension`].
 pub fn convert_method_assists<DB: RootDatabase>(
     db: &DB,
     file_id: FileId,
@@ -30,7 +33,9 @@ pub fn convert_method_assists<DB: RootDatabase>(
     let Some(method) = enclosing_method(&root, range.start()) else {
         return Vec::new();
     };
-    if !on_declaration_line(&text, &method, range.start()) {
+    if !on_declaration_line(&text, &method, range.start())
+        || bound_by_extension(db, file_id, &method)
+    {
         return Vec::new();
     }
 
@@ -81,6 +86,43 @@ fn on_declaration_line(text: &str, method: &SyntaxNode, offset: TextSize) -> boo
     (start..=end).contains(&usize::from(offset))
 }
 
+/// An extension binds a method by its name and its kind: `&Вместо` must be of the kind of
+/// the method it replaces, `&Перед` and `&После` cannot extend a function, and
+/// `&ИзменениеИКонтроль` must match the method's text. Converting either side of such a pair
+/// leaves the interception silently inapplicable, and the other side lives in another body
+/// of the same module, which the edit does not touch.
+fn bound_by_extension<DB: RootDatabase>(db: &DB, file_id: FileId, method: &SyntaxNode) -> bool {
+    if extension_target(method).is_some() {
+        return true;
+    }
+    let Some(name) = method_name(method) else {
+        return false;
+    };
+    let name = name.text().to_lowercase();
+    let source_root = db.file_source_root_input(file_id).source_root_id(db);
+    db.module_index(source_root).sibling_bodies(file_id).into_iter().any(|sibling| {
+        db.parse(sibling)
+            .syntax_node()
+            .children()
+            .filter_map(|other| extension_target(&other))
+            .any(|target| target.to_lowercase() == name)
+    })
+}
+
+/// The base method an extension method intercepts or changes, by name.
+fn extension_target(method: &SyntaxNode) -> Option<String> {
+    hir::interceptor_target(method)
+        .map(|interception| interception.target)
+        .or_else(|| hir::extract_change_and_validate(method).map(|change| change.target))
+}
+
+fn method_name(method: &SyntaxNode) -> Option<SyntaxToken> {
+    match ProcedureDef::cast(method.clone()) {
+        Some(procedure) => procedure.name(),
+        None => FunctionDef::cast(method.clone())?.name(),
+    }
+}
+
 fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &SyntaxNode) -> bool {
     let Some(function) = FunctionDef::cast(method.clone()) else {
         return false;
@@ -95,6 +137,9 @@ fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Syn
         return false;
     };
     let root = db.parse(file_id).syntax_node();
+    if called_from_a_string(&root, name.text()) {
+        return false;
+    }
     find_references_in_file(db, file_id, &symbol)
         .into_iter()
         .filter(|reference| reference.range != name.text_range())
@@ -103,6 +148,25 @@ fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Syn
                 .right_biased()
                 .is_some_and(|token| is_call_statement(&token))
         })
+}
+
+/// `Вычислить("Имя()")` and `Выполнить("Х = Имя();")` call the method from a string, which
+/// no reference search sees. The name followed by `(` in any string literal counts as a call
+/// reading the result; the bare name, as a notification handler takes it, does not call it.
+fn called_from_a_string(root: &SyntaxNode, name: &str) -> bool {
+    let name = name.to_lowercase();
+    root.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind().is_string_literal())
+        .any(|token| calls_by_name(&token.text().to_lowercase(), &name))
+}
+
+fn calls_by_name(text: &str, name: &str) -> bool {
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(is_name_char)
+            && text[at + name.len()..].trim_start().starts_with('(')
+    })
 }
 
 /// A bare `Возврат;` holds only tokens; `Возврат <выражение>;` holds the expression node.

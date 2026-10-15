@@ -947,6 +947,9 @@ impl MetadataObject {
         if !overlay.register_records().is_empty() {
             self.set_register_records(overlay.register_records().to_vec());
         }
+        if overlay.max_ext_dimension_count.is_some() {
+            self.max_ext_dimension_count = overlay.max_ext_dimension_count;
+        }
 
         crate::common_attribute::merge_common_attribute_fields(
             &mut self.common_attributes,
@@ -1293,6 +1296,20 @@ mod tests {
 
         assert_eq!(MdoType::from_plural("InvalidType"), None);
         assert_eq!(MdoType::from_plural(""), None);
+    }
+
+    #[test]
+    fn extension_overlay_takes_max_ext_dimension_count_when_specified() {
+        let mut base = MetadataObject::new(MdoType::ChartOfAccounts, "План1");
+        base.set_max_ext_dimension_count(Some(3));
+        let mut overlay = MetadataObject::new(MdoType::ChartOfAccounts, "План1");
+        overlay.set_max_ext_dimension_count(Some(5));
+        base.apply_extension_overlay(&overlay);
+        assert_eq!(base.max_ext_dimension_count, Some(5));
+
+        let silent = MetadataObject::new(MdoType::ChartOfAccounts, "План1");
+        base.apply_extension_overlay(&silent);
+        assert_eq!(base.max_ext_dimension_count, Some(5), "an omitted count stays with the base",);
     }
 
     #[test]

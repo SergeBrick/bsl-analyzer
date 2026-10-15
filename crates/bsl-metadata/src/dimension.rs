@@ -61,6 +61,10 @@ impl Dimension {
         self.balance
     }
 
+    pub fn set_balance(&mut self, balance: Option<bool>) {
+        self.balance = balance;
+    }
+
     pub fn type_str(&self) -> &str {
         &self.type_str
     }

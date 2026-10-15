@@ -56,9 +56,11 @@ fn parse_register_xml(xml: &str, mdo_type: MdoType) -> Result<Register> {
     let (correspondence, chart_of_accounts) = if mdo_type == MdoType::AccountingRegister {
         (
             optional_bool(props, "Correspondence"),
-            child_text(props, "ChartOfAccounts")
-                .and_then(|raw| raw.split_once('.'))
-                .map(|(_, name)| name.to_string()),
+            child_text(props, "ChartOfAccounts").and_then(|raw| {
+                let (_, name) = raw.trim().split_once('.')?;
+                let name = name.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            }),
         )
     } else {
         (None, None)

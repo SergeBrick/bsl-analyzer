@@ -1223,6 +1223,34 @@ mod tests {
         assert_eq!(coa.max_ext_dimension_count, Some(3));
     }
 
+    #[test]
+    fn whitespace_around_a_chart_count_or_name_is_not_part_of_the_value() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">
+    <ChartOfAccounts uuid="11111111-1111-1111-1111-111111111111">
+        <Properties>
+            <Name>План1</Name>
+            <MaxExtDimensionCount> 3
+</MaxExtDimensionCount>
+        </Properties>
+    </ChartOfAccounts>
+</MetaDataObject>"#;
+        let coa = parse_chart_of_accounts_xml(xml).unwrap();
+        assert_eq!(coa.max_ext_dimension_count, Some(3));
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <AccountingRegister uuid="22222222-2222-2222-2222-222222222222">
+        <Properties>
+            <Name>Бухгалтерия1</Name>
+            <ChartOfAccounts>ChartOfAccounts.План1 </ChartOfAccounts>
+        </Properties>
+    </AccountingRegister>
+</MetaDataObject>"#;
+        let register = parse_accounting_register_xml(xml).unwrap();
+        assert_eq!(register.chart_of_accounts(), Some("План1"));
+    }
+
     /// The shape of an accounting register's query tables follows from four properties — the
     /// correspondence flag, the chart of accounts, and each dimension's and resource's balance
     /// flag — so all four must survive the parse. Other register kinds have none of them and

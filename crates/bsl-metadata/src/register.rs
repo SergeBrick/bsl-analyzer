@@ -354,14 +354,36 @@ impl Register {
     /// so the whole-config merge and the per-register resolver share one rule.
     pub fn apply_extension_overlay(&mut self, overlay: &Register) {
         for dimension in &overlay.dimensions {
+            let mut dimension = dimension.clone();
+            // An omitted Balance is "the XML did not say", not "this member is no longer
+            // balance". Replacing a known flag with None makes every spelling provisional.
+            if dimension.balance().is_none() {
+                if let Some(existing) = self
+                    .dimensions
+                    .iter()
+                    .find(|existing| stdx::case::eq_ignore_case(existing.name(), dimension.name()))
+                {
+                    dimension.set_balance(existing.balance());
+                }
+            }
             self.dimensions
                 .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), dimension.name()));
-            self.dimensions.push(dimension.clone());
+            self.dimensions.push(dimension);
         }
         for resource in &overlay.resources {
+            let mut resource = resource.clone();
+            if resource.balance().is_none() {
+                if let Some(existing) = self
+                    .resources
+                    .iter()
+                    .find(|existing| stdx::case::eq_ignore_case(existing.name(), resource.name()))
+                {
+                    resource.set_balance(existing.balance());
+                }
+            }
             self.resources
                 .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), resource.name()));
-            self.resources.push(resource.clone());
+            self.resources.push(resource);
         }
         for attribute in &overlay.attributes {
             self.attributes
@@ -692,6 +714,37 @@ mod tests {
             .build();
 
         assert_eq!(reg1, reg2);
+    }
+
+    #[test]
+    fn extension_overlay_keeps_balance_when_the_replacement_omits_it() {
+        let mut base = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .dimensions(vec![Dimension::builder().name("Измерение1").balance(Some(false)).build()])
+            .resources(vec![{
+                let mut resource = RegisterResource::new(Uuid::new_v4(), "Ресурс1");
+                resource.set_balance(Some(false));
+                resource
+            }])
+            .build();
+        let overlay = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .dimensions(vec![Dimension::builder().name("Измерение1").build()])
+            .resources(vec![RegisterResource::new(Uuid::new_v4(), "Ресурс1")])
+            .build();
+        base.apply_extension_overlay(&overlay);
+        assert_eq!(base.dimensions()[0].balance(), Some(false));
+        assert_eq!(base.resources()[0].balance(), Some(false));
+
+        let explicit = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .dimensions(vec![Dimension::builder().name("Измерение1").balance(Some(true)).build()])
+            .build();
+        base.apply_extension_overlay(&explicit);
+        assert_eq!(base.dimensions()[0].balance(), Some(true));
     }
 
     #[test]

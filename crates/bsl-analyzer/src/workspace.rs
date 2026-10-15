@@ -209,8 +209,6 @@ impl GlobalState {
     }
 
     pub fn process_changes(&mut self, suppress_metadata_bump: bool) -> ChangeOutcome {
-        use base_db::SourceDatabase;
-
         let start = Instant::now();
         let take_start = Instant::now();
         let changed_files = self.vfs.write().take_changes();
@@ -230,20 +228,17 @@ impl GlobalState {
         let db = self.analysis_host.raw_database_mut();
         let source_root_id = base_db::SourceRootId(0);
 
-        let source_root_input = db.source_root_input(source_root_id);
-        let source_root = source_root_input.root(db);
-        let mut file_set = source_root.file_set().clone();
-        let mut file_set_modified = false;
+        let mut source_changes = Vec::with_capacity(file_count);
         let mut config_file_changed = false;
         let mut diagnostics_baseline_changed = false;
-        let mut bsl_source_changed = false;
         let mut call_hierarchy_body_edits = Vec::new();
+        let mut call_hierarchy_structural_file_ids = Vec::new();
         let mut call_hierarchy_structural_change = false;
         let mut changed_metadata_paths: Vec<std::path::PathBuf> = Vec::new();
         // Substrate-listed module bodies (common modules and HTTP/Web/Integration
         // services) that were added or removed (not merely edited): their per-MDO
         // listing `module_file` entry must be rebuilt.
-        let mut changed_listed_bodies: Vec<std::path::PathBuf> = Vec::new();
+        let mut changed_listed_bodies: Vec<(FileId, std::path::PathBuf)> = Vec::new();
 
         for file in changed_files {
             // Capture the change kind before `file.change` is consumed below; only an
@@ -267,9 +262,7 @@ impl GlobalState {
                 continue;
             }
 
-            db.set_file_source_root(file.file_id, source_root_id);
-
-            let is_bsl_path = {
+            let (path, is_bsl_path) = {
                 let vfs = self.vfs.read();
                 let path = vfs.file_path(file.file_id);
                 let path_path = path.as_path();
@@ -287,57 +280,30 @@ impl GlobalState {
                     call_hierarchy_structural_change = true;
                 }
                 if change_is_structural && project_model::is_substrate_listed_body_path(path_path) {
-                    changed_listed_bodies.push(path_path.to_path_buf());
+                    changed_listed_bodies.push((file.file_id, path_path.to_path_buf()));
                 }
-                project_model::is_bsl_source_path(path_path)
+                (path.clone(), project_model::is_bsl_source_path(path_path))
             };
 
             if is_bsl_path {
                 if change_is_structural {
-                    call_hierarchy_structural_change = true;
+                    call_hierarchy_structural_file_ids.push(file.file_id);
                 } else if text.is_some() {
                     call_hierarchy_body_edits.push(file.file_id);
                 }
             }
 
             if is_bsl_path && text.is_none() {
-                if file_set.path_for_file(&file.file_id).is_some() {
-                    file_set.remove(file.file_id);
-                    // `Deleted` rather than `Unreadable`: the VFS reports both as
-                    // absent text, and the eviction below puts the file out of every
-                    // consumer's reach anyway, so marking it unread would assert a
-                    // cause nobody established and nobody could read back.
-                    ide_host_core::set_file_text_source(
-                        db,
-                        file.file_id,
-                        ide_host_core::FileTextSource::Deleted,
-                    );
-                    file_set_modified = true;
-                    bsl_source_changed = true;
-                    tracing::warn!(
-                        file_id = file.file_id.0,
-                        "BSL file evicted from FileSet (deleted or unreadable); text input emptied",
-                    );
-                }
+                // `Deleted` rather than `Unreadable`: the VFS reports both as
+                // absent text, and the batch removes the file from every consumer's
+                // reach before publishing the updated root.
+                source_changes
+                    .push(ide_host_core::SourceBatchChange::Remove { file_id: file.file_id });
                 continue;
             }
 
-            if file_set.path_for_file(&file.file_id).is_none() {
-                let vfs = self.vfs.read();
-                let path = vfs.file_path(file.file_id);
-                file_set.insert(file.file_id, path.clone());
-                drop(vfs);
-                file_set_modified = true;
-
-                tracing::debug!(
-                    file_id = file.file_id.0,
-                    "added file to FileSet during process_changes"
-                );
-            }
-
             if let Some(text) = text {
-                let store_in_salsa = ide_db::is_bsl_source(&file_set, file.file_id);
-                if store_in_salsa {
+                let source = if is_bsl_path {
                     // Open editor buffers are the source of truth for unsaved
                     // content, so they stay a resident overlay. Closed files are
                     // recorded by content revision only and re-read from disk on
@@ -351,21 +317,38 @@ impl GlobalState {
                         is_open,
                         "process_changes: file text"
                     );
-                    let source = if is_open {
-                        ide_host_core::FileTextSource::Overlay(&text)
+                    if is_open {
+                        Some(ide_host_core::BatchTextSource::Overlay(text))
                     } else {
-                        ide_host_core::FileTextSource::Disk(&text)
-                    };
-                    ide_host_core::set_file_text_source(db, file.file_id, source);
-                    bsl_source_changed = true;
-                }
+                        Some(ide_host_core::BatchTextSource::Disk(text))
+                    }
+                } else {
+                    None
+                };
+                source_changes.push(ide_host_core::SourceBatchChange::Upsert {
+                    file_id: file.file_id,
+                    path,
+                    source,
+                });
             }
         }
 
-        if file_set_modified {
-            let updated_source_root = base_db::SourceRoot::new_local(file_set);
-            db.set_source_root(source_root_id, updated_source_root);
-        }
+        let source_effects = ide_host_core::apply_source_batch(db, source_root_id, source_changes);
+        // LSP already captured its metadata paths; release the unused common path copies before reload.
+        drop(source_effects.affected_paths);
+        let changed_file_ids = &source_effects.changed_file_ids;
+        let changed_file_id_set = (changed_file_ids.len() > 1)
+            .then(|| changed_file_ids.iter().copied().collect::<rustc_hash::FxHashSet<_>>());
+        let has_source_change = |file_id: &FileId| {
+            changed_file_id_set
+                .as_ref()
+                .map_or_else(|| changed_file_ids.contains(file_id), |set| set.contains(file_id))
+        };
+        let bsl_source_changed = source_effects.bsl_source_changed;
+        call_hierarchy_body_edits.retain(has_source_change);
+        call_hierarchy_structural_change |=
+            call_hierarchy_structural_file_ids.iter().any(has_source_change);
+        changed_listed_bodies.retain(|(file_id, _)| has_source_change(file_id));
 
         if config_file_changed {
             if suppress_metadata_bump {
@@ -415,7 +398,9 @@ impl GlobalState {
         // the owning roots so the reverse index reflects the new/removed body. (The
         // initial sync is suppressed; the post-sync bootstrap rebuilds the listings.)
         if !suppress_metadata_bump && !changed_listed_bodies.is_empty() {
-            self.refresh_metadata_substrate(&changed_listed_bodies);
+            let paths: Vec<_> =
+                changed_listed_bodies.iter().map(|(_, path)| path.clone()).collect();
+            self.refresh_metadata_substrate(&paths);
         }
 
         if !suppress_metadata_bump {
@@ -684,8 +669,10 @@ impl GlobalState {
             self.show_error_message(format!("bsl-analyzer: project config reload failed: {e}"));
             return false;
         }
-        self.prune_stale_workspace_files();
+        // Let excluded sources flow through the VFS removal batch while their
+        // FileIds are still in SourceRoot, so the batch can tombstone their text.
         self.evict_excluded_sources();
+        self.prune_stale_workspace_files();
         self.readmit_open_documents();
         true
     }
@@ -812,14 +799,13 @@ impl GlobalState {
     }
 
     fn prune_stale_workspace_files(&mut self) {
-        use base_db::{SourceDatabase, SourceRoot, SourceRootId};
+        use base_db::{SourceDatabase, SourceRootId};
 
         let Some(allowed_roots) = self.workspace_allowed_roots() else { return };
         let open_paths = self.open_doc_paths();
 
         let source_root_id = SourceRootId(0);
-        let mut new_file_set = vfs::file_set::FileSet::new();
-        let mut dropped = 0usize;
+        let mut dropped_paths = Vec::new();
         let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
         {
             let db = self.analysis_host.raw_database();
@@ -829,29 +815,52 @@ impl GlobalState {
 
             for file_id in file_set.iter() {
                 let Some(vfs_path) = file_set.path_for_file(&file_id) else { continue };
-                if path_in_workspace(
+                if !path_in_workspace(
                     vfs_path.as_path(),
                     Some(&allowed_roots),
                     &open_paths,
                     &self.source_exclusions,
                     &mut resolved,
                 ) {
-                    new_file_set.insert(file_id, vfs_path.clone());
-                } else {
-                    dropped += 1;
+                    dropped_paths.push((file_id, vfs_path.clone()));
                 }
             }
         }
 
-        if dropped == 0 {
+        if dropped_paths.is_empty() {
             return;
         }
 
+        let dropped = dropped_paths.len();
         tracing::info!(dropped, "pruning stale files from SourceRoot after workspace reconfig");
 
         self.analysis_host.request_cancellation();
-        let new_source_root = SourceRoot::new_local(new_file_set);
-        self.analysis_host.raw_database_mut().set_source_root(source_root_id, new_source_root);
+        let (stale_bsl, stale_non_bsl): (Vec<_>, Vec<_>) = dropped_paths
+            .into_iter()
+            .partition(|(_, path)| project_model::is_bsl_source_path(path.as_path()));
+
+        // The project inputs are VFS-backed so the loader can watch and reload
+        // them, but they are not workspace sources. Remove only their stale
+        // SourceRoot registrations; deleting their VFS contents would report
+        // another project-input change and recursively start the same reload.
+        if !stale_non_bsl.is_empty() {
+            ide_host_core::apply_source_batch(
+                self.analysis_host.raw_database_mut(),
+                SourceRootId(0),
+                stale_non_bsl
+                    .into_iter()
+                    .map(|(file_id, _)| ide_host_core::SourceBatchChange::Remove { file_id }),
+            );
+        }
+
+        if !stale_bsl.is_empty() {
+            let mut vfs = self.vfs.write();
+            for (_, path) in stale_bsl {
+                vfs.set_file_contents(path, None);
+            }
+            drop(vfs);
+            self.process_changes(!self.vfs_done);
+        }
     }
 
     /// The project's source roots, or `None` without a project. Empty when the user

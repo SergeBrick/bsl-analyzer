@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" version="2.10">
+  <Catalog uuid="00000000-0000-0000-0000-000000000002">
+    <Properties><Name>КонтрольныйКаталог</Name></Properties>
+    <ChildObjects>
+      <Attribute uuid="00000000-0000-0000-0000-000000000003">
+        <Properties><Name>ИзменяемыйТип</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties>
+      </Attribute>
+      <Attribute uuid="00000000-0000-0000-0000-000000000004">
+        <Properties><Name>СтабильныйТип</Name><Type><v8:Type>xs:string</v8:Type></Type></Properties>
+      </Attribute>
+    </ChildObjects>
+  </Catalog>
+</MetaDataObject>

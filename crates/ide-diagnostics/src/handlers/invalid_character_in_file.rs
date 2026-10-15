@@ -1,8 +1,9 @@
 use crate::define_metadata;
 use crate::metadata::*;
-use crate::{BodyContext, Diagnostic, DiagnosticCode};
+use crate::{BodyContext, Diagnostic, DiagnosticCode, Fix, TextEdit};
 use hir::LocalRange;
-use syntax::SyntaxKind;
+use ide_db::TextRange;
+use syntax::{SyntaxKind, TextSize};
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -23,14 +24,58 @@ const ILLEGAL_DASHES: &[char] =
 
 const ILLEGAL_SPACE: char = '\u{00A0}';
 
+const SOFT_HYPHEN: char = '\u{00AD}';
+
 enum InvalidCharType {
     IllegalDash,
     IllegalSpace,
 }
 
+/// What an illegal character becomes, or `None` for a legal one. The soft hyphen is
+/// invisible, so it is removed rather than turned into a visible `-`.
+fn replacement_for(ch: char) -> Option<&'static str> {
+    if ch == ILLEGAL_SPACE {
+        Some(" ")
+    } else if ch == SOFT_HYPHEN {
+        Some("")
+    } else if ILLEGAL_DASHES.contains(&ch) {
+        Some("-")
+    } else {
+        None
+    }
+}
+
+/// Replaces every illegal character of one token. Safe in whitespace and comments,
+/// where the program does not see the text; manual in a string literal (the value
+/// changes: a non-breaking space may be exactly what the code searches for) and in
+/// an error token (the replacement changes how the line parses).
+fn token_fix(kind: SyntaxKind, text: &str, start: TextSize) -> Option<Fix<LocalRange>> {
+    let edits: Vec<TextEdit<LocalRange>> = text
+        .char_indices()
+        .filter_map(|(offset, ch)| {
+            let new_text = replacement_for(ch)?;
+            let at = start + TextSize::from(offset as u32);
+            Some(TextEdit {
+                range: LocalRange::of_detached_node(TextRange::at(at, TextSize::of(ch))),
+                new_text: new_text.to_string(),
+            })
+        })
+        .collect();
+    if edits.is_empty() {
+        return None;
+    }
+    Some(match kind {
+        SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => {
+            Fix::safe("Заменить недопустимые символы", edits)
+        }
+        _ => Fix::manual("Заменить недопустимые символы (меняет текст программы)", edits),
+    })
+}
+
 fn create_diagnostic(
     range: LocalRange,
     char_type: InvalidCharType,
+    fixes: Vec<Fix<LocalRange>>,
     code: DiagnosticCode,
     ctx: &BodyContext,
 ) -> Diagnostic<LocalRange> {
@@ -47,7 +92,7 @@ fn create_diagnostic(
         severity: ctx.severity(code),
         range,
         tags: ctx.tags(code),
-        fixes: vec![],
+        fixes,
     }
 }
 
@@ -86,9 +131,11 @@ pub fn check_body(ctx: &BodyContext, acc: &mut Vec<Diagnostic<LocalRange>>) {
                         InvalidCharType::IllegalDash
                     };
 
+                    let fix = token_fix(token.kind(), text, token.text_range().start());
                     diagnostics.push(create_diagnostic(
                         LocalRange::of_detached_node(token.text_range()),
                         char_type,
+                        fix.into_iter().collect(),
                         code,
                         ctx,
                     ));

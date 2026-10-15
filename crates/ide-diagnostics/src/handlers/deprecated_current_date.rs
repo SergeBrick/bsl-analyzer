@@ -1,10 +1,11 @@
 use crate::AnalysisContext;
-use crate::{Diagnostic, DiagnosticCode};
+use crate::{Diagnostic, DiagnosticCode, Fix, TextEdit};
 use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
 use hir::LocalRange;
 
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias, replacement_for_name,
+    canonical_name_for, global_function_fact, is_russian_alias, replacement_compiles_here,
+    replacement_for_name,
 };
 
 pub fn from_hir(
@@ -27,8 +28,26 @@ pub fn from_hir(
         severity: ctx.severity(code),
         range,
         tags: ctx.tags(code),
-        fixes: vec![],
+        fixes: get_fix(name, fact, range, ctx).into_iter().collect(),
     })
+}
+
+/// `ТекущаяДата()` returns the local time of the computer the code runs on,
+/// `ТекущаяДатаСеанса()` the time in the session's time zone. The two agree only
+/// while both zones do, so the replacement can change a stored or compared value: a
+/// manual fix, never part of `source.fixAll`.
+fn get_fix(
+    name: &str,
+    fact: &DeprecationEntry,
+    range: LocalRange,
+    ctx: &AnalysisContext,
+) -> Option<Fix<LocalRange>> {
+    let replacement = replacement_for_name(fact, name)?;
+    if !replacement_compiles_here(replacement, ctx) {
+        return None;
+    }
+    let label = format!("Заменить на \"{}\" (время в часовом поясе сеанса)", replacement);
+    Some(Fix::manual(label, vec![TextEdit { range, new_text: replacement.to_string() }]))
 }
 
 fn get_message(method_name: &str, fact: &DeprecationEntry) -> Option<String> {

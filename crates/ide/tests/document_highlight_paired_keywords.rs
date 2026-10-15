@@ -329,3 +329,44 @@ fn unfinished_pairs_answer_nothing() {
     let unfinished_method = "Процедура А()\n    Если Истина Тогда\n    КонецЕсли;\n";
     assert_eq!(highlights(&with_cursor(unfinished_method, 0, "Процедура")), Vec::new());
 }
+
+/// A method named with its own declaration keyword — not the language, but the parser takes the
+/// word as the name — keeps the name on the symbol path: the name is not part of the pair.
+#[test]
+fn method_named_with_its_own_keyword_keeps_the_name_out_of_the_pair() {
+    for (text, opener, closer) in [
+        ("Процедура Процедура()\nКонецПроцедуры\n", "Процедура", "КонецПроцедуры"),
+        ("Функция Функция()\nКонецФункции\n", "Функция", "КонецФункции"),
+        ("Procedure Procedure()\nEndProcedure\n", "Procedure", "EndProcedure"),
+    ] {
+        let name_at = opener.len() + 1;
+        let on_name = format!("{}{CURSOR}{}", &text[..name_at], &text[name_at..]);
+        let found = highlights(&on_name);
+        assert!(!found.iter().any(|(_, word)| word == closer), "cursor on the name: {found:?}");
+
+        assert_eq!(
+            highlights(&with_cursor(text, 1, closer)),
+            lines(&[(0, opener), (1, closer)]),
+            "cursor on `{closer}`"
+        );
+    }
+}
+
+/// A region marker the parser swallowed into an error node is not a region directive: it neither
+/// pairs nor shifts the pairing of the directives around it.
+#[test]
+fn region_marker_inside_an_error_node_does_not_pair() {
+    let text = "\
+#Область Внешняя
+Процедура А()
+    Б =
+#Область Внутренняя
+    1;
+КонецПроцедуры
+#КонецОбласти
+";
+    let outer = lines(&[(0, "#Область"), (6, "#КонецОбласти")]);
+    assert_eq!(highlights(&with_cursor(text, 0, "#Область")), outer);
+    assert_eq!(highlights(&with_cursor(text, 6, "#КонецОбласти")), outer);
+    assert_eq!(highlights(&with_cursor(text, 3, "#Область")), Vec::new());
+}

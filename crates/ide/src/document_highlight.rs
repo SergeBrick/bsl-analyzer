@@ -39,7 +39,7 @@ pub fn document_highlights<DB: RootDatabase>(
     let parse = db.parse(file_id);
     let root = parse.syntax_node();
 
-    if let Some(marker) = root.token_at_offset(offset).find(|t| is_region_marker(t.kind())) {
+    if let Some(marker) = root.token_at_offset(offset).find(is_region_marker) {
         return region_pair_highlights(&root, &marker);
     }
 
@@ -99,26 +99,29 @@ fn is_construct_clause(kind: SyntaxKind) -> bool {
 /// The construct a keyword token opens, divides or closes.
 ///
 /// Only a keyword standing directly in the construct or in one of its branch nodes counts:
-/// the same word elsewhere — inside an expression, in a recovered error node — is not
-/// structural, and the cursor there keeps the ordinary symbol highlight.
+/// the same word elsewhere — inside an expression, in a recovered error node, in the name
+/// position of a method declared with its own keyword — is not structural, and the cursor
+/// there keeps the ordinary symbol highlight.
 fn keyword_construct(token: &SyntaxToken) -> Option<SyntaxNode> {
     let parent = token.parent()?;
     let construct = if is_construct_clause(parent.kind()) { parent.parent()? } else { parent };
-    construct_keywords(construct.kind()).contains(&token.kind()).then_some(construct)
+    construct_keyword_tokens(&construct).contains(token).then_some(construct)
 }
 
 /// Every structural keyword of `construct`. Nested constructs own their keywords and are
 /// not entered: the keywords sit only in the construct node itself and its branch nodes.
 ///
-/// A construct the parser left without its closing keyword answers nothing: half a pair
-/// would point at a block end that is not there.
-fn construct_keyword_highlights(construct: &SyntaxNode) -> Vec<DocumentHighlight> {
+/// A construct opens once, so only the first token of its opening kind is structural. A
+/// later one is a name: the parser takes a keyword as the name of a method declared with
+/// it, `Процедура Процедура()`, and leaves the name token in the declaration node.
+fn construct_keyword_tokens(construct: &SyntaxNode) -> Vec<SyntaxToken> {
     let keywords = construct_keywords(construct.kind());
-    let Some(&closing) = keywords.last() else {
+    let Some(&opening) = keywords.first() else {
         return Vec::new();
     };
 
-    let tokens: Vec<SyntaxToken> = construct
+    let mut opened = false;
+    construct
         .children_with_tokens()
         .flat_map(|element| match element {
             NodeOrToken::Token(token) => vec![token],
@@ -128,8 +131,20 @@ fn construct_keyword_highlights(construct: &SyntaxNode) -> Vec<DocumentHighlight
             NodeOrToken::Node(_) => Vec::new(),
         })
         .filter(|token| keywords.contains(&token.kind()))
-        .collect();
+        .filter(|token| token.kind() != opening || !std::mem::replace(&mut opened, true))
+        .collect()
+}
 
+/// The keywords of `construct` under the cursor.
+///
+/// A construct the parser left without its closing keyword answers nothing: half a pair
+/// would point at a block end that is not there.
+fn construct_keyword_highlights(construct: &SyntaxNode) -> Vec<DocumentHighlight> {
+    let Some(&closing) = construct_keywords(construct.kind()).last() else {
+        return Vec::new();
+    };
+
+    let tokens = construct_keyword_tokens(construct);
     if !tokens.iter().any(|token| token.kind() == closing) {
         return Vec::new();
     }
@@ -143,8 +158,11 @@ fn construct_keyword_highlights(construct: &SyntaxNode) -> Vec<DocumentHighlight
         .collect()
 }
 
-fn is_region_marker(kind: SyntaxKind) -> bool {
-    matches!(kind, SyntaxKind::PRE_REGION | SyntaxKind::PRE_END_REGION)
+/// A `#Область` / `#КонецОбласти` marker of a region directive. The same token the parser
+/// swallowed into an error node is not a directive, and the region tree does not count it.
+fn is_region_marker(token: &SyntaxToken) -> bool {
+    matches!(token.kind(), SyntaxKind::PRE_REGION | SyntaxKind::PRE_END_REGION)
+        && token.parent().is_some_and(|parent| parent.kind() == SyntaxKind::PRE_REGION_DIR)
 }
 
 /// A region directive and its balanced partner.
@@ -155,10 +173,8 @@ fn is_region_marker(kind: SyntaxKind) -> bool {
 fn region_pair_highlights(root: &SyntaxNode, marker: &SyntaxToken) -> Vec<DocumentHighlight> {
     let mut open: Vec<SyntaxToken> = Vec::new();
     let mut partner = None;
-    for token in root
-        .descendants_with_tokens()
-        .filter_map(|it| it.into_token())
-        .filter(|token| is_region_marker(token.kind()))
+    for token in
+        root.descendants_with_tokens().filter_map(|it| it.into_token()).filter(is_region_marker)
     {
         if token.kind() == SyntaxKind::PRE_REGION {
             open.push(token);

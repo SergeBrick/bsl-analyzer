@@ -569,7 +569,7 @@ pub fn embedding_config_fingerprint_with_prefixes(prefixes: &crate::EmbeddingPre
         hasher.update(b"=");
         if let Ok(value) = std::env::var(key) {
             if key == "EMBEDDING_URL" {
-                hasher.update(bsl_platform::redact_url(&value).as_bytes());
+                hasher.update(embedding_endpoint_identity(&value).as_bytes());
             } else {
                 hasher.update(value.as_bytes());
             }
@@ -615,6 +615,19 @@ pub const EMBEDDING_TOKENIZER_SHA256_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_TO
 /// child, so both sides key the SAME rendezvous even if the config changes between
 /// their respective project reads.
 pub const TOPOLOGY_FP_ENV: &str = "BSL_MCP_TOPOLOGY_FP";
+
+/// The part of an embedding endpoint that decides what an index means: the endpoint
+/// without its userinfo, plus the query, which can select an API version or a deployment.
+/// The credential travels in `EMBEDDING_API_KEY` as a header, so the query is not where a
+/// key belongs.
+fn embedding_endpoint_identity(url: &str) -> String {
+    let redacted = bsl_platform::redact_url(url);
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    match without_fragment.split_once('?') {
+        Some((_, query)) => format!("{redacted}?{query}"),
+        None => redacted,
+    }
+}
 
 /// Stable 64-bit identity of the project's extension topology at `source_dir`, for
 /// backend keying: a daemon whose graph/search/diagnostics caches were built for
@@ -814,6 +827,21 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
         assert!(!runtime.exists(), "the preflight must not create the overlapping path");
+    }
+
+    #[test]
+    fn embedding_endpoint_identity_keeps_the_query_and_drops_userinfo() {
+        let identity = embedding_endpoint_identity;
+        assert_ne!(
+            identity("https://h.example/v1/embeddings?api-version=2023-05-15"),
+            identity("https://h.example/v1/embeddings?api-version=2024-02-01"),
+            "a query that selects the API version is part of what an index means"
+        );
+        assert_eq!(
+            identity("https://user:one@h.example/v1/embeddings?model=a"),
+            identity("https://user:two@h.example/v1/embeddings?model=a#part"),
+            "userinfo and the fragment are not"
+        );
     }
 
     #[test]

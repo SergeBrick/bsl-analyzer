@@ -440,6 +440,12 @@ impl Files {
         })
     }
 
+    /// Whether an explicit file→root registration exists, without weakening the
+    /// strict [`Self::file_source_root`] accessor used by source and text queries.
+    pub fn try_file_source_root(&self, file_id: FileId) -> Option<FileSourceRootInput> {
+        self.file_source_roots.get(&file_id).map(|entry| *entry.value())
+    }
+
     /// The file→root mapping inherits the target root's durability (the root input
     /// must already be registered; an unknown root falls back to LOW). Same reason
     /// as [`Self::set_source_root`]: `file_text_query`'s disk branch reads the

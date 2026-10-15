@@ -1,13 +1,16 @@
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use stdx::case::CaseExt;
 
 use dashmap::DashMap;
 use rustc_hash::FxHasher;
 
-use base_db::{FileIdInput, Files, RootQueryDb, SourceDatabase, SourceRoot, SourceRootId};
+use base_db::{
+    FileIdInput, Files, RootQueryDb, SourceDatabase, SourceRoot, SourceRootId, BSL_SOURCE_ROOT,
+};
 use hir::{
     ConditionalTree, DefDatabase, ItemTree, ModuleBodies, ModuleData, ModuleId, RegionTree,
     SymbolTree,
@@ -129,6 +132,25 @@ pub struct RootDatabaseImpl {
     /// (the default) leaves the hot path at salsa's single `is_some` branch per
     /// event. See [`crate::salsa_events`].
     salsa_events: Option<Arc<crate::salsa_events::SalsaEventStats>>,
+
+    /// A path lookup observed a missing file→root or source-root registration.
+    /// Shared across clones: the query that saw the miss may run on a snapshot,
+    /// and the later insert runs on the owning handle. Inserts bump
+    /// [`FileRootLookupEpoch`] only after this is set, so a cold load that
+    /// registers every file before any query does not rewrite the epoch per file.
+    file_root_lookup_miss: Arc<AtomicBool>,
+}
+
+/// Invalidation token for a path lookup that observed no registration.
+///
+/// The miss is a DashMap absence. Salsa cannot see that absence, and the
+/// registration that appears later is a new input rather than a write to one the
+/// memo read. Queries that took the fallback depend on this epoch; an insert
+/// after a miss bumps it.
+#[salsa::input(singleton, debug, heap_size = stdx::heap::zero)]
+struct FileRootLookupEpoch {
+    #[returns(copy)]
+    epoch: u64,
 }
 
 /// Build-scoped cache of loaded configurations by interned config-root path string.
@@ -178,6 +200,7 @@ impl Clone for RootDatabaseImpl {
             // Salsa shares one `event_callback` across all storage clones, so every
             // handle must point at the same stats to keep counts consistent.
             salsa_events: self.salsa_events.clone(),
+            file_root_lookup_miss: Arc::clone(&self.file_root_lookup_miss),
         }
     }
 }
@@ -217,6 +240,7 @@ impl RootDatabaseImpl {
             type_kernel: Arc::new(TypeKernelInner::new()),
             graph_config_cache: None,
             salsa_events,
+            file_root_lookup_miss: Arc::new(AtomicBool::new(false)),
         };
         // The singleton inputs are created once here and retrieved via `::get()`
         // afterwards; a second `new()` against the same storage would panic inside
@@ -237,6 +261,7 @@ impl RootDatabaseImpl {
             .durability(Durability::MEDIUM)
             .new(&db);
         let _ = GlobalConfigRevisionInput::builder(0).durability(Durability::MEDIUM).new(&db);
+        let _ = FileRootLookupEpoch::builder(0).durability(Durability::LOW).new(&db);
         let defaults = project_model::FeaturesConfig::default();
         let _ = FeaturesInput::builder(
             defaults.type_narrowing,
@@ -800,10 +825,10 @@ impl RootDatabaseImpl {
     /// The same ranking, addressed by PATH.
     ///
     /// A caller that already holds the path must not go back through the file id:
-    /// resolving a path from an id needs the global file→root mapping, which
-    /// PANICS for a file the database was never told about — and the graph builder
-    /// runs against per-batch databases that legitimately know only their own
-    /// slice. See `CommonModuleCandidates::reflagged` for the same asymmetry.
+    /// graph batches intentionally register text and file→root inputs only for
+    /// their own slice. Path lookup can use the shared root's exact FileId without
+    /// those registrations, but this method's caller already has the path.
+    /// See `CommonModuleCandidates::reflagged` for the same asymmetry.
     pub fn config_root_rank_for_path(
         &self,
         file_path: &std::path::Path,
@@ -2449,10 +2474,9 @@ impl RootDatabaseImpl {
             hir::MdoModuleRole::RecordSet => index.record_set_candidates(mdo_type, &name).to_vec(),
         };
 
-        // Paths come from the source root's own file set, never from the global
-        // file→root mapping: that mapping panics for a file the database has not
-        // been told about, and the graph builder resolves against per-batch
-        // databases holding only their own slice.
+        // Paths come from the source root's own file set: graph batches resolve
+        // against the full root while registering file→root inputs only for their
+        // own slice.
         let source_root = self.source_root_input(source_root_id).root(self);
         let file_set = source_root.file_set();
         let rank_of = |file: FileId| -> Option<usize> {
@@ -2673,13 +2697,47 @@ impl RootDatabaseImpl {
     }
 
     pub(crate) fn get_file_path(&self, file_id: FileId) -> Option<PathBuf> {
-        let source_root_input = self.file_source_root_input(file_id);
-        let source_root_id = source_root_input.source_root_id(self);
-        let source_root_input = self.source_root_input(source_root_id);
+        // Graph batch databases publish the full BSL FileSet but register a
+        // file→root input only for the batch whose text they load.
+        let source_root_id = match self.files.try_file_source_root(file_id) {
+            Some(input) => input.source_root_id(self),
+            None => {
+                // The miss is not a salsa read. Record the epoch so a later
+                // registration, a new input, invalidates whoever memoised this path.
+                self.note_unregistered_file_root();
+                BSL_SOURCE_ROOT
+            }
+        };
+        let Some(source_root_input) = self.try_source_root_input(source_root_id) else {
+            self.note_unregistered_file_root();
+            return None;
+        };
         let source_root = source_root_input.root(self);
         let file_set = source_root.file_set();
         let vfs_path = file_set.path_for_file(&file_id)?;
         Some(PathBuf::from(vfs_path.as_path()))
+    }
+
+    fn note_unregistered_file_root(&self) {
+        self.file_root_lookup_miss.store(true, Ordering::Release);
+        let _epoch = self.file_root_lookup_epoch();
+    }
+
+    fn file_root_lookup_epoch(&self) -> u64 {
+        FileRootLookupEpoch::try_get(self)
+            .expect("FileRootLookupEpoch is created in RootDatabaseImpl::new")
+            .epoch(self)
+    }
+
+    fn bump_file_root_lookup_epoch_if_observed(&mut self) {
+        if !self.file_root_lookup_miss.load(Ordering::Acquire) {
+            return;
+        }
+        use salsa::Setter;
+        let input = FileRootLookupEpoch::try_get(self)
+            .expect("FileRootLookupEpoch is created in RootDatabaseImpl::new");
+        let current = input.epoch(self);
+        input.set_epoch(self).to(current.wrapping_add(1));
     }
 
     /// The whole-config load key for `file_path`: the root attributed from disk,
@@ -2835,13 +2893,21 @@ impl SourceDatabase for RootDatabaseImpl {
     }
 
     fn set_file_source_root(&mut self, file_id: FileId, source_root_id: SourceRootId) {
+        let inserted = self.files.try_file_source_root(file_id).is_none();
         let files = self.files.clone();
         files.set_file_source_root(self, file_id, source_root_id);
+        if inserted {
+            self.bump_file_root_lookup_epoch_if_observed();
+        }
     }
 
     fn set_source_root(&mut self, source_root_id: SourceRootId, source_root: SourceRoot) {
+        let inserted = self.files.try_source_root(source_root_id).is_none();
         let files = self.files.clone();
         files.set_source_root(self, source_root_id, source_root);
+        if inserted {
+            self.bump_file_root_lookup_epoch_if_observed();
+        }
     }
 
     fn resolve_vfs_path(

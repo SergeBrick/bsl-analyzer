@@ -4633,6 +4633,58 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn borrowed_form_graph_is_independent_of_batch_size() {
+        fn copy_dir(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let fixture = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bsl-metadata/fixtures/extension_metadata"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        copy_dir(&fixture.join("base"), root);
+        let extension = root.join("cfe/Расширение");
+        copy_dir(&fixture.join("extension"), &extension);
+        declare_scoped_extension(root, "Расширение", "cfe/Расширение");
+
+        let meta = crate::graph_db::GraphMeta {
+            revision: 1,
+            fingerprint: crate::graph_db::GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
+        };
+        let one_batch = root.join(".build/one-batch.db");
+        let all_batches = root.join(".build/all-modules.db");
+        fs::create_dir_all(one_batch.parent().unwrap()).unwrap();
+        build_whole_graph(root, &one_batch, 1, &meta).expect("single-file batches build");
+        build_whole_graph(root, &all_batches, usize::MAX, &meta)
+            .expect("the whole workspace batch builds");
+
+        let (one_nodes, one_edges, _, _) = dump_data(&one_batch);
+        let (all_nodes, all_edges, _, _) = dump_data(&all_batches);
+        assert_eq!(one_nodes, all_nodes, "all graph nodes match across batch sizes");
+        assert_eq!(one_edges, all_edges, "all graph edges match across batch sizes");
+        assert!(
+            one_nodes.iter().any(|row| {
+                row.contains("form_attr/Document/Заказ/ФормаДокумента/БазовыйРеквизитФормы")
+            }),
+            "batch size one must retain the inherited base-form attribute"
+        );
+    }
+
     /// The straddle verdict is more than a fingerprint comparison: either
     /// bracketing scan failing to cover the whole tree loses the coherence claim
     /// even when the fingerprints match exactly.

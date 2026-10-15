@@ -208,22 +208,33 @@ fn incomplete_method_is_not_offered() {
 }
 
 #[test]
-fn function_called_from_a_string_is_not_offered() {
+fn function_in_a_module_that_runs_dynamic_code_is_not_offered() {
+    // The text `Вычислить` and `Выполнить` run is not known until run time, however it is
+    // assembled, so any of them in the module may read the result.
     for call in [
         "Итог = Вычислить(\"Проверить()\");",
         "Выполнить(\"Итог = Проверить ();\");",
-        "Итог = Вычислить(\"Проверить\" + \"()\");",
+        "Итог = Вычислить(\"Провер\" + \"ить()\");",
+        "Итог = Eval(Текст + \"()\");",
+        "Если Истина Тогда\n        Выполнить Текст;\n    КонецЕсли;",
     ] {
         let code = with_caller(call);
         assert!(
             assists_at(&code, "Проверить()\n    А").is_empty(),
-            "offered although `{call}` calls it from a string"
+            "offered although `{call}` may call it"
         );
     }
 
-    // Control: a string holding the name only as a part of a longer word.
-    let code = with_caller("Итог = Вычислить(\"ПроверитьВсё()\");");
-    assert_eq!(assists_at(&code, "Проверить()\n    А").len(), 1);
+    // Control: the call written in a string that nothing runs, and a method of an object
+    // that is spelled like the global one.
+    for call in [
+        "Сообщить(\"Проверить()\");",
+        "Запрос.Выполнить();",
+        "Итог = Формула.Вычислить(\"Проверить()\");",
+    ] {
+        let code = with_caller(call);
+        assert_eq!(assists_at(&code, "Проверить()\n    А").len(), 1, "not offered with `{call}`");
+    }
 }
 
 const BASE: FileId = FileId(0);

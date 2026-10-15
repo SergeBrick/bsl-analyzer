@@ -16,8 +16,8 @@ use crate::references::find_references_in_file;
 ///
 /// The reverse is offered only when nothing depends on the function returning a value:
 /// it has no `Возврат <выражение>` (a procedure does not compile one), no call in the
-/// module uses its result (a procedure call is not an expression), no string in the module
-/// names it (`Вычислить("Имя()")`), and it is not `Экспорт` — callers in other modules are
+/// module uses its result (a procedure call is not an expression), the module runs no
+/// dynamic code (`Вычислить`, `Выполнить`), and it is not `Экспорт` — callers in other modules are
 /// not searched here, so an exported function is never converted.
 ///
 /// Neither direction is offered for a method an extension binds by name, nor for an
@@ -139,7 +139,7 @@ fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Syn
         return false;
     };
     let root = db.parse(file_id).syntax_node();
-    if called_from_a_string(&root, name.text()) {
+    if runs_dynamic_code(&root) {
         return false;
     }
     find_references_in_file(db, file_id, &symbol)
@@ -152,23 +152,24 @@ fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Syn
         })
 }
 
-/// `Вычислить("Имя()")` and `Выполнить("Х = Имя();")` call the method from a string, which
-/// no reference search sees. A call may also be assembled from pieces
-/// (`Вычислить("Имя" + "()")`), so the name as a whole word in any string literal counts as
-/// a call reading the result.
-fn called_from_a_string(root: &SyntaxNode, name: &str) -> bool {
-    let name = name.to_lowercase();
-    root.descendants_with_tokens()
-        .filter_map(|element| element.into_token())
-        .filter(|token| token.kind().is_string_literal())
-        .any(|token| holds_word(&token.text().to_lowercase(), &name))
-}
-
-fn holds_word(text: &str, word: &str) -> bool {
-    let is_name_char = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices(word).any(|(at, _)| {
-        !text[..at].chars().next_back().is_some_and(is_name_char)
-            && !text[at + word.len()..].chars().next().is_some_and(is_name_char)
+/// `Выполнить` and `Вычислить` run text that is known only at run time, however it is
+/// assembled, and it may call the function and read its result. A function without
+/// `Экспорт` is reachable from no other module, so dynamic code in this module is the only
+/// such caller.
+fn runs_dynamic_code(root: &SyntaxNode) -> bool {
+    root.descendants().any(|node| match node.kind() {
+        SyntaxKind::EXECUTE_STMT => true,
+        SyntaxKind::CALL_EXPR => node.first_child().is_some_and(|callee| {
+            let callee = match callee.kind() {
+                SyntaxKind::EXPR => callee.first_child().unwrap_or(callee),
+                _ => callee,
+            };
+            callee.kind() == SyntaxKind::IDENT && {
+                let name = callee.text().to_string().to_lowercase();
+                name == "вычислить" || name == "eval"
+            }
+        }),
+        _ => false,
     })
 }
 

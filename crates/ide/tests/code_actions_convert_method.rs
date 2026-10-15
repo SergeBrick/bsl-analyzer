@@ -331,3 +331,17 @@ fn function_an_extension_body_reads_is_not_offered() {
     let analysis = with_extension(base, extension);
     assert_eq!(assists_in(&analysis, BASE, base, "Проверить()").len(), 1);
 }
+
+#[test]
+fn offered_anywhere_on_the_declaration_line() {
+    let indented = "    Процедура Тест()\n    А = 1;\nКонецПроцедуры\n";
+    let offset = TextSize::from(0);
+    assert_eq!(analysis(indented).code_actions(FILE, TextRange::empty(offset)).len(), 1);
+
+    let annotated = "&НаСервере Процедура Тест()\n    А = 1;\nКонецПроцедуры\n";
+    assert_eq!(assists_at(annotated, "&НаСервере").len(), 1);
+
+    // Control: the line before the declaration is not it.
+    let code = format!("Перем А;\n{indented}");
+    assert!(assists_at(&code, "Перем").is_empty());
+}

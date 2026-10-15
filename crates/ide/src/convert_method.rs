@@ -63,7 +63,12 @@ pub fn convert_method_assists<DB: RootDatabase>(
 }
 
 fn enclosing_method(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxNode> {
-    let token = root.token_at_offset(offset).right_biased()?;
+    let mut token = root.token_at_offset(offset).right_biased()?;
+    // The indentation before the declaration need not belong to the method node; the
+    // declaration-line check then rejects a method that starts on a later line.
+    if token.kind() == SyntaxKind::WHITESPACE {
+        token = token.next_token()?;
+    }
     token
         .parent_ancestors()
         .find(|n| matches!(n.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF))
@@ -73,8 +78,8 @@ fn keyword(method: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
     method.children_with_tokens().filter_map(|e| e.into_token()).find(|t| t.kind() == kind)
 }
 
-/// The line that starts with `Асинх`/`Процедура`/`Функция`, up to its end. The method node
-/// also spans the annotations above it (`&НаСервере`), which are not the declaration.
+/// The whole line holding `Асинх`/`Процедура`/`Функция`. The method node also spans the
+/// annotation lines above it (`&НаСервере`), which are not the declaration.
 fn on_declaration_line(text: &str, method: &SyntaxNode, offset: TextSize) -> bool {
     let Some(start) = keyword(method, SyntaxKind::KW_ASYNC)
         .or_else(|| keyword(method, SyntaxKind::KW_PROCEDURE))
@@ -83,8 +88,9 @@ fn on_declaration_line(text: &str, method: &SyntaxNode, offset: TextSize) -> boo
     else {
         return false;
     };
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
     let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-    (start..=end).contains(&usize::from(offset))
+    (line_start..=end).contains(&usize::from(offset))
 }
 
 /// An extension binds a method by its name and its kind: `&Вместо` must be of the kind of

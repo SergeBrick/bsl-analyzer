@@ -5,7 +5,7 @@ use syntax::{TextRange, TextSize};
 
 use crate::{
     body::{Body, ManagerType},
-    hir::{Expr, ExprIdx, Literal},
+    hir::{Expr, ExprIdx, Literal, Stmt},
     item_tree::{AnnotationKind, ItemTree},
     name::Name,
     MethodId, MethodKey, ModuleBodies, ModuleId,
@@ -44,7 +44,8 @@ pub struct ForeignHandlerBinding {
     /// variable or parameter holding the bound object (`Форма` in
     /// `Форма.Элементы.Поле.УстановитьДействие`). Lets the fold drop bindings whose
     /// receiver is a common module, whose handlers are exported methods anyway.
-    pub receiver_root: Name,
+    /// `None` when the receiver is a call's result, which is never a common module.
+    pub receiver_root: Option<Name>,
 }
 
 /// Every procedure name bound by string to a handler slot of another module's object
@@ -810,8 +811,7 @@ pub fn extract_call_summary(
 /// Collects [`ForeignHandlerBinding`]s of one body: identifier-shaped handler names
 /// handed by string to a handler slot of an object that is not the current module.
 ///
-/// - `<получатель>.ПодключитьОбработчикОжидания("Имя", …)` / `ОтключитьОбработчикОжидания`
-///   (first argument);
+/// - `<получатель>.ПодключитьОбработчикОжидания("Имя", …)` (first argument);
 /// - `<получатель>.ПодключитьОбработчикИзмененияДанных(Данные, "Имя", …)` (second argument);
 /// - `<получатель>.<…>.УстановитьДействие("Событие", "Имя")` (second argument) - only
 ///   through an access chain (`Форма.Элементы.Поле`): a bare variable receiver holds an
@@ -819,14 +819,16 @@ pub fn extract_call_summary(
 ///
 /// The receiver is foreign when its chain, after an optional leading `ЭтаФорма` /
 /// `ЭтотОбъект`, does not start at the current form's items (`Элементы`,
-/// `ЭлементыФормы`) - `Форма.…`, `ВладелецФормы.…`, `ЭтаФорма.ВладелецФормы.…`. Bindings
-/// to the current module are already covered by the same-module summary facts.
+/// `ЭлементыФормы`) - `Форма.…`, `ВладелецФормы.…`, `ЭтаФорма.ВладелецФормы.…`,
+/// `Форма.ПолучитьФорму().…`. A bare `Элементы` that is a parameter or local of the body
+/// holds some other form's items. Bindings to the current module are already covered by
+/// the same-module summary facts.
 pub fn collect_foreign_handler_bindings(body: &Body, out: &mut Vec<ForeignHandlerBinding>) {
     for (_, expr) in body.exprs_iter() {
         let Expr::Call { callee, args } = expr else { continue };
         let Expr::Field { base, field } = body.expr_idx(*callee) else { continue };
         let method = field.as_str().fold_lower();
-        let handler_arg = if is_attach_idle_handler(&method) || is_detach_idle_handler(&method) {
+        let handler_arg = if is_attach_idle_handler(&method) {
             0
         } else if is_attach_data_change_handler(&method)
             || (is_set_action(&method) && !matches!(body.expr_idx(*base), Expr::Path(_)))
@@ -848,11 +850,13 @@ pub fn collect_foreign_handler_bindings(body: &Body, out: &mut Vec<ForeignHandle
     }
 }
 
-/// The first segment of `receiver`'s access chain that denotes another object, or
-/// `None` when the chain stays in the current module (`ЭтаФорма`, `Элементы.Поле`,
-/// `ЭтотОбъект.ЭлементыФормы.Поле`) or is not rooted at a name (a call result, a literal).
-fn foreign_receiver_root(body: &Body, receiver: ExprIdx) -> Option<Name> {
+/// Whether `receiver` denotes an object other than the current module, and if so the
+/// root to report as [`ForeignHandlerBinding::receiver_root`]. `None` when the chain
+/// stays in the current module (`ЭтаФорма`, `Элементы.Поле`, `ЭтотОбъект.ЭлементыФормы.Поле`,
+/// `Элементы.Найти("Поле")`) or is not rooted at a name (a literal, `Новый …`).
+fn foreign_receiver_root(body: &Body, receiver: ExprIdx) -> Option<Option<Name>> {
     let mut chain = Vec::new();
+    let mut through_call = false;
     let mut cursor = receiver;
     loop {
         match body.expr_idx(cursor) {
@@ -865,27 +869,41 @@ fn foreign_receiver_root(body: &Body, receiver: ExprIdx) -> Option<Name> {
                 cursor = *base;
             }
             Expr::Index { base, .. } => cursor = *base,
+            Expr::Call { callee, .. } => {
+                through_call = true;
+                cursor = *callee;
+            }
             _ => return None,
         }
     }
     chain.reverse();
     let mut segments = chain.into_iter();
     let mut first = segments.next()?;
-    if is_this_receiver(&first.as_str().fold_lower()) {
+    let qualified = is_this_receiver(&first.as_str().fold_lower());
+    if qualified {
         first = segments.next()?;
     }
-    if is_current_form_items(&first.as_str().fold_lower()) {
+    if is_current_form_items(&first.as_str().fold_lower())
+        && (qualified || !is_body_local(body, first))
+    {
         return None;
     }
-    Some(first.clone())
+    Some((!through_call).then(|| first.clone()))
 }
 
 fn is_current_form_items(name_lower: &str) -> bool {
     matches!(name_lower, "элементы" | "items" | "элементыформы" | "controls")
 }
 
-fn is_detach_idle_handler(name_lower: &str) -> bool {
-    name_lower == "отключитьобработчикожидания" || name_lower == "detachidlehandler"
+/// Whether `name` is a parameter, a declared variable or an assigned local of `body` -
+/// a binding that shadows a context property of the same name.
+fn is_body_local(body: &Body, name: &Name) -> bool {
+    let lower = name.as_str().fold_lower();
+    body.bindings_iter().any(|(_, binding)| binding.name.as_str().fold_lower() == lower)
+        || body.stmts_iter().any(|(_, stmt)| {
+            matches!(stmt, Stmt::Assign { target, .. }
+                if matches!(body.expr_idx(*target), Expr::Path(target) if target.as_str().fold_lower() == lower))
+        })
 }
 
 fn is_attach_data_change_handler(name_lower: &str) -> bool {
@@ -1649,6 +1667,8 @@ mod tests {
 Процедура Подключить(Форма, Элемент) Экспорт
     Форма.ПодключитьОбработчикОжидания("ОбработчикОжидания1", 0.1, Истина);
     Форма.ОтключитьОбработчикОжидания("ОбработчикОжидания2");
+    Форма.ПолучитьФорму().ПодключитьОбработчикОжидания("ОбработчикРезультата", 1);
+    Элементы.Найти("Поле3").УстановитьДействие("ПриИзменении", "СвойОбработчик5");
     ЭтаФорма.ВладелецФормы.ПодключитьОбработчикОжидания("ОбработчикВладельца", 1);
     Форма.Элементы.Поле1.УстановитьДействие("ПриИзменении", "Поле1ПриИзменении");
     Форма.ПодключитьОбработчикИзмененияДанных("Реквизит1", "ОбработчикИзмененияДанных", Ложь);
@@ -1670,16 +1690,18 @@ mod tests {
         }
         found.sort();
         found.dedup();
-        let bindings: Vec<(&str, &str)> =
-            found.iter().map(|b| (b.handler_name.as_str(), b.receiver_root.as_str())).collect();
+        let bindings: Vec<(&str, Option<&str>)> = found
+            .iter()
+            .map(|b| (b.handler_name.as_str(), b.receiver_root.as_ref().map(Name::as_str)))
+            .collect();
         assert_eq!(
             bindings,
             vec![
-                ("ОбработчикВладельца", "ВладелецФормы"),
-                ("ОбработчикИзмененияДанных", "Форма"),
-                ("ОбработчикОжидания1", "Форма"),
-                ("ОбработчикОжидания2", "Форма"),
-                ("Поле1ПриИзменении", "Форма"),
+                ("ОбработчикВладельца", Some("ВладелецФормы")),
+                ("ОбработчикИзмененияДанных", Some("Форма")),
+                ("ОбработчикОжидания1", Some("Форма")),
+                ("ОбработчикРезультата", None),
+                ("Поле1ПриИзменении", Some("Форма")),
             ]
         );
     }

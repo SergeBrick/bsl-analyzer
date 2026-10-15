@@ -136,3 +136,79 @@ fn parameters_of_handlers_bound_from_another_module_are_not_reported() {
     let alone = unused_parameters(form_findings(FORM, &[]));
     assert!(alone.iter().any(|f| f.contains("\"ИмяДанных\"")), "{alone:#?}");
 }
+
+const COMMON_MODULE_1: &str = "/test/CommonModules/ОбщийМодуль1/Ext/Module.bsl";
+
+fn only_unused_dead_procedure(findings: &[String]) -> bool {
+    findings
+        == [
+            "UnusedLocalMethod: Неиспользуемый локальный метод \"ДействительноНеИспользуется\"",
+            "UnusedParameters: Уберите неиспользуемый параметр \"Параметр\"",
+        ]
+}
+
+/// The parser joins a member access across whitespace, a line break and a comment after
+/// the dot; the binding written that way is the same binding.
+#[test]
+fn binding_split_after_the_dot_is_seen() {
+    let helper = r#"
+Процедура Подключить(Форма) Экспорт
+    Форма.
+        ПодключитьОбработчикОжидания("ОбработчикОжидания1", 0.1, Истина);
+    Форма.Элементы.Поле1. // поле формы
+        УстановитьДействие("ПриИзменении", "Поле1ПриИзменении");
+    Форма .	ПодключитьОбработчикИзмененияДанных("Реквизит1", "ОбработчикИзмененияДанных", Ложь);
+КонецПроцедуры
+"#;
+    let findings = form_findings(FORM, &[(COMMON_MODULE_1, helper)]);
+    assert!(only_unused_dead_procedure(&findings), "{findings:#?}");
+}
+
+/// Outside the form, `Элементы` is just a name: a helper parameter or local holding
+/// another form's items is a foreign receiver.
+#[test]
+fn items_named_local_of_a_helper_is_a_foreign_receiver() {
+    let helper = r#"
+Процедура Подключить(Элементы, Форма) Экспорт
+    Перем ЭлементыФормы;
+    Элементы.Поле1.УстановитьДействие("ПриИзменении", "Поле1ПриИзменении");
+    ЭлементыФормы = Форма.Элементы;
+    ЭлементыФормы.Поле2.УстановитьДействие("ПриИзменении", "ОбработчикОжидания1");
+    Items = Форма.Элементы;
+    Items.Поле3.УстановитьДействие("ПриИзменении", "ОбработчикИзмененияДанных");
+КонецПроцедуры
+"#;
+    let findings = form_findings(FORM, &[(COMMON_MODULE_1, helper)]);
+    assert!(only_unused_dead_procedure(&findings), "{findings:#?}");
+}
+
+/// A receiver produced by a call is an object, not the binder's own module, unless the
+/// call is a method of the current form's items.
+#[test]
+fn binding_on_a_call_result_is_seen() {
+    let helper = r#"
+Процедура Подключить(Форма) Экспорт
+    Форма.ПолучитьФормуВладельца().ПодключитьОбработчикОжидания("ОбработчикОжидания1", 0.1, Истина);
+    Форма.Элементы.Найти("Поле1").УстановитьДействие("ПриИзменении", "Поле1ПриИзменении");
+    ПолучитьФорму("Обработка.Обработка1.Форма").ПодключитьОбработчикИзмененияДанных("Реквизит1", "ОбработчикИзмененияДанных");
+    Элементы.Найти("Поле2").УстановитьДействие("ПриИзменении", "ДействительноНеИспользуется");
+КонецПроцедуры
+"#;
+    let findings = form_findings(
+        FORM,
+        &[("/test/DataProcessors/Обработка1/Forms/Форма/Ext/Form/Module.bsl", helper)],
+    );
+    assert!(only_unused_dead_procedure(&findings), "{findings:#?}");
+}
+
+/// Detaching an idle handler does not make the platform call it.
+#[test]
+fn detaching_a_handler_does_not_mark_it_used() {
+    let helper = r#"
+Процедура Отключить(Форма) Экспорт
+    Форма.ОтключитьОбработчикОжидания("ОбработчикОжидания1");
+КонецПроцедуры
+"#;
+    let findings = form_findings(FORM, &[(COMMON_MODULE_1, helper)]);
+    assert!(findings.iter().any(|f| f.contains("метод \"ОбработчикОжидания1\"")), "{findings:#?}");
+}

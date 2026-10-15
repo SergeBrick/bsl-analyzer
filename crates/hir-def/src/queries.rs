@@ -55,7 +55,9 @@ mod heap_estimate {
     ) -> usize {
         vec_bytes::<crate::call_graph::ForeignHandlerBinding>(v.len())
             + v.iter()
-                .map(|b| name_bytes(&b.handler_name) + name_bytes(&b.receiver_root))
+                .map(|b| {
+                    name_bytes(&b.handler_name) + b.receiver_root.as_ref().map_or(0, name_bytes)
+                })
                 .sum::<usize>()
     }
 
@@ -297,8 +299,6 @@ pub fn file_foreign_handler_bindings_query<'db>(
 const HANDLER_BINDING_TOKENS: &[&str] = &[
     "подключитьобработчикожидания",
     "attachidlehandler",
-    "отключитьобработчикожидания",
-    "detachidlehandler",
     "подключитьобработчикизмененияданных",
     "attachdatachangehandler",
     "установитьдействие",
@@ -350,8 +350,10 @@ pub fn workspace_foreign_handler_bindings_query(
         db.unwind_if_revision_cancelled();
         let input = FileIdInput::new(db, file_id);
         for binding in file_foreign_handler_bindings_query(db, input).iter() {
-            let receiver = intern::NormName::intern(binding.receiver_root.as_str());
-            if !common_modules.contains(&receiver) {
+            let received_by_common_module = binding.receiver_root.as_ref().is_some_and(|root| {
+                common_modules.contains(&intern::NormName::intern(root.as_str()))
+            });
+            if !received_by_common_module {
                 names.insert(intern::NormName::intern(binding.handler_name.as_str()));
             }
         }
@@ -372,9 +374,21 @@ pub fn file_mentions_handler_binding_query<'db>(
     let _span = tracing::info_span!("file_mentions_handler_binding").entered();
     let text = stdx::case::fold_lower_per_char(db.file_text_ref(file_id_input.file_id(db)));
     text.match_indices('.').any(|(dot, _)| {
-        let after = &text[dot + 1..];
+        let after = skip_trivia(&text[dot + 1..]);
         HANDLER_BINDING_TOKENS.iter().any(|token| after.starts_with(token))
     })
+}
+
+/// `text` past leading whitespace and `//` comments: the parser joins a member access
+/// across both, so the pre-filter must too.
+fn skip_trivia(mut text: &str) -> &str {
+    loop {
+        text = text.trim_start();
+        match text.strip_prefix("//") {
+            Some(comment) => text = comment.find('\n').map_or("", |eol| &comment[eol..]),
+            None => return text,
+        }
+    }
 }
 
 #[salsa::tracked(lru = 256, heap_size = heap_estimate::module_call_summary_heap, returns(clone))]

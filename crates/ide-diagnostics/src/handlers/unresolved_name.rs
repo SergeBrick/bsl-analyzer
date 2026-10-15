@@ -806,6 +806,39 @@ mod tests {
         assert!(diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedName));
     }
 
+    /// An ordinary form has an implicit receiver whose surface cannot be built.
+    /// The call channel stays silent there; the callee read must not fill that
+    /// silence with `UnresolvedName`. A value read of the same spelling is still
+    /// not a value.
+    #[test]
+    fn unreadable_form_bare_call_is_not_an_unresolved_name() {
+        let source = "\
+Процедура Тест()
+    Закрыть();
+    Значение = Закрыть;
+КонецПроцедуры
+";
+        let diagnostics = crate::test_utils::check_cfe_at_with_unreadable(
+            "DataProcessors/Обр/Forms/Форма/Ext/Form/Module.bsl",
+            source,
+            test_fixture::CfeFixtureBuilder::new("").build(),
+            &[],
+            crate::diagnostics,
+        );
+        assert!(
+            diagnostics.iter().all(|diag| diag.code != DiagnosticCode::UnresolvedBareCall),
+            "the call channel leaves an unreadable receiver alone: {diagnostics:?}"
+        );
+        assert!(
+            !is_call_callee(source, &diagnostics, DiagnosticCode::UnresolvedName, "Закрыть"),
+            "a bare call on an unreadable form must not be accused as an undefined name: {diagnostics:?}"
+        );
+        assert!(
+            value_read_is_unresolved(source, &diagnostics, "Закрыть"),
+            "a value read is still not a value: {diagnostics:?}"
+        );
+    }
+
     #[test]
     fn a_common_module_has_no_implicit_object_method() {
         let source = r#"

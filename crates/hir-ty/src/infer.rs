@@ -698,9 +698,9 @@ pub struct InferenceContext<'db> {
 
     /// The path under inference is the callee of a bare call, not a value read.
     /// The cascade still classifies the name as a value — a method is not one —
-    /// but `UnresolvedName` must stay silent when the call channel already owns
-    /// that callee as a method of the implicit receiver. A value read of the
-    /// same spelling (`Значение = ЭтоНовый`) keeps the diagnostic.
+    /// but `UnresolvedName` must stay silent when the call channel already leaves
+    /// that callee undiagnosed. A value read of the same spelling
+    /// (`Значение = ЭтоНовый`) keeps the diagnostic.
     reading_bare_call_callee: bool,
 }
 
@@ -2868,15 +2868,16 @@ impl<'db> InferenceContext<'db> {
             BareNameResolution::Resolved { ty, .. } => ty,
             BareNameResolution::Absent => {
                 // A bare call reads its callee as a value before the call channel
-                // runs. That channel already treats a method of the implicit
-                // receiver as present; emitting `UnresolvedName` here would
-                // accuse the same token, and with the rule enabled the call
-                // channel defers to it. Silence only on that callee, and only
-                // when the call channel's own recognition says the method is
-                // there. The verdict stays `Absent`: the name is still not a value.
+                // runs. That channel already leaves the callee undiagnosed when
+                // the implicit receiver owns the method, and when the receiver
+                // exists but its surface cannot be produced. Emitting
+                // `UnresolvedName` here would accuse the same token, and with
+                // the rule enabled the call channel defers to it. Silence only
+                // on that callee, and only for the call channel's own silence.
+                // The verdict stays `Absent`: the name is still not a value.
                 if usage == BareNameUse::ReadValue
                     && !name.is_missing()
-                    && !self.bare_callee_method_recognized(name)
+                    && !self.bare_callee_spared_by_call_channel(name)
                 {
                     self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedName {
                         expr: expr_id,
@@ -2890,9 +2891,9 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// `true` only while this read is the callee of a bare call and the call
-    /// channel already recognises `name` as a method of the implicit receiver.
-    fn bare_callee_method_recognized(&self, name: &hir_def::Name) -> bool {
-        self.reading_bare_call_callee && self.implicit_receiver_owns_method(name)
+    /// channel leaves that callee undiagnosed.
+    fn bare_callee_spared_by_call_channel(&self, name: &hir_def::Name) -> bool {
+        self.reading_bare_call_callee && self.implicit_receiver_call_is_silent(name)
     }
 
     fn resolve_bare_name(
@@ -3938,9 +3939,9 @@ impl<'db> InferenceContext<'db> {
     /// in a managed form module are all `ЭтотОбъект.<метод>()` written without the
     /// receiver. So it is cleared here, through the platform catalog the qualified
     /// spelling is judged by, and where the receiver exists but cannot be built the
-    /// call keeps its silence. The callee's value read asks the same recognition
-    /// ([`Self::implicit_receiver_owns_method`]) before emitting `UnresolvedName`,
-    /// so the two channels agree on the method and still disagree on a value read
+    /// call keeps its silence. The callee's value read asks the same silence
+    /// ([`Self::implicit_receiver_call_is_silent`]) before emitting `UnresolvedName`,
+    /// so the two channels agree on the call and still disagree on a value read
     /// of that spelling.
     fn report_absent_bare_call(
         &mut self,
@@ -3961,14 +3962,11 @@ impl<'db> InferenceContext<'db> {
         if self.in_uncompiled_branch {
             return;
         }
-        // `Unreadable` is silence without recognition: a receiver exists, but
-        // its surface cannot be produced, so absence is not proven. Recognition
-        // itself is [`Self::implicit_receiver_owns_method`] — the same predicate
-        // the callee's value read uses, so the two channels cannot disagree
-        // about whether the method is there.
-        if matches!(self.implicit_self_surface(), ImplicitSelfSurface::Unreadable)
-            || self.implicit_receiver_owns_method(name)
-        {
+        // Shared with the callee's value read: a recognised method, or a
+        // receiver whose surface cannot be produced. `Unreadable` is silence
+        // without recognition — absence is not proven — and both channels must
+        // share it, or `UnresolvedName` accuses a token this channel leaves alone.
+        if self.implicit_receiver_call_is_silent(name) {
             return;
         }
         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedBareCall {
@@ -3978,8 +3976,8 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// Infer the callee of a bare call. A path callee is marked so the value
-    /// read does not emit `UnresolvedName` for a method the call channel
-    /// already recognises; a nested read inside any other callee shape is not
+    /// read does not emit `UnresolvedName` for a callee the call channel
+    /// leaves undiagnosed; a nested read inside any other callee shape is not
     /// that callee and keeps the ordinary value diagnostic.
     fn infer_bare_call_callee(&mut self, callee: ExprId) -> TypeId {
         let is_path = matches!(self.body.expr(callee), Expr::Path(_));
@@ -3992,10 +3990,18 @@ impl<'db> InferenceContext<'db> {
         ty
     }
 
+    /// Whether a bare call of `name` is left undiagnosed because of this
+    /// module's implicit receiver: the receiver owns the method, or it exists
+    /// but its surface cannot be produced. `Unreadable` is not recognition;
+    /// it is still silence, because absence is not proven.
+    fn implicit_receiver_call_is_silent(&self, name: &hir_def::Name) -> bool {
+        matches!(self.implicit_self_surface(), ImplicitSelfSurface::Unreadable)
+            || self.implicit_receiver_owns_method(name)
+    }
+
     /// Whether the call channel already recognises `name` as a method of this
     /// module's implicit receiver. `Unreadable` is not recognition: the
-    /// surface cannot be produced, so this answers `false` and the caller
-    /// decides silence separately.
+    /// surface cannot be produced, so this answers `false`.
     fn implicit_receiver_owns_method(&self, name: &hir_def::Name) -> bool {
         match self.implicit_self_surface() {
             ImplicitSelfSurface::Receiver(receiver_ty) => {
@@ -4475,6 +4481,15 @@ impl<'db> InferenceContext<'db> {
                 call_expr,
                 true,
             ));
+        }
+
+        // An exported variable of an application module is a user global, so it ranks
+        // here exactly as on the bare-name read path: below a common module of the same
+        // name, above platform globals. Its value is untyped, so a member called through
+        // it is not this call site's to judge; the read of the receiver has already
+        // checked the environments the variable is visible in.
+        if self.global_read_export(module_name).is_some() {
+            return BareReceiverDispatch::Unhandled;
         }
 
         // A manager module that calls one of its own methods through the object's

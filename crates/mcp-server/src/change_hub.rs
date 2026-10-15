@@ -10022,11 +10022,11 @@ mod tests {
         let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(
             dir.path().to_path_buf(),
         )]);
-        assert!(hub.wait_until_watching(Duration::from_secs(5)));
+        assert!(hub.wait_until_watching());
         let cursor = hub.subscribe();
 
         assert!(hub.notify_path_changed(&file));
-        assert!(eventually(Duration::from_secs(10), || {
+        assert!(eventually(|| {
             hub.materialize(cursor).entries.iter().any(|entry| entry.raw == file)
         }));
         let batch = hub.drain(cursor);
@@ -10039,7 +10039,7 @@ mod tests {
         // and derives the tombstone from the current filesystem state.
         std::fs::remove_file(&file).unwrap();
         assert!(hub.notify_path_changed(&file));
-        assert!(eventually(Duration::from_secs(10), || {
+        assert!(eventually(|| {
             hub.materialize(cursor).entries.iter().any(|entry| entry.raw == file)
         }));
         let batch = hub.drain(cursor);

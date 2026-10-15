@@ -2330,10 +2330,10 @@ mod tests {
 
         // The adapter's r2d2 pool retries failed connects until its 5s connection_timeout;
         // allow that configured bound plus worker scheduling, not an arbitrary longer wait.
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
         let mut accepted = 0;
         let mut protocol_error = None;
-        while Instant::now() < deadline && deferred.view().pending {
+        while std::time::Instant::now() < deadline && deferred.view().pending {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     accepted += 1;

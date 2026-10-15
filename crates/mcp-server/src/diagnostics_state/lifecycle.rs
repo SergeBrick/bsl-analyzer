@@ -1345,7 +1345,7 @@ impl DiagnosticsState {
         match Self::catch_build(|| {
             Self::build_resident_with_catalog(&root, &self.excluded, self.catalog.clone())
         }) {
-            Ok(mut built) => {
+            Ok(built) => {
                 if self.freeze_if_invalid_or_frozen() {
                     return;
                 }
@@ -2518,7 +2518,7 @@ mod tests {
         ready.ensure_loading();
         wait_ready(&ready);
         ready.with_build_timeout_for_test(Duration::from_secs(0));
-        lock_recover(&ready.inner).reload = ReloadState::Running;
+        lock_inner(&ready.inner).reload = ReloadState::Running;
         assert!(!ready.expire_stuck_build(), "a serving resident is not a build that hung");
         let report = ready.status_report();
         assert_eq!(report.state, "ready", "and the deadline left it serving: {:?}", report.reload);

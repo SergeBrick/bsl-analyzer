@@ -183,6 +183,17 @@ struct ReachingDef {
     ty: Option<TypeId>,
 }
 
+/// The state of one [`InferenceContext::types_on_every_path`] query.
+///
+/// A local read reached through several definitions is resolved once: copying a local
+/// through a chain of branches would otherwise revisit it once per path.
+#[derive(Default)]
+struct PathWalk {
+    /// The local reads being resolved.
+    active: Vec<ExprId>,
+    resolved: FxHashMap<ExprId, Option<Vec<TypeId>>>,
+}
+
 /// What a definition reaching a read takes its value from.
 #[derive(Clone, Copy)]
 enum DefinitionSource {
@@ -2137,7 +2148,7 @@ impl<'db> InferenceContext<'db> {
         receiver_expr: ExprId,
         field: &hir_def::Name,
     ) -> bool {
-        let Some(types) = self.types_on_every_path(receiver_expr, &mut Vec::new()) else {
+        let Some(types) = self.types_on_every_path(receiver_expr, &mut PathWalk::default()) else {
             return false;
         };
         if types.is_empty() {
@@ -2159,22 +2170,25 @@ impl<'db> InferenceContext<'db> {
     /// A member read or an index takes its type from its receiver alone, so it is vouched for
     /// when the receiver's every type is the one the walk saw. A local is vouched for through
     /// the right-hand sides of the writes reaching it and the collection of the loop that
-    /// binds it. `active` holds the locals being resolved, so a write that reads its own
-    /// target (`Описание = Описание.Родитель` in a loop) vouches for nothing.
-    fn types_on_every_path(&self, expr: ExprId, active: &mut Vec<ExprId>) -> Option<Vec<TypeId>> {
+    /// binds it. A local being resolved that is reached again — a write that reads its own
+    /// target (`Описание = Описание.Родитель` in a loop) — vouches for nothing.
+    fn types_on_every_path(&self, expr: ExprId, walk: &mut PathWalk) -> Option<Vec<TypeId>> {
         const MAX_DEPTH: usize = 16;
         match self.body.expr(expr) {
             Expr::Field { base, .. } | Expr::Index { base, .. } => {
                 let base = ExprId::from_idx(*base);
                 let walked = self.expr_types.get(&base).copied()?;
-                let base_types = self.types_on_every_path(base, active)?;
+                let base_types = self.types_on_every_path(base, walk)?;
                 if base_types.is_empty() || base_types.iter().any(|ty| *ty != walked) {
                     return None;
                 }
                 Some(vec![self.expr_types.get(&expr).copied()?])
             }
             Expr::Path(name) => {
-                if active.contains(&expr) || active.len() >= MAX_DEPTH {
+                if let Some(known) = walk.resolved.get(&expr) {
+                    return known.clone();
+                }
+                if walk.active.contains(&expr) || walk.active.len() >= MAX_DEPTH {
                     return None;
                 }
                 let key = name.as_str().fold_lower();
@@ -2192,9 +2206,10 @@ impl<'db> InferenceContext<'db> {
                     return None;
                 }
                 let sources = self.loop_aware_definitions(&key, use_stmt, reaching)?;
-                active.push(expr);
-                let types = self.types_of_definitions(&sources, active);
-                active.pop();
+                walk.active.push(expr);
+                let types = self.types_of_definitions(&sources, walk);
+                walk.active.pop();
+                walk.resolved.insert(expr, types.clone());
                 types
             }
             _ => None,
@@ -2204,16 +2219,16 @@ impl<'db> InferenceContext<'db> {
     fn types_of_definitions(
         &self,
         sources: &[DefinitionSource],
-        active: &mut Vec<ExprId>,
+        walk: &mut PathWalk,
     ) -> Option<Vec<TypeId>> {
         let mut types = Vec::new();
         for source in sources {
             match *source {
                 DefinitionSource::Value(value) => {
-                    types.extend(self.types_on_every_path(value, active)?);
+                    types.extend(self.types_on_every_path(value, walk)?);
                 }
                 DefinitionSource::LoopElement(collection) => {
-                    for collection_ty in self.types_on_every_path(collection, active)? {
+                    for collection_ty in self.types_on_every_path(collection, walk)? {
                         let element = crate::iteration_lookup::resolve_iter_element_ty(
                             self.db,
                             collection_ty,
@@ -2225,6 +2240,8 @@ impl<'db> InferenceContext<'db> {
                 DefinitionSource::Opaque => return None,
             }
         }
+        let mut seen = FxHashSet::default();
+        types.retain(|ty| seen.insert(*ty));
         Some(types)
     }
 

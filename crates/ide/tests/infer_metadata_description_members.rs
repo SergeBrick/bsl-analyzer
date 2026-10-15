@@ -446,3 +446,20 @@ fn a_loop_over_a_local_collection_of_one_kind_is_checked() {
     );
     assert_eq!(found, vec!["Измерения".to_string(), "Измерения".to_string()]);
 }
+
+#[test]
+fn a_local_copied_through_a_long_chain_of_branches_is_resolved_once_per_read() {
+    // Every link has three definitions copying the previous local; following each path
+    // separately would visit 3^12 of them.
+    let mut code =
+        String::from("Процедура Тест(Условие)\n    Л0 = Метаданные.Справочники.Справочник1;\n");
+    for k in 1..=12 {
+        let p = k - 1;
+        code.push_str(&format!(
+            "    Если Условие Тогда Л{k} = Л{p}; ИначеЕсли Условие Тогда Л{k} = Л{p}; \
+             Иначе Л{k} = Л{p}; КонецЕсли;\n"
+        ));
+    }
+    code.push_str("    Нет = Л12.Измерения;\nКонецПроцедуры\n");
+    assert_eq!(unresolved_fields(&code), vec!["Измерения".to_string()]);
+}

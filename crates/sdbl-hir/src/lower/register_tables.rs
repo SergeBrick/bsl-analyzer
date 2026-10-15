@@ -96,6 +96,12 @@ impl Member {
     }
 }
 
+/// Safety bound for expanding `Субконто<N>`. A chart's ext-dimension count is a small metadata
+/// property; a larger value is not trusted, because [`numbered`] allocates one field per
+/// number and an unbounded `u32` does not fit in memory. The table is then left unjudged,
+/// as when the chart is absent.
+const EXT_DIMENSION_COUNT_CEILING: u32 = 64;
+
 /// `<Имя>1..<Имя>N`: the numbered ext-dimension fields.
 fn numbered(
     ru: &str,
@@ -178,9 +184,11 @@ impl LoweringContext<'_> {
         let correspondence = register.correspondence();
         let chart = register.chart_of_accounts();
         let ext_count = chart.and_then(|chart| {
-            self.resolver?
+            let count = self
+                .resolver?
                 .resolve_metadata_object(MdoType::ChartOfAccounts, chart)?
-                .max_ext_dimension_count
+                .max_ext_dimension_count?;
+            (count <= EXT_DIMENSION_COUNT_CEILING).then_some(count)
         });
         let account_ty = chart
             .map(|chart| SdblType::reference(MdoType::ChartOfAccounts, chart))

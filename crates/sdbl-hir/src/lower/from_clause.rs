@@ -515,8 +515,10 @@ impl LoweringContext<'_> {
 
     /// Whether the register named by a three-segment path has the table its last segment
     /// names. `table` is the segment already classified against the register KIND; what is left
-    /// to ask is the one property of the register itself that removes tables: a turnovers-only
-    /// accumulation register has no balance.
+    /// to ask is a property of the register itself that removes tables: a turnovers-only
+    /// accumulation register has no balance, and an accounting register without correspondence
+    /// has no debit-credit turnovers. An absent property is unknown, not false — reporting the
+    /// table missing then would be a false positive.
     fn register_owns_table(
         &self,
         mdo_type: MdoType,
@@ -527,16 +529,21 @@ impl LoweringContext<'_> {
             return false;
         };
         debug_assert!(register_table_kinds(mdo_type).contains(&table));
-        if mdo_type != MdoType::AccumulationRegister
-            || !matches!(table, VirtualTableType::Balance | VirtualTableType::BalanceAndTurnovers)
-        {
-            return true;
+        let register =
+            self.resolver.and_then(|resolver| resolver.resolve_register(mdo_type, object_name));
+        match (mdo_type, table) {
+            (
+                MdoType::AccumulationRegister,
+                VirtualTableType::Balance | VirtualTableType::BalanceAndTurnovers,
+            ) => {
+                register.and_then(|register| register.register_type())
+                    != Some(bsl_metadata::AccumulationRegisterType::Turnovers)
+            }
+            (MdoType::AccountingRegister, VirtualTableType::DrCrTurnovers) => {
+                register.and_then(|register| register.correspondence()) != Some(false)
+            }
+            _ => true,
         }
-        let register_type = self
-            .resolver
-            .and_then(|resolver| resolver.resolve_register(mdo_type, object_name))
-            .and_then(|register| register.register_type());
-        register_type != Some(bsl_metadata::AccumulationRegisterType::Turnovers)
     }
 
     fn build_register_resolved(
@@ -1467,8 +1474,9 @@ fn call_arguments(table_ref: &syntax::SyntaxNode) -> Option<Vec<Option<syntax::S
 /// expression is asked — a `ВЫБОР` whose branches compare things still yields a value.
 ///
 /// The tree wraps every operand in one node per precedence level (`&Период` is an OR node
-/// holding an AND node holding …), so the top is found by walking down the wrappers that
-/// carry a single child and no operator of their own.
+/// holding an AND node holding …), and parentheses are a wrapper too, so the top is found
+/// by walking down the wrappers that carry a single child and no operator of their own.
+/// Parentheses do not turn a comparison into a value: the platform still rejects the call.
 fn is_condition(argument: &syntax::SyntaxNode) -> bool {
     use syntax::SyntaxKind;
     let mut node = argument.clone();
@@ -1481,6 +1489,10 @@ fn is_condition(argument: &syntax::SyntaxNode) -> bool {
             | SyntaxKind::SDBL_BETWEEN_EXPR
             | SyntaxKind::SDBL_LIKE_EXPR
             | SyntaxKind::SDBL_IS_NULL_EXPR => return true,
+            SyntaxKind::SDBL_PAREN_EXPR => match node.children().next() {
+                Some(child) => node = child,
+                None => return false,
+            },
             SyntaxKind::SDBL_LOGICAL_OR_EXPR
             | SyntaxKind::SDBL_LOGICAL_AND_EXPR
             | SyntaxKind::SDBL_ADDITIVE_EXPR

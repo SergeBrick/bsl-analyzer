@@ -179,7 +179,9 @@ impl<'a> Scope<'a> {
         //
         // Provisional fields are skipped while COUNTING sources, not while typing: a field the
         // platform may not expose cannot be one of the two occurrences that make a bare name
-        // ambiguous.
+        // ambiguous. A field that is offered still counts when its type is unknown: the type
+        // lookup answers `Unknown` both for "not in this table" and for "offered, type not
+        // known" (`Субконто<N>`), and treating the second as the first hid the collision.
         for frame in self.frames.iter().rev() {
             if frame.outputs {
                 if let Some(field) = Self::output_named(frame, column_name) {
@@ -192,11 +194,19 @@ impl<'a> Scope<'a> {
             let mut provisional_type: Option<SdblType> = None;
 
             for table in frame.tables.values() {
-                let ty = self.find_column_type_in_table(table, column_name);
-                if ty.is_unknown_or_error() {
+                let Some(resolved) = table.metadata.as_ref() else {
+                    continue;
+                };
+                let Some(field) = resolved.find_field(column_name) else {
+                    continue;
+                };
+                // An error type is not an occurrence: the name is already broken, and counting
+                // it would report the same reference ambiguous a second time.
+                if field.ty == SdblType::Error {
                     continue;
                 }
-                if self.column_is_provisional_in_table(table, column_name) {
+                let ty = field.ty.clone();
+                if resolved.column_is_provisional(column_name) {
                     provisional_type.get_or_insert(ty);
                     continue;
                 }
@@ -224,10 +234,6 @@ impl<'a> Scope<'a> {
             .filter_map(|table| table.metadata.as_ref())
             .find_map(|resolved| resolved.fields().iter().find(|f| f.matches_name(column_name)))
             .cloned()
-    }
-
-    fn column_is_provisional_in_table(&self, table: &TableRef, column_name: &str) -> bool {
-        table.metadata.as_ref().is_some_and(|resolved| resolved.column_is_provisional(column_name))
     }
 
     fn find_column_type_in_table(&self, table: &TableRef, column_name: &str) -> SdblType {

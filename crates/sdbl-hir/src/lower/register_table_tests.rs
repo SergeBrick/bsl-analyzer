@@ -479,6 +479,20 @@ fn an_output_of_unknown_type_still_owns_its_name_in_order_by() {
     assert_eq!(ambiguity_reports_in(configuration(true), &query), Vec::new());
 }
 
+/// `Субконто<N>` has no type the lowering knows. Two sources that both offer the name are
+/// still ambiguous: the collision is about the name, not the type.
+#[test]
+fn an_unknown_typed_ext_dimension_is_still_ambiguous_across_two_sources() {
+    let query =
+        "ВЫБРАТЬ Субконто1 ИЗ РегистрБухгалтерии.Бухгалтерия1.Остатки(&Период, , , ) КАК А \
+                 ЛЕВОЕ СОЕДИНЕНИЕ РегистрБухгалтерии.Бухгалтерия1.Остатки(&Период, , , ) КАК Б \
+                 ПО ИСТИНА";
+    assert_eq!(
+        ambiguity_reports_in(configuration(true), query),
+        vec![("Субконто1".to_string(), vec!["А".to_string(), "Б".to_string()])],
+    );
+}
+
 /// An ambiguous name in the select list is reported where it is written, naming both sources.
 /// `УПОРЯДОЧИТЬ ПО` that names the output refers to the output, so it adds no second report —
 /// least of all one with an empty list of sources.
@@ -662,4 +676,75 @@ fn without_metadata_an_unknown_register_table_is_not_reported() {
     assert!(!package
         .all_diagnostics()
         .any(|diag| matches!(diag, SdblDiagnostic::QueryToMissingMetadata { .. })),);
+}
+
+/// A register without correspondence keeps one account per record, so it has no
+/// debit-credit turnovers table at all; the flag is read from its metadata.
+#[test]
+fn a_register_without_correspondence_has_no_dr_cr_turnovers_table() {
+    let mut config = Configuration::new("Тест");
+    config.add_metadata_object(parse_chart_of_accounts_xml(CHART_OF_ACCOUNTS).unwrap());
+    config.add_register(
+        parse_accounting_register_xml(
+            &ACCOUNTING_REGISTER
+                .replace("<Correspondence>true", "<Correspondence>false")
+                .replace("Бухгалтерия1", "Бухгалтерия2"),
+        )
+        .unwrap(),
+    );
+    config.add_register(parse_accounting_register_xml(ACCOUNTING_REGISTER).unwrap());
+    config.add_register(
+        parse_accounting_register_xml(
+            &ACCOUNTING_REGISTER
+                .replace("<Correspondence>true</Correspondence>", "")
+                .replace("Бухгалтерия1", "Бухгалтерия3"),
+        )
+        .unwrap(),
+    );
+    let config = Arc::new(config);
+
+    assert_eq!(
+        missing_tables_in(
+            config.clone(),
+            "ВЫБРАТЬ Т.Период КАК П ИЗ РегистрБухгалтерии.Бухгалтерия2.ОборотыДтКт(&Начало, &Конец, , , , , , ) КАК Т",
+        ),
+        vec!["РегистрБухгалтерии.Бухгалтерия2.ОборотыДтКт"],
+    );
+    assert_eq!(
+        missing_tables_in(
+            config.clone(),
+            "ВЫБРАТЬ Т.Период КАК П ИЗ РегистрБухгалтерии.Бухгалтерия1.ОборотыДтКт(&Начало, &Конец, , , , , , ) КАК Т",
+        ),
+        Vec::<String>::new(),
+    );
+    assert_eq!(
+        missing_tables_in(
+            config,
+            "ВЫБРАТЬ Т.Период КАК П ИЗ РегистрБухгалтерии.Бухгалтерия3.ОборотыДтКт(&Начало, &Конец, , , , , , ) КАК Т",
+        ),
+        Vec::<String>::new(),
+        "correspondence left unset is unknown, not a missing table",
+    );
+}
+
+/// An ext-dimension count no chart of accounts can have is not trusted: the `Субконто<N>`
+/// family is not expanded from it, and the table falls silent as if the chart were absent.
+#[test]
+fn an_implausible_ext_dimension_count_leaves_the_table_unjudged() {
+    let mut config = Configuration::new("Тест");
+    config.add_metadata_object(
+        parse_chart_of_accounts_xml(
+            &CHART_OF_ACCOUNTS.replace(
+                "<MaxExtDimensionCount>3<",
+                &format!("<MaxExtDimensionCount>{}<", u32::MAX),
+            ),
+        )
+        .unwrap(),
+    );
+    config.add_register(parse_accounting_register_xml(ACCOUNTING_REGISTER).unwrap());
+    let query = select_from(
+        "РегистрБухгалтерии.Бухгалтерия1.Остатки(&Период, , , )",
+        &["Субконто7", "НетТакогоПоля123"],
+    );
+    assert_eq!(unknown_fields_in(Arc::new(config), &query), Vec::<String>::new());
 }

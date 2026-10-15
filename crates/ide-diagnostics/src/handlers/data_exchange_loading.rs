@@ -103,28 +103,22 @@ fn insert_guard_fix(root: &SyntaxNode, source_range: TextRange) -> Vec<Fix> {
         .find(|token| token.kind() == SyntaxKind::KW_PROCEDURE)
         .is_some_and(|keyword| keyword.text().is_ascii());
 
-    let list = method.children().find(|node| node.kind() == SyntaxKind::STMT_LIST);
-    // A directive may wrap declarations (`#Если` holds them as its own children), and
-    // the guard has to follow every one of them.
-    let declarations_end = list
-        .iter()
-        .flat_map(|list| list.descendants())
-        .filter(|node| node.kind() == SyntaxKind::VAR_DEF)
-        .map(|node| node.text_range().end())
-        .max();
-    let statements: Vec<SyntaxNode> = list
+    let items: Vec<SyntaxNode> = method
+        .children()
+        .find(|node| node.kind() == SyntaxKind::STMT_LIST)
         .iter()
         .flat_map(|list| list.children())
-        .filter(|node| node.kind() != SyntaxKind::VAR_DEF)
         .collect();
-    let first_statement = statements
-        .iter()
-        .find(|stmt| declarations_end.is_none_or(|end| stmt.text_range().start() >= end));
+    let declarations_end = items.iter().filter_map(body_declarations_end).max();
+    let first_statement = items.iter().find(|item| executes(item));
 
     let Line { start, indent, newline } = match first_statement {
-        // Declarations and statements under one directive leave no line at this level
-        // that follows the declarations and precedes the statements.
-        None if !statements.is_empty() => return Vec::new(),
+        // A body declaration after the first statement (they share a directive, or the
+        // body is out of order) leaves no line that follows every declaration and
+        // precedes every statement.
+        Some(stmt) if declarations_end.is_some_and(|end| stmt.text_range().start() < end) => {
+            return Vec::new();
+        }
         Some(stmt) => {
             // A statement sharing its line with the header or another statement has
             // no line of its own to put the guard above.
@@ -156,6 +150,38 @@ fn insert_guard_fix(root: &SyntaxNode, source_range: TextRange) -> Vec<Fix> {
         format!("Добавить проверку {condition}"),
         vec![TextEdit { range: TextRange::empty(start), new_text: guard }],
     )]
+}
+
+/// A `#Если` directive and its branches hold their code as their own children, so
+/// a declaration or statement inside them stays at the level of the body.
+fn is_directive_branch(node: &SyntaxNode) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::PRE_IF_DIR | SyntaxKind::PRE_ELSIF_CLAUSE | SyntaxKind::PRE_ELSE_CLAUSE
+    )
+}
+
+/// End of the last `Перем` that `item` declares at the level of the body. A `Перем`
+/// nested in an ordinary block such as `Если` is not one: the guard may precede the
+/// whole block.
+fn body_declarations_end(item: &SyntaxNode) -> Option<TextSize> {
+    match item.kind() {
+        SyntaxKind::VAR_DEF => Some(item.text_range().end()),
+        _ if is_directive_branch(item) => {
+            item.children().filter_map(|child| body_declarations_end(&child)).max()
+        }
+        _ => None,
+    }
+}
+
+/// Whether `item` runs code at the level of the body. Region markers and the
+/// condition of a directive run nothing.
+fn executes(item: &SyntaxNode) -> bool {
+    match item.kind() {
+        SyntaxKind::VAR_DEF | SyntaxKind::PRE_REGION_DIR | SyntaxKind::PRE_EXPR => false,
+        _ if is_directive_branch(item) => item.children().any(|child| executes(&child)),
+        _ => true,
+    }
 }
 
 struct Line {

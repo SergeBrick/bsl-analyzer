@@ -289,3 +289,23 @@ fn guard_stays_unconditional_before_a_leading_directive_without_declarations() {
          КонецЕсли;\n#Если Сервер Тогда\n\tИтог = 1;\n#КонецЕсли\nКонецПроцедуры\n"
     );
 }
+
+#[test]
+fn declarations_sharing_a_directive_with_statements_get_no_guard_fix_before_a_later_statement() {
+    let source = "Процедура ПередЗаписью(Отказ)\n#Если Сервер Тогда\n\tПерем Итог;\n\tИтог = 1;\n\
+                  #КонецЕсли\n\tЗаписать();\nКонецПроцедуры\n";
+    assert_eq!(guard_fix(source), "DataExchangeLoading @ 1:11 no fix");
+}
+
+#[test]
+fn guard_goes_before_a_block_holding_a_nested_local_variable() {
+    let source = "Процедура ПередЗаписью(Отказ)\n\tЕсли Истина Тогда\n\t\tПерем Л;\n\t\tЛ = 1;\n\
+                  \tКонецЕсли;\n\tСообщить(\"x\");\nКонецПроцедуры\n";
+    assert_eq!(
+        guard_fix(source),
+        "DataExchangeLoading @ 1:11 Добавить проверку ОбменДанными.Загрузка [fix_all=false]\n\
+         Процедура ПередЗаписью(Отказ)\n\tЕсли ОбменДанными.Загрузка Тогда\n\t\tВозврат;\n\
+         \tКонецЕсли;\n\tЕсли Истина Тогда\n\t\tПерем Л;\n\t\tЛ = 1;\n\tКонецЕсли;\n\
+         \tСообщить(\"x\");\nКонецПроцедуры\n"
+    );
+}

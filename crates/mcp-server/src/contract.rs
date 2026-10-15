@@ -1624,6 +1624,12 @@ mod tests {
                             "type": "integer"
                           },
                           {
+                            "name": "target",
+                            "nullable": true,
+                            "required": false,
+                            "type": "string"
+                          },
+                          {
                             "name": "timeout_secs",
                             "nullable": true,
                             "required": false,

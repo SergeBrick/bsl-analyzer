@@ -955,7 +955,8 @@ struct DebugParams {
     /// `attach`: `[name, root]` pairs for loaded extensions (optional).
     #[serde(default)]
     extensions: Vec<[String; 2]>,
-    /// `attach`: object-name patterns to auto-attach on connect (optional).
+    /// `attach`: debug TARGET TYPES to attach, default `Client`, `ManagedClient`, `Server`,
+    /// `ServerEmulation`, `HTTPService`; an empty or omitted list means that default (optional).
     #[serde(default)]
     auto_attach: Vec<String>,
     /// `set_breakpoint`/`remove_breakpoint`: target module id (required).
@@ -966,9 +967,13 @@ struct DebugParams {
     condition: Option<String>,
     /// `step`: `over`/`next`, `in`/`into`, or `out` (required).
     direction: Option<String>,
+    /// `continue`/`step`: id of the halted target to act on, as `attach` or `wait_stop` print it
+    /// (optional; default the target of the latest stop).
+    target: Option<String>,
     /// `wait_stop`: max seconds to wait for a stop event (optional).
     timeout_secs: Option<u64>,
-    /// `locals`/`eval`: stack frame level to evaluate in (optional, default top frame).
+    /// `locals`/`eval`: stack frame to evaluate in — frame 0 is the current frame, and the
+    /// numbering matches the printed stack (optional, default 0).
     stack_level: Option<u32>,
     /// `eval`: BSL expression to evaluate in the current stop (required).
     expression: Option<String>,
@@ -1889,15 +1894,21 @@ impl McpServer {
                 .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             "continue" => {
-                tokio::task::spawn_blocking(move || tools::debug::debug_continue(&session))
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+                let target = p.target;
+                tokio::task::spawn_blocking(move || {
+                    tools::debug::debug_continue(&session, target.as_deref())
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             "step" => {
                 let direction = require(p.direction, "direction", "step")?;
-                tokio::task::spawn_blocking(move || tools::debug::debug_step(&session, &direction))
-                    .await
-                    .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
+                let target = p.target;
+                tokio::task::spawn_blocking(move || {
+                    tools::debug::debug_step(&session, &direction, target.as_deref())
+                })
+                .await
+                .map_err(|e| McpError::internal_error(format!("Task error: {e}"), None))?
             }
             "wait_stop" => {
                 let timeout_secs = p.timeout_secs;
@@ -5094,7 +5105,8 @@ mod tool_descriptions {
             (`host` + `infobase`, default port 1550).
               - action: attach | disconnect | set_breakpoint | remove_breakpoint | continue | step |
             wait_stop | stack_trace | locals | eval.
-              - auto_attach: `attach`: object-name patterns to auto-attach on connect (optional).
+              - auto_attach: `attach`: debug TARGET TYPES to attach, default `Client`, `ManagedClient`, `Server`,
+            `ServerEmulation`, `HTTPService`; an empty or omitted list means that default (optional).
               - condition: `set_breakpoint`: conditional-breakpoint expression (optional).
               - config_root: `attach`: configuration source root (optional).
               - direction: `step`: `over`/`next`, `in`/`into`, or `out` (required).
@@ -5108,7 +5120,10 @@ mod tool_descriptions {
             boundary with a continuation note (default 6000).
               - module: `set_breakpoint`/`remove_breakpoint`: target module id (required).
               - port: `attach`: debugger port (default 1550).
-              - stack_level: `locals`/`eval`: stack frame level to evaluate in (optional, default top frame).
+              - stack_level: `locals`/`eval`: stack frame to evaluate in — frame 0 is the current frame, and the
+            numbering matches the printed stack (optional, default 0).
+              - target: `continue`/`step`: id of the halted target to act on, as `attach` or `wait_stop` print it
+            (optional; default the target of the latest stop).
               - timeout_secs: `wait_stop`: max seconds to wait for a stop event (optional).
 
             ## diagnostics

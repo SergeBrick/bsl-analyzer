@@ -21,6 +21,14 @@ pub enum SdblDiagnostic {
         range: TextRange,
     },
 
+    /// A call the platform rejects with «Неверные параметры»: the argument list does not fit
+    /// the table's parameter list.
+    InvalidVirtualTableParameters {
+        table_name: String,
+        problem: VirtualTableParameterProblem,
+        range: TextRange,
+    },
+
     UnknownField {
         table_name: String,
         field_name: String,
@@ -164,6 +172,35 @@ impl UnlimitedStringUsageContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtualTableParameterProblem {
+    /// More arguments than the table has parameters.
+    TooMany { passed: usize, allowed: Vec<String> },
+    /// A condition passed in a parameter that takes a value. `position` is 1-based.
+    ConditionAsValue { position: usize, slot: String },
+}
+
+/// The one wording of a parameter-list error, shared by the enum rendering and the
+/// `ide-diagnostics` handler.
+pub fn invalid_virtual_table_parameters_message(
+    table_name: &str,
+    problem: &VirtualTableParameterProblem,
+) -> String {
+    match problem {
+        VirtualTableParameterProblem::TooMany { passed, allowed } => format!(
+            "Неверные параметры виртуальной таблицы \"{table_name}\": передано {passed}, а у \
+             таблицы {} ({}). Условия внутри одного параметра соединяются через И, а не запятой",
+            allowed.len(),
+            allowed.join(", "),
+        ),
+        VirtualTableParameterProblem::ConditionAsValue { position, slot } => format!(
+            "Неверные параметры виртуальной таблицы \"{table_name}\": в параметр {position} \
+             ({slot}) передано условие, а он принимает значение. Проверьте позицию аргумента: \
+             параметры читаются строго по порядку"
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LikeUsageKind {
     Allowed,
@@ -210,6 +247,9 @@ impl SdblDiagnostic {
             }
             Self::UnknownField { table_name, field_name, .. } => {
                 format!("Поле '{}' не найдено в таблице '{}'", field_name, table_name)
+            }
+            Self::InvalidVirtualTableParameters { table_name, problem, .. } => {
+                invalid_virtual_table_parameters_message(table_name, problem)
             }
             Self::AmbiguousQualifiedHead { head, offered_by, .. } => {
                 ambiguous_qualified_head_message(head, offered_by)
@@ -334,6 +374,7 @@ impl SdblDiagnostic {
             Self::QueryToMissingMetadata { range, .. } => *range,
             Self::JoinWithVirtualTable { range, .. } => *range,
             Self::VirtualTableCallWithoutParameters { range, .. } => *range,
+            Self::InvalidVirtualTableParameters { range, .. } => *range,
             Self::UnknownField { range, .. } => *range,
             Self::AmbiguousColumnRef { range, .. } => *range,
             Self::AmbiguousQualifiedHead { range, .. } => *range,
@@ -362,6 +403,7 @@ impl SdblDiagnostic {
         match self {
             Self::QueryToMissingMetadata { .. } => true,
             Self::UnknownField { .. } => true,
+            Self::InvalidVirtualTableParameters { .. } => true,
             Self::AmbiguousColumnRef { .. } => true,
             Self::AmbiguousQualifiedHead { .. } => true,
             Self::TypeMismatch { .. } => true,

@@ -4,6 +4,9 @@ mod diagnostics;
 mod expr;
 mod from_clause;
 mod join_clause;
+#[cfg(test)]
+mod register_table_tests;
+mod register_tables;
 mod select_fields;
 #[cfg(test)]
 mod tests;
@@ -255,7 +258,12 @@ impl LoweringContext<'_> {
 
         let group_by = query.group_by_clause().map(|g| self.lower_group_by(&g));
 
-        let order_by = query.order_by_clause().map(|o| self.lower_order_by(&o));
+        let order_by = query.order_by_clause().map(|o| {
+            self.push_select_outputs_frame(&select, false, o.syntax().text_range());
+            let order_by = self.lower_order_by(&o);
+            self.scope.pop_frame();
+            order_by
+        });
 
         self.lower_index_by_clause(query.syntax(), &select);
 

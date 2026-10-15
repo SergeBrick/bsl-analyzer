@@ -13,7 +13,7 @@ use dap::prelude::*;
 use dap::server::ServerOutput;
 use dap::types::{Breakpoint, Scope, ScopePresentationhint, Source, StackFrame, Thread, Variable};
 
-use crate::session::{DebugConfig, DebugSession, StopReason};
+use crate::session::{DebugConfig, DebugSession, StopReason, DEFAULT_AUTO_ATTACH};
 use crate::types::base::{CalcPathItem, StepAction, ViewInterface};
 
 const THREAD_ID: i64 = 1;
@@ -308,7 +308,7 @@ fn handle_request(
             {
                 let mut guard = state.lock().unwrap();
                 if let Some(session) = guard.session.take() {
-                    if let Err(e) = session.disconnect() {
+                    if let Some(e) = session.disconnect().detach_error {
                         tracing::warn!(error = %e, "disconnect error");
                     }
                 }
@@ -352,7 +352,8 @@ fn do_attach(
         infobase: args.infobase,
         config_root,
         extensions: Vec::new(),
-        auto_attach: vec!["Client".to_string(), "Server".to_string()],
+        auto_attach: DEFAULT_AUTO_ATTACH.iter().map(|t| t.to_string()).collect(),
+        lease_dir: None,
     };
 
     let session = DebugSession::connect(config)?;
@@ -515,8 +516,8 @@ fn do_variables(
 }
 
 fn do_step(action: StepAction, state: &Arc<Mutex<DapState>>) -> Result<(), String> {
-    let guard = state.lock().unwrap();
-    let session = guard.session.as_ref().ok_or("no active debug session")?;
+    let mut guard = state.lock().unwrap();
+    let session = guard.session.as_mut().ok_or("no active debug session")?;
     session.step(action).map_err(|e| e.to_string())
 }
 
@@ -571,6 +572,11 @@ fn spawn_event_listener(
                         types::StoppedEventReason::Exception,
                         Some(message.clone()),
                         Some("Paused on exception".to_string()),
+                    ),
+                    StopReason::Suspended => (
+                        types::StoppedEventReason::Pause,
+                        None,
+                        Some("Was paused before this debugger attached".to_string()),
                     ),
                 };
 

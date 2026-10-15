@@ -260,6 +260,41 @@ fn current_date_keeps_the_manual_fix_on_the_server() {
 }
 
 #[test]
+fn a_module_method_of_the_replacement_name_is_not_renamed() {
+    let find = "Функция СтрНайти(Строка, Что)\n    Возврат 0;\nКонецФункции\n\nПроцедура Тест()\n    Позиция = Найти(\"Строка\", \"о\");\nКонецПроцедуры\n";
+    let find_diags = module_diagnostics(find, Project::default());
+    assert_eq!(
+        fixes_of(find, &find_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 6:15 no fix",
+        "replacement must not retarget a module method"
+    );
+
+    let date = "Функция ТекущаяДатаСеанса()\n    Возврат '00010101';\nКонецФункции\n\nПроцедура Тест()\n    ТекущаяДата();\nКонецПроцедуры\n";
+    let date_diags = module_diagnostics(date, Project::default());
+    assert_eq!(
+        fixes_of(date, &date_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 6:5 no fix",
+        "replacement must not retarget a module method"
+    );
+}
+
+#[test]
+fn an_interceptor_without_its_own_directive_keeps_the_module_environment() {
+    let source = "&Вместо(\"Обновить\")\nПроцедура Расш_Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let diagnostics = form_module_diagnostics(source);
+    assert_eq!(
+        fixes_of(source, &diagnostics, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 3:12 no fix"
+    );
+
+    let server = "&НаСервере\n&Вместо(\"Обновить\")\nПроцедура Расш_Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let server_diags = form_module_diagnostics(server);
+    let fixes = fixes_of(server, &server_diags, DiagnosticCode::DeprecatedPlatformApi);
+    assert!(fixes.contains("Дата = ТекущаяДатаСеанса();"), "got: {fixes}");
+    assert!(fixes.contains("[fix_all=false]"), "got: {fixes}");
+}
+
+#[test]
 fn a_module_method_of_the_same_name_is_not_renamed() {
     // The bare call resolves to the module method, not the platform global.
     let find = "Процедура Найти(Строка, Что)\nКонецПроцедуры\n\nПроцедура Тест()\n    Найти(\"Строка\", \"о\");\nКонецПроцедуры\n";

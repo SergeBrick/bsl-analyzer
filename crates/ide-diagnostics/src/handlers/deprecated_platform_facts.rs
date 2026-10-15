@@ -108,7 +108,8 @@ pub(crate) fn replacement_compiles_here(replacement: &str, ctx: &BodyContext) ->
 }
 
 /// A method of this module named `name` owns a bare call of that spelling, ahead
-/// of any platform global. Renaming the call would retarget that method.
+/// of any platform global. True for the call's current name (the call is not the
+/// global) and for the replacement (the renamed call would land on the method).
 pub(crate) fn module_owns_bare_call(name: &str, ctx: &BodyContext) -> bool {
     ctx.interface_method_named(&hir::Name::new(name)).is_some()
 }
@@ -132,12 +133,12 @@ fn global_function_env(name: &str) -> Option<EnvFlags> {
 }
 
 /// Environments the call is compiled for, from the position-free declaration:
-/// the method directive (or the module default) intersected with the module-level
-/// `#Если` regions around the method. Empty means unknown — a weaving interceptor
-/// inherits a directive this module cannot see, and a common module without
-/// metadata has no flags. An intra-method `#Если` is not folded in: a body check
-/// does not read file positions, and the declaration already says which
-/// environments the method as a whole is compiled for.
+/// [`hir::execution_env::body_env`] (the method directive, or the module base when
+/// a weaving interceptor has none of its own) intersected with the module-level
+/// `#Если` regions around the method. Empty means unknown — a common module
+/// without metadata has no flags. An intra-method `#Если` is not folded in: a
+/// body check does not read file positions, and the declaration already says
+/// which environments the method as a whole is compiled for.
 fn call_compile_env(ctx: &BodyContext) -> EnvFlags {
     let opts = ctx.env_options();
     let metadata = ctx.module_metadata();
@@ -147,9 +148,6 @@ fn call_compile_env(ctx: &BodyContext) -> EnvFlags {
     let Some(decl) = ctx.decl() else {
         return EnvFlags::EMPTY;
     };
-    if decl.directives.iter().any(|kind| kind.is_interception()) {
-        return EnvFlags::EMPTY;
-    }
     let env = hir::execution_env::body_env(&metadata, &decl.directives, &opts);
     if env.is_empty() {
         return EnvFlags::EMPTY;

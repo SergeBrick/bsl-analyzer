@@ -41,10 +41,10 @@ fn get_fix(
     range: LocalRange,
     ctx: &BodyContext,
 ) -> Option<Fix<LocalRange>> {
-    if module_owns_bare_call(name, ctx) {
+    let replacement = replacement_for_name(fact, name)?;
+    if module_owns_bare_call(name, ctx) || module_owns_bare_call(replacement, ctx) {
         return None;
     }
-    let replacement = replacement_for_name(fact, name)?;
     if !replacement_compiles_here(replacement, ctx) {
         return None;
     }

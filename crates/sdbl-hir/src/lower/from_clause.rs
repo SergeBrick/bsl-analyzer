@@ -1486,9 +1486,11 @@ fn is_condition(argument: &syntax::SyntaxNode) -> bool {
             SyntaxKind::SDBL_COMPARISON_EXPR
             | SyntaxKind::SDBL_NOT_EXPR
             | SyntaxKind::SDBL_IN_EXPR
+            | SyntaxKind::SDBL_IN_HIERARCHY_EXPR
             | SyntaxKind::SDBL_BETWEEN_EXPR
             | SyntaxKind::SDBL_LIKE_EXPR
-            | SyntaxKind::SDBL_IS_NULL_EXPR => return true,
+            | SyntaxKind::SDBL_IS_NULL_EXPR
+            | SyntaxKind::SDBL_REFS_EXPR => return true,
             SyntaxKind::SDBL_PAREN_EXPR => match node.children().next() {
                 Some(child) => node = child,
                 None => return false,

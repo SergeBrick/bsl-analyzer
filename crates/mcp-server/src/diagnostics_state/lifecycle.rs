@@ -1,14 +1,14 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vfs::{Vfs, VfsPath};
+use vfs::VfsPath;
 
 use crate::change_hub::{Health, SinkCursor, WorkspaceChangeHub};
-use crate::graph::input::{build_source_root, db_for_files_lazy, ProjectSnapshot};
+use crate::graph::input::{db_for_files_lazy, ProjectSnapshot};
 
 use super::drift::{
     compute_freshness, config_identity, config_identity_now, reconcile_interval, ScanCache,
@@ -16,6 +16,12 @@ use super::drift::{
 };
 use super::resident::{canonical_key, DiagnosticsResident, HoleOrigin, ResidentVfs};
 use super::types::{DiagnosticsStatus, ReloadState, ResidentOutcome, StatusReport, WatchReport};
+use ide_host_core::WorkspaceCatalog;
+
+static NEXT_RESIDENT_STORAGE_ID: AtomicUsize = AtomicUsize::new(1);
+static RESIDENT_BOOTSTRAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub(super) const LAST_GOOD_INVALID_PROJECT: &str =
+    "bsl-analyzer: project config reload failed: check bsl-analyzer.toml and .env; using the last valid configuration";
 
 /// Drop the resident database after this long with no `diagnostics file` call, so a
 /// standalone server reclaims the ~2.8 GB after a burst. The next call rebuilds.
@@ -45,9 +51,10 @@ struct ResidentBuild {
     scan_clean: bool,
 }
 
-/// Everything mutable about the resident db, guarded by one `Mutex`. The lock is held
-/// for the duration of a per-file query or an incremental/full reload, so the two are
-/// mutually exclusive (the db is `!Sync`, so a query cannot run off-thread anyway).
+/// Everything mutable about the resident db, guarded by one FIFO-fair lock. The lock is
+/// held for the duration of a per-file query or an incremental/full reload, so the two are
+/// mutually exclusive and queued source writers cannot be indefinitely overtaken by new
+/// Analysis clones.
 pub(super) struct Inner {
     pub(super) status: DiagnosticsStatus,
     pub(super) resident: Option<DiagnosticsResident>,
@@ -71,6 +78,9 @@ pub(super) struct Inner {
     /// The snapshot carries the epoch it was taken at so the apply can refuse it.
     pub(super) baseline_epoch: u64,
     pub(super) reload: ReloadState,
+    /// A last-good backend remains readable after the live Project becomes invalid, but
+    /// permanently stops accepting disk publications until a new owner is created.
+    pub(super) invalid_configuration: Option<(u64, String)>,
     /// When the current `Loading` build started, for the `status`/`loading` envelope's
     /// `elapsed_ms`. Set on `Idle → Loading`, cleared when the resident becomes `Ready`.
     pub(super) loading_since: Option<Instant>,
@@ -79,7 +89,7 @@ pub(super) struct Inner {
 /// Handle to the workspace diagnostics database. Cheap to clone (shared `Arc`s).
 #[derive(Clone)]
 pub(crate) struct DiagnosticsState {
-    pub(super) inner: Arc<Mutex<Inner>>,
+    pub(super) inner: Arc<ide::FairMutex<Inner>>,
     pub(super) scan: Arc<Mutex<Option<ScanCache>>>,
     pub(super) last_access: Arc<Mutex<Instant>>,
     pub(super) shutdown: Arc<AtomicBool>,
@@ -90,6 +100,10 @@ pub(crate) struct DiagnosticsState {
     /// Guards spawning exactly one idle sweeper for the lifetime of the handle.
     pub(super) sweeper_started: Arc<AtomicBool>,
     pub(super) workspace_root: Option<PathBuf>,
+    /// Opt in only for owners whose editor sessions can keep their own accepted snapshot.
+    pub(super) last_good_on_invalid: bool,
+    /// The bootstrap-validated project used for early LSP source admission.
+    pub(super) validated_project: Arc<Mutex<Option<Arc<project_model::Project>>>>,
     /// Subtrees this profile must not read as sources — the server's derived cache.
     ///
     /// Held here because the diagnostics passes walk the tree on their own and are the
@@ -132,6 +146,10 @@ pub(crate) struct DiagnosticsState {
     /// run under an armed one. False puts the drift back on its own walk — the window
     /// between a build that raced the arming and the arming itself is in no event.
     pub(super) hub_armed: Arc<AtomicBool>,
+    /// Shared path interner, created before the disk owner starts loading.
+    pub(crate) catalog: WorkspaceCatalog,
+    pub(crate) active_workspace_handles: Arc<AtomicUsize>,
+    pub(crate) generation_subscribers: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<u64>>>>,
     /// Whether the idle sweeper thread is running right now. Raised before the thread starts
     /// and lowered by a guard it owns, so every way out — a return, a panic, a thread that
     /// never started — lowers it. A test cannot otherwise see a detached thread leave.
@@ -212,13 +230,19 @@ impl DiagnosticsState {
     /// failed load leaves behind and cannot provoke one from outside.
     #[cfg(test)]
     pub(crate) fn fail_for_test(&self, message: &str) {
-        let mut inner = lock_recover(&self.inner);
+        let mut inner = lock_inner(&self.inner);
         inner.loading_since = None;
         inner.status = DiagnosticsStatus::Failed(message.to_owned());
     }
 
     pub(crate) fn for_workspace(workspace_root: PathBuf) -> Self {
         Self::with_status(DiagnosticsStatus::Idle, Some(workspace_root))
+    }
+
+    #[must_use]
+    pub(crate) fn with_last_good_on_invalid(mut self, enabled: bool) -> Self {
+        self.last_good_on_invalid = enabled;
+        self
     }
 
     /// Take the subtrees this profile must not read as sources (see [`Self::excluded`]).
@@ -228,9 +252,154 @@ impl DiagnosticsState {
         self
     }
 
+    pub(crate) fn with_project(self, project: project_model::Project) -> Self {
+        *lock_recover(&self.validated_project) = Some(Arc::new(project));
+        self
+    }
+
+    pub(crate) fn validated_project(&self) -> Option<Arc<project_model::Project>> {
+        lock_recover(&self.validated_project).clone()
+    }
+
+    pub(crate) fn workspace_snapshot(
+        &self,
+    ) -> Result<ide_host_core::WorkspaceSnapshot, DiagnosticsStatus> {
+        let inner = lock_inner(&self.inner);
+        match &inner.status {
+            DiagnosticsStatus::Ready { .. } => inner
+                .resident
+                .as_ref()
+                .map(|resident| resident.db.snapshot())
+                .ok_or(DiagnosticsStatus::Loading),
+            status => Err(status.clone()),
+        }
+    }
+
+    pub(crate) fn workspace_generation(&self) -> Result<u64, DiagnosticsStatus> {
+        let inner = lock_inner(&self.inner);
+        match &inner.status {
+            DiagnosticsStatus::Ready { .. } => Ok(inner.generation),
+            _ => Err(inner.status.clone()),
+        }
+    }
+
+    pub(crate) fn workspace_catch_up(
+        &self,
+        generation: u64,
+    ) -> Result<ide_host_core::CatchUp, DiagnosticsStatus> {
+        let inner = lock_inner(&self.inner);
+        match &inner.status {
+            DiagnosticsStatus::Ready { .. } => inner
+                .resident
+                .as_ref()
+                .map(|resident| resident.db.changes_since(generation))
+                .ok_or(DiagnosticsStatus::Loading),
+            status => Err(status.clone()),
+        }
+    }
+
+    /// The closure must capture a short-lived request value; it runs under the
+    /// resident lock so `Analysis` is cloned from the current master storage.
+    pub(crate) fn workspace_analysis(&self) -> Result<ide::Analysis, DiagnosticsStatus> {
+        let inner = lock_inner(&self.inner);
+        match &inner.status {
+            DiagnosticsStatus::Ready { .. } => inner
+                .resident
+                .as_ref()
+                .map(|resident| resident.analysis())
+                .ok_or(DiagnosticsStatus::Loading),
+            status => Err(status.clone()),
+        }
+    }
+
+    /// Freeze disk publications when the live project no longer validates, while leaving
+    /// the already-built resident and its generation available to existing readers.
+    pub(crate) fn freeze_invalid_project(&self) -> bool {
+        if !self.last_good_on_invalid {
+            return false;
+        }
+        let Some(root) = self.workspace_root.as_deref() else { return false };
+        let identity_before = config_identity_now(root);
+        if crate::project::at(root).is_ok() {
+            return false;
+        }
+        // Do not latch an error based on a config that was being repaired while it was
+        // parsed. The fingerprint is deliberately cheap and does not load source files.
+        if config_identity_now(root) != identity_before {
+            return false;
+        }
+
+        let mut inner = lock_inner(&self.inner);
+        if !matches!(inner.status, DiagnosticsStatus::Ready { .. }) || inner.resident.is_none() {
+            return false;
+        }
+        if inner.invalid_configuration.is_none() {
+            inner.invalid_configuration =
+                Some((inner.generation, LAST_GOOD_INVALID_PROJECT.to_owned()));
+            inner.reload = ReloadState::Idle;
+            crate::workspace_handle::notify_generation(self, inner.generation);
+        }
+        true
+    }
+
+    pub(crate) fn invalid_configuration(&self) -> Option<(u64, String)> {
+        lock_inner(&self.inner).invalid_configuration.clone()
+    }
+
+    pub(crate) fn had_invalid_configuration(&self) -> bool {
+        lock_inner(&self.inner).invalid_configuration.is_some()
+    }
+
+    pub(super) fn freeze_if_invalid_or_frozen(&self) -> bool {
+        self.had_invalid_configuration() || self.freeze_invalid_project()
+    }
+
+    pub(crate) fn enforce_lru(&self, deep: bool) -> crate::workspace_handle::WorkspaceRead<()> {
+        use crate::workspace_handle::WorkspaceRead;
+
+        self.mark_in_use();
+        let mut inner = lock_inner(&self.inner);
+        match &inner.status {
+            DiagnosticsStatus::Ready { .. } => {
+                let Some(resident) = inner.resident.as_mut() else {
+                    return WorkspaceRead::Busy;
+                };
+                let db = resident.db.database_mut();
+                if deep {
+                    ide::sweep_lru_deep(db);
+                } else {
+                    db.enforce_lru();
+                }
+                WorkspaceRead::Ready(())
+            }
+            DiagnosticsStatus::Idle | DiagnosticsStatus::Loading => WorkspaceRead::Loading,
+            DiagnosticsStatus::Disabled => WorkspaceRead::Disabled,
+            DiagnosticsStatus::Failed(message) if message.starts_with("invalid project at ") => {
+                WorkspaceRead::RejectedScope(message.clone())
+            }
+            DiagnosticsStatus::Failed(message) => WorkspaceRead::Failed(message.clone()),
+        }
+    }
+
+    pub(crate) fn workspace_project(&self) -> Result<project_model::Project, DiagnosticsStatus> {
+        let inner = lock_inner(&self.inner);
+        match &inner.status {
+            DiagnosticsStatus::Ready { .. } => inner
+                .resident
+                .as_ref()
+                .map(|resident| resident.project().clone())
+                .ok_or(DiagnosticsStatus::Loading),
+            DiagnosticsStatus::Idle | DiagnosticsStatus::Loading => self
+                .validated_project()
+                .map(|project| (*project).clone())
+                .ok_or_else(|| inner.status.clone()),
+            status => Err(status.clone()),
+        }
+    }
+
     fn with_status(status: DiagnosticsStatus, workspace_root: Option<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: Arc::new(ide::FairMutex::new(Inner {
                 status,
                 resident: None,
                 stats: HashMap::new(),
@@ -239,6 +408,7 @@ impl DiagnosticsState {
                 generation: 0,
                 baseline_epoch: 0,
                 reload: ReloadState::Idle,
+                invalid_configuration: None,
                 loading_since: None,
             })),
             scan: Arc::new(Mutex::new(None)),
@@ -247,6 +417,8 @@ impl DiagnosticsState {
             shutdown_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             sweeper_started: Arc::new(AtomicBool::new(false)),
             workspace_root,
+            last_good_on_invalid: false,
+            validated_project: Arc::new(Mutex::new(None)),
             excluded: Vec::new(),
             drift_interval: DRIFT_CHECK_INTERVAL,
             eviction_after: IDLE_EVICTION,
@@ -260,6 +432,9 @@ impl DiagnosticsState {
             scan_count: Arc::new(AtomicUsize::new(0)),
             scope_ref_check_at: Arc::new(Mutex::new(None)),
             hub_armed: Arc::new(AtomicBool::new(false)),
+            catalog: WorkspaceCatalog::new(),
+            active_workspace_handles: Arc::new(AtomicUsize::new(0)),
+            generation_subscribers: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             sweeper_live: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -287,12 +462,12 @@ impl DiagnosticsState {
     }
 
     pub(crate) fn status(&self) -> DiagnosticsStatus {
-        lock_recover(&self.inner).status.clone()
+        lock_inner(&self.inner).status.clone()
     }
 
     /// A lifecycle snapshot for the `status` action and the enriched `loading` envelope.
     pub(crate) fn status_report(&self) -> StatusReport {
-        let inner = lock_recover(&self.inner);
+        let inner = lock_inner(&self.inner);
         let (state, files) = match &inner.status {
             DiagnosticsStatus::Disabled => ("disabled", None),
             DiagnosticsStatus::Idle => ("idle", None),
@@ -357,7 +532,7 @@ impl DiagnosticsState {
             return;
         }
         {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_inner(&self.inner);
             if inner.status != DiagnosticsStatus::Idle {
                 return;
             }
@@ -373,7 +548,7 @@ impl DiagnosticsState {
             .name("bsl-diag-init".to_owned())
             .spawn(move || state.run_load());
         if let Err(e) = spawned {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_inner(&self.inner);
             inner.loading_since = None;
             inner.status = DiagnosticsStatus::Failed(format!("could not spawn loader: {e}"));
         }
@@ -466,7 +641,7 @@ impl DiagnosticsState {
             None
         };
 
-        let mut inner = lock_recover(&self.inner);
+        let mut inner = lock_inner(&self.inner);
         let inner: &mut Inner = &mut inner;
         let generation = inner.generation;
         match &inner.status {
@@ -490,7 +665,7 @@ impl DiagnosticsState {
     }
 
     fn refresh_diagnostics_baseline(&self) {
-        let mut inner = lock_recover(&self.inner);
+        let mut inner = lock_inner(&self.inner);
         let Some(resident) = inner.resident.as_mut() else { return };
         if !resident.diagnostics_baseline.moved_since_load(&resident.project) {
             return;
@@ -508,7 +683,7 @@ impl DiagnosticsState {
     #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.poll_drift();
-        lock_recover(&self.inner).generation
+        lock_inner(&self.inner).generation
     }
 
     /// Number of actual workspace walks performed (cache misses), for asserting the
@@ -561,9 +736,12 @@ impl DiagnosticsState {
     /// Peak RAM is bounded: the new db is built, then swapped under the write lock and
     /// the old one dropped — the brief overlap is the price of a structural change.
     pub(super) fn kick_full_reload(&self) {
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         {
-            let mut inner = lock_recover(&self.inner);
-            if inner.reload == ReloadState::Running {
+            let mut inner = lock_inner(&self.inner);
+            if inner.reload == ReloadState::Running || inner.invalid_configuration.is_some() {
                 return;
             }
             inner.reload = ReloadState::Running;
@@ -573,7 +751,7 @@ impl DiagnosticsState {
             .name("bsl-diag-reload".to_owned())
             .spawn(move || state.run_reload());
         if let Err(e) = spawned {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_inner(&self.inner);
             inner.reload = ReloadState::Failed(format!("could not spawn reload: {e}"));
         }
     }
@@ -585,6 +763,9 @@ impl DiagnosticsState {
         let Some(root) = self.workspace_root.clone() else {
             return;
         };
+        let storage_id = NEXT_RESIDENT_STORAGE_ID.fetch_add(1, Ordering::Relaxed);
+        let bootstrap_count = RESIDENT_BOOTSTRAP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let trace_markers = std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some();
         // Snapshot the hub cursor at build start: the build's baseline scan captures the
         // disk as of now, so only events landing after this point need replaying onto the
         // published resident.
@@ -594,21 +775,37 @@ impl DiagnosticsState {
         // settling below is defensiveness for a future reuse of this path, not the carried-debt
         // story `run_reload` tells.
         let carried = self.resubscribe_cursor();
+        if trace_markers {
+            tracing::info!(
+                target: "bsl_analyzer::shared_backend",
+                event = "resident_bootstrap_start",
+                owner_epoch = crate::broker::process_epoch(),
+                storage_id,
+                resident_bootstrap_count = bootstrap_count,
+                "shared resident bootstrap started"
+            );
+        }
         tracing::info!(?root, "diagnostics resident db build started");
-        match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
-            Ok(built) => {
+        match Self::catch_build(|| {
+            Self::build_resident_with_catalog(&root, &self.excluded, self.catalog.clone())
+        }) {
+            Ok(mut built) => {
                 let files = built.resident.file_count();
+                let project = Arc::new(built.resident.project().clone());
                 {
-                    let mut inner = lock_recover(&self.inner);
+                    let mut inner = lock_inner(&self.inner);
+                    let generation = built.resident.db.publish_full_rebuild_from(inner.generation);
+                    inner.generation = generation;
+                    *lock_recover(&self.validated_project) = Some(project);
                     inner.resident = Some(built.resident);
                     inner.stats = built.stats;
                     inner.baseline_epoch += 1;
                     inner.config_fp = built.config_fp;
                     inner.topology = built.topology;
-                    inner.generation += 1;
                     inner.reload = ReloadState::Idle;
                     inner.loading_since = None;
                     inner.status = DiagnosticsStatus::Ready { files };
+                    crate::workspace_handle::notify_generation(self, inner.generation);
                 }
                 *lock_recover(&self.scan) = None;
                 // The build read the tree whole, so the reconcile its fresh cursor carried
@@ -622,10 +819,33 @@ impl DiagnosticsState {
                     built.declaration_epoch,
                 );
                 self.recheck_config_identity_after_publish();
+                if self.last_good_on_invalid {
+                    self.poll_pending_drift();
+                }
+                if trace_markers {
+                    tracing::info!(
+                        target: "bsl_analyzer::shared_backend",
+                        event = "resident_bootstrap_complete",
+                        owner_epoch = crate::broker::process_epoch(),
+                        storage_id,
+                        resident_bootstrap_count = bootstrap_count,
+                        "shared resident bootstrap completed"
+                    );
+                }
             }
             Err(msg) => {
+                if trace_markers {
+                    tracing::warn!(
+                        target: "bsl_analyzer::shared_backend",
+                        event = "resident_bootstrap_failed",
+                        owner_epoch = crate::broker::process_epoch(),
+                        storage_id,
+                        resident_bootstrap_count = bootstrap_count,
+                        "shared resident bootstrap failed"
+                    );
+                }
                 tracing::warn!("diagnostics resident db build failed: {msg}");
-                let mut inner = lock_recover(&self.inner);
+                let mut inner = lock_inner(&self.inner);
                 inner.loading_since = None;
                 inner.status = DiagnosticsStatus::Failed(msg);
             }
@@ -641,8 +861,11 @@ impl DiagnosticsState {
         let Some(root) = self.workspace_root.as_deref() else {
             return;
         };
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         let current = config_identity_now(root);
-        if current != lock_recover(&self.inner).config_fp {
+        if current != lock_inner(&self.inner).config_fp {
             tracing::info!("project config/topology changed during the resident build; reloading");
             self.kick_full_reload();
         }
@@ -652,16 +875,36 @@ impl DiagnosticsState {
     /// then swap it in under the write lock. Keeps the old resident served until the
     /// swap; on failure the old one stays and `reload` is flagged failed.
     fn run_reload(&self) {
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         let Some(root) = self.workspace_root.clone() else {
             return;
         };
         #[cfg(test)]
         self.rebuilds_started.fetch_add(1, Ordering::SeqCst);
+        let storage_id = NEXT_RESIDENT_STORAGE_ID.fetch_add(1, Ordering::Relaxed);
+        let trace_markers = std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some();
+        if trace_markers {
+            tracing::info!(
+                target: "bsl_analyzer::shared_backend",
+                event = "resident_rebuild_start",
+                owner_epoch = crate::broker::process_epoch(),
+                storage_id,
+                reason = "workspace_config_or_structure_drift",
+                "shared resident rebuild started"
+            );
+        }
         // Fresh cursor snapshot at rebuild start; events during the rebuild replay onto
         // the new resident, events before it are covered by the rebuild's baseline scan.
         let carried = self.resubscribe_cursor();
-        match Self::catch_build(|| Self::build_resident(&root, &self.excluded)) {
-            Ok(built) => {
+        match Self::catch_build(|| {
+            Self::build_resident_with_catalog(&root, &self.excluded, self.catalog.clone())
+        }) {
+            Ok(mut built) => {
+                if self.freeze_if_invalid_or_frozen() {
+                    return;
+                }
                 // A swap states outright which files exist, so a build that could not read
                 // the whole tree may not perform one: it would retire a serving resident in
                 // favour of a shorter universe, dropping live files — the same loss the
@@ -670,13 +913,23 @@ impl DiagnosticsState {
                 // is still on disk, so the next window asks again, and the request is
                 // granted the first time the tree can be read whole. A first build has no
                 // resident to protect and publishes regardless: half a universe beats none.
-                if !built.scan_clean && lock_recover(&self.inner).resident.is_some() {
+                if !built.scan_clean && lock_inner(&self.inner).resident.is_some() {
+                    if trace_markers {
+                        tracing::warn!(
+                            target: "bsl_analyzer::shared_backend",
+                            event = "resident_rebuild_declined",
+                            owner_epoch = crate::broker::process_epoch(),
+                            storage_id,
+                            reason = "workspace_config_or_structure_drift",
+                            "shared resident rebuild declined"
+                        );
+                    }
                     tracing::info!(
                         "declining to swap in a resident built over a partially unreadable \
                          tree; the pending drift is retried once the tree reads whole"
                     );
                     {
-                        let mut inner = lock_recover(&self.inner);
+                        let mut inner = lock_inner(&self.inner);
                         inner.reload = ReloadState::Idle;
                     }
                     // This rebuild's cursor was resubscribed at its start, which advances
@@ -691,15 +944,23 @@ impl DiagnosticsState {
                     return;
                 }
                 let files = built.resident.file_count();
-                let mut inner = lock_recover(&self.inner);
+                let project = Arc::new(built.resident.project().clone());
+                let mut inner = lock_inner(&self.inner);
+                if inner.invalid_configuration.is_some() {
+                    inner.reload = ReloadState::Idle;
+                    return;
+                }
+                let generation = built.resident.db.publish_full_rebuild_from(inner.generation);
+                inner.generation = generation;
+                *lock_recover(&self.validated_project) = Some(project);
                 inner.resident = Some(built.resident);
                 inner.stats = built.stats;
                 inner.baseline_epoch += 1;
                 inner.config_fp = built.config_fp;
                 inner.topology = built.topology;
-                inner.generation += 1;
                 inner.reload = ReloadState::Idle;
                 inner.status = DiagnosticsStatus::Ready { files };
+                crate::workspace_handle::notify_generation(self, inner.generation);
                 drop(inner);
                 *lock_recover(&self.scan) = None;
                 // The swap states this build read the tree whole, so the reconcile its
@@ -713,11 +974,43 @@ impl DiagnosticsState {
                     built.declaration_epoch,
                 );
                 self.recheck_config_identity_after_publish();
+                if self.last_good_on_invalid {
+                    self.poll_pending_drift();
+                }
+                if trace_markers {
+                    tracing::info!(
+                        target: "bsl_analyzer::shared_backend",
+                        event = "resident_rebuild_complete",
+                        owner_epoch = crate::broker::process_epoch(),
+                        storage_id,
+                        reason = "workspace_config_or_structure_drift",
+                        "shared resident rebuild completed"
+                    );
+                }
             }
             Err(msg) => {
+                if trace_markers {
+                    tracing::warn!(
+                        target: "bsl_analyzer::shared_backend",
+                        event = "resident_rebuild_failed",
+                        owner_epoch = crate::broker::process_epoch(),
+                        storage_id,
+                        reason = "workspace_config_or_structure_drift",
+                        "shared resident rebuild failed"
+                    );
+                }
                 tracing::warn!("diagnostics resident db reload failed: {msg}");
+                if self.freeze_if_invalid_or_frozen() {
+                    let mut inner = lock_inner(&self.inner);
+                    inner.reload = ReloadState::Idle;
+                    return;
+                }
                 {
-                    let mut inner = lock_recover(&self.inner);
+                    let mut inner = lock_inner(&self.inner);
+                    if inner.invalid_configuration.is_some() {
+                        inner.reload = ReloadState::Idle;
+                        return;
+                    }
                     inner.reload = ReloadState::Failed(msg);
                 }
                 // The SERVING resident is the old one, and this rebuild already moved the
@@ -757,7 +1050,16 @@ impl DiagnosticsState {
     /// Build a resident db over every workspace `.bsl`, with the same Salsa inputs the
     /// LSP server registers (source root, per-file source root + text, all config
     /// paths). Returns the resident, the per-file drift baseline, and the config fp.
+    #[cfg(test)]
     fn build_resident(root: &Path, excluded: &[PathBuf]) -> anyhow::Result<ResidentBuild> {
+        Self::build_resident_with_catalog(root, excluded, WorkspaceCatalog::new())
+    }
+
+    fn build_resident_with_catalog(
+        root: &Path,
+        excluded: &[PathBuf],
+        catalog: WorkspaceCatalog,
+    ) -> anyhow::Result<ResidentBuild> {
         // The config-file stat is captured BEFORE the project load: the published
         // identity must describe the config state the resident was built FROM. A
         // stat taken after the build could pair a mid-build config edit's mtime
@@ -805,13 +1107,21 @@ impl DiagnosticsState {
         // current HEAD; the drift poll rebuilds it when the refs move.
         let ignored_authors = project.config.analysis.ignored_authors.clone();
         let author_filter = super::resident::build_author_filter(root, &ignored_authors);
-        let source_root = build_source_root(files);
+        let vfs = ResidentVfs(catalog.clone());
+        let mut file_set = vfs::file_set::FileSet::new();
+        let mut shared_files = Vec::with_capacity(files.len());
+        for (_, path) in files {
+            let file_id = catalog.intern_path(path.clone());
+            file_set.insert(file_id, VfsPath::new(path.clone()));
+            shared_files.push((file_id, path.clone()));
+        }
+        let source_root = base_db::SourceRoot::new_local(file_set);
         // Disk-backed: register each file's content revision and drop its text, so the
         // whole-workspace resident is not pinned as salsa inputs (which OOMs on a large
         // config). `file_text_query` re-reads on demand under its LRU cap — the same
         // model the LSP server and CLI `analyze` use.
         let crate::graph::input::BatchLoad { mut db, unread } =
-            db_for_files_lazy(&source_root, files, &configs, None);
+            db_for_files_lazy(&source_root, &shared_files, &configs, None);
         super::resident::apply_project_compatibility_mode(&mut db, project.compatibility_mode());
         // A file whose bytes could not be read is NOT served: it is held out of
         // `by_path` and answered as "known but unreadable", and the retry list
@@ -827,23 +1137,10 @@ impl DiagnosticsState {
         // bootstrap resolves common-module / service module back-links through
         // `vfs.file_id(<Module.bsl>)`; without these ids present it drops them silently.
         // Bootstrap then allocates only the metadata-XML ids on top of this id space.
-        let vfs = ResidentVfs(RefCell::new(Vfs::default()));
-        {
-            let mut guard = vfs.0.borrow_mut();
-            for (file_id, path) in files {
-                let allocated = guard.alloc_file_id(VfsPath::new(path.clone()));
-                // A hard check, not `debug_assert`: this is a one-time O(n) pass at
-                // resident build (not a hot path), and a release-mode misalignment
-                // would silently scatter every metadata back-link with no signal.
-                assert_eq!(
-                    allocated, *file_id,
-                    "resident VFS must mirror enumerate_bsl_files ids for back-link resolution",
-                );
-            }
-        }
         // Runs AFTER every file is registered, so the unreadable ones already carry
         // their mark: the substrate asks the database per body, and a body asked too
         // early would get a back-link to text nobody could read.
+        Self::hold_shared_test_gate("BSL_TEST_SHARED_METADATA_BOOTSTRAP_GATE");
         ide_host_core::bootstrap_metadata_substrate(&mut db, &vfs);
 
         let mut by_path = HashMap::with_capacity(files.len());
@@ -867,7 +1164,7 @@ impl DiagnosticsState {
             ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project);
         Ok(ResidentBuild {
             resident: DiagnosticsResident {
-                db,
+                db: ide_host_core::WorkspaceBackend::from_database_with_catalog(db, catalog),
                 #[cfg(test)]
                 read_trims: 0,
                 sweep_pool: std::sync::OnceLock::new(),
@@ -892,6 +1189,28 @@ impl DiagnosticsState {
             physical_topology: crate::graph::scan::topology_u64(&snapshot.configs),
             scan_clean,
         })
+    }
+
+    fn hold_shared_test_gate(variable: &str) {
+        if std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_none() {
+            return;
+        }
+        let Some(gate) = std::env::var_os(variable).map(PathBuf::from) else { return };
+        std::fs::create_dir_all(&gate).expect("create isolated shared-workspace test gate");
+        let entered = gate.join("entered");
+        let Ok(_marker) = std::fs::OpenOptions::new().write(true).create_new(true).open(entered)
+        else {
+            return;
+        };
+        let release = gate.join("release");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !release.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "shared-workspace test gate {variable} was not released"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// After a successful (re)build, re-point the daemon's change hub at the build
@@ -1006,16 +1325,20 @@ impl DiagnosticsState {
     /// decision and the act live here. A test whose subject is the eviction itself
     /// calls this directly and so does not depend on when the clock gets round to it.
     pub(super) fn evict_if_idle(&self) -> bool {
+        if self.active_workspace_handles.load(Ordering::Acquire) != 0 {
+            return false;
+        }
         if !matches!(self.status(), DiagnosticsStatus::Ready { .. }) {
             return false;
         }
         if lock_recover(&self.last_access).elapsed() < self.eviction_after {
             return false;
         }
-        let mut inner = lock_recover(&self.inner);
+        let mut inner = lock_inner(&self.inner);
         // Re-check under the lock: a read between the idle check and the lock bumps
         // last_access, and a reload may be in flight — never evict either.
         if lock_recover(&self.last_access).elapsed() < self.eviction_after
+            || self.active_workspace_handles.load(Ordering::Acquire) != 0
             || !matches!(inner.status, DiagnosticsStatus::Ready { .. })
             || inner.reload == ReloadState::Running
         {
@@ -1079,10 +1402,303 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> 
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Acquire the resident's FIFO-fair serialization point. parking_lot's FairMutex
+/// queues blocked callers in order and hands the lock to the oldest waiter, so a
+/// stream of fresh Analysis clones cannot repeatedly overtake a queued source writer.
+pub(crate) fn lock_inner<T>(mutex: &ide::FairMutex<T>) -> impl DerefMut<Target = T> + '_ {
+    mutex.lock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diagnostics_state::test_support::sample_workspace;
+
+    #[test]
+    fn lru_trim_waits_for_analysis_clone_without_publishing_generation() {
+        use crate::diagnostics_state::test_support::wait_ready;
+        use crate::workspace_handle::WorkspaceRead;
+        use std::panic::AssertUnwindSafe;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.ensure_loading();
+        wait_ready(&state);
+        let generation = state.workspace_generation().unwrap();
+        let held_analysis = state.workspace_analysis().unwrap();
+
+        let (trim_done_tx, trim_done_rx) = mpsc::channel();
+        let trim_state = state.clone();
+        let trim = std::thread::spawn(move || {
+            trim_done_tx.send(trim_state.enforce_lru(true)).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pending_write = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                salsa::Database::unwind_if_revision_cancelled(held_analysis.database());
+            }))
+            .is_err();
+            if pending_write {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test watchdog: LRU trim never reached Salsa pending-write checkpoint"
+            );
+            std::thread::yield_now();
+        }
+        assert!(state.inner.try_lock().is_none(), "LRU trim holds owner FIFO admission");
+        assert!(matches!(trim_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        drop(held_analysis);
+        assert!(matches!(
+            trim_done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("test watchdog: LRU trim completes after Analysis clone release"),
+            WorkspaceRead::Ready(())
+        ));
+        trim.join().unwrap();
+        assert_eq!(state.workspace_generation().unwrap(), generation);
+    }
+
+    #[test]
+    fn queued_source_writer_and_following_analysis_reader_progress_under_clone_producer() {
+        use crate::diagnostics_state::test_support::{module_path, wait_ready};
+        use crate::workspace_handle::WorkspaceRead;
+        use std::fs;
+        use std::panic::AssertUnwindSafe;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+        let path = module_path(dir.path(), "Сервер");
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
+        state.ensure_loading();
+        wait_ready(&state);
+        let before_generation = state.workspace_generation().unwrap();
+
+        // This clone outlives the admission lock, just like a request-owned analysis. A
+        // Salsa source write must cancel and wait for this handle before it can commit.
+        let held_analysis = state.workspace_analysis().unwrap();
+        fs::write(&path, "Функция Считать() Экспорт Возврат \"обновлено\"; КонецФункции").unwrap();
+
+        let (writer_done_tx, writer_done_rx) = mpsc::channel();
+        let writer_state = state.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let outcome = writer_state.refresh_saved_path(&writer_path);
+            let generation = match outcome {
+                WorkspaceRead::Ready(snapshot) => snapshot.generation,
+                _ => panic!("stable admitted saved-path refresh must finish"),
+            };
+            writer_done_tx.send(generation).unwrap();
+        });
+
+        // Wait for the held clone to observe Salsa's actual global pending-write flag. The
+        // writer has taken owner admission and is waiting for this storage handle to leave.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pending_write = salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                salsa::Database::unwind_if_revision_cancelled(held_analysis.database());
+            }))
+            .is_err();
+            if pending_write {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test watchdog: Salsa pending-write checkpoint never arrived"
+            );
+            std::thread::yield_now();
+        }
+        assert!(state.inner.try_lock().is_none(), "the writer holds owner admission while waiting");
+        assert!(
+            matches!(writer_done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the source writer remains pending while the old Salsa clone is alive"
+        );
+
+        // Keep presenting new Analysis clone requests while the writer is pending. A
+        // plain unfair Mutex would let this producer barge ahead once the writer releases.
+        let producer_running = Arc::new(AtomicBool::new(true));
+        let producer_clones = Arc::new(AtomicUsize::new(0));
+        let (producer_started_tx, producer_started_rx) = mpsc::channel();
+        let producer_state = state.clone();
+        let producer_running_thread = Arc::clone(&producer_running);
+        let producer_clones_thread = Arc::clone(&producer_clones);
+        let producer = std::thread::spawn(move || {
+            producer_started_tx.send(()).unwrap();
+            while producer_running_thread.load(Ordering::Acquire) {
+                if let Ok(analysis) = producer_state.workspace_analysis() {
+                    producer_clones_thread.fetch_add(1, Ordering::AcqRel);
+                    drop(analysis);
+                }
+                std::thread::yield_now();
+            }
+        });
+        producer_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test watchdog: clone producer started");
+        assert_eq!(producer_clones.load(Ordering::Acquire), 0);
+
+        let (reader_done_tx, reader_done_rx) = mpsc::channel();
+        let interactive_state = state.clone();
+        let interactive_reader = std::thread::spawn(move || {
+            let result = interactive_state.workspace_analysis();
+            let reader_ok = result.is_ok();
+            drop(result);
+            let generation = interactive_state.workspace_generation().ok();
+            reader_done_tx.send((reader_ok, generation)).unwrap();
+        });
+
+        // Drop the old request-owned handle. That releases Salsa's actual writer wait;
+        // no new Analysis clone could be made while the writer held `inner`.
+        drop(held_analysis);
+        let committed_generation = writer_done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test watchdog: source writer completes after clone release");
+        assert_eq!(committed_generation, before_generation + 1);
+        let (reader_ok, reader_generation) = reader_done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test watchdog: the queued interactive reader follows the writer");
+        assert!(reader_ok, "interactive Analysis clone remains available after publication");
+        assert_eq!(reader_generation, Some(committed_generation));
+        producer_running.store(false, Ordering::Release);
+        producer.join().unwrap();
+        interactive_reader.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(state.workspace_generation().unwrap(), committed_generation);
+
+        let writer_running = Arc::new(AtomicBool::new(true));
+        let writer_updates = Arc::new(AtomicUsize::new(0));
+        let stream_state = state.clone();
+        let stream_running = Arc::clone(&writer_running);
+        let stream_updates = Arc::clone(&writer_updates);
+        let stream_path = path.clone();
+        let (first_write_tx, first_write_rx) = mpsc::channel();
+        let writer_stream = std::thread::spawn(move || {
+            let mut revision = 0u64;
+            while stream_running.load(Ordering::Acquire) {
+                revision += 1;
+                fs::write(
+                    &stream_path,
+                    format!("Функция Считать() Экспорт Возврат {revision}; КонецФункции"),
+                )
+                .unwrap();
+                match stream_state.refresh_saved_path(&stream_path) {
+                    WorkspaceRead::Ready(snapshot) => {
+                        stream_updates.fetch_add(1, Ordering::AcqRel);
+                        let _ = first_write_tx.send(snapshot.generation);
+                    }
+                    _ => panic!("a stable source-writer stream remains admitted"),
+                }
+                std::thread::yield_now();
+            }
+        });
+        let _ = first_write_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test watchdog: source-writer producer started");
+
+        let (interactive_write_tx, interactive_write_rx) = mpsc::channel();
+        let reader_state = state.clone();
+        let continuous_writer_reader = std::thread::spawn(move || {
+            let analysis = reader_state.workspace_analysis();
+            let reader_ok = analysis.is_ok();
+            drop(analysis);
+            let generation = reader_state.workspace_generation().ok();
+            interactive_write_tx.send((reader_ok, generation)).unwrap();
+        });
+        let (reader_ok, generation) = interactive_write_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("test watchdog: interactive reader progresses during repeated source writes");
+        assert!(reader_ok);
+        assert!(generation.is_some());
+        writer_running.store(false, Ordering::Release);
+        writer_stream.join().unwrap();
+        continuous_writer_reader.join().unwrap();
+        assert!(writer_updates.load(Ordering::Acquire) > 0);
+    }
+
+    #[test]
+    fn invalid_project_freezes_disk_publications_but_keeps_last_good_resident_readable() {
+        use crate::diagnostics_state::test_support::{module_path, wait_ready};
+        use crate::workspace_handle::WorkspaceRead;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        let body_path = module_path(root, "Сервер");
+        let initial_text = "Функция Считать() Экспорт Возврат 1; КонецФункции";
+        fs::write(&body_path, initial_text).unwrap();
+
+        let state =
+            DiagnosticsState::for_workspace(root.to_path_buf()).with_last_good_on_invalid(true);
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let initial = state.workspace_snapshot().unwrap();
+        let canonical_body = body_path.canonicalize().unwrap();
+        let file_id = initial
+            .catalog
+            .iter()
+            .find(|file| file.path == canonical_body)
+            .expect("bootstrap admits the module")
+            .file_id;
+        let generation = initial.generation;
+        let read_text =
+            || match state.read(|resident, _| resident.analysis().file_text(file_id).to_string()) {
+                ResidentOutcome::Ready(text, _) => text,
+                _ => panic!("ready last-good resident remains readable"),
+            };
+        assert_eq!(read_text(), initial_text);
+
+        let invalid_config = root.join("bsl-analyzer.toml");
+        fs::write(&invalid_config, "invalid {{{{ toml").unwrap();
+        assert!(crate::project::at(root).is_err());
+        fs::write(
+            &body_path,
+            "Функция Считать() Экспорт Возврат \"изменено на диске\"; КонецФункции",
+        )
+        .unwrap();
+
+        assert!(state.freeze_invalid_project());
+        let frozen = state.invalid_configuration().expect("invalid configuration is latched");
+        assert_eq!(frozen.0, generation);
+        assert!(!frozen.1.contains("invalid {{{{ toml"));
+        assert!(matches!(state.status(), DiagnosticsStatus::Ready { .. }));
+
+        assert!(matches!(state.refresh_saved_path(&body_path), WorkspaceRead::Failed(_)));
+        assert!(!state.notify_changed_path(&body_path));
+        state.poll_drift();
+        state.kick_full_reload();
+        assert_eq!(state.workspace_generation().unwrap(), generation);
+        assert_eq!(state.workspace_snapshot().unwrap().generation, generation);
+        assert_eq!(
+            read_text(),
+            initial_text,
+            "reads continue from the accepted last-good database"
+        );
+
+        fs::remove_file(&invalid_config).unwrap();
+        assert!(crate::project::at(root).is_ok());
+        assert!(
+            state.notify_changed_path(&invalid_config),
+            "repair hints must reach the existing scope guard"
+        );
+        assert!(state.had_invalid_configuration());
+        assert!(matches!(state.refresh_saved_path(&body_path), WorkspaceRead::Failed(_)));
+        state.poll_drift();
+        state.kick_full_reload();
+        assert_eq!(state.workspace_generation().unwrap(), generation);
+        assert_eq!(
+            read_text(),
+            initial_text,
+            "repair requires a replacement owner and does not resume this one"
+        );
+    }
 
     /// The sweeper parks between ticks, and the shutdown wakes it out of that park rather
     /// than leaving it to time out. The tick is half a minute: slept out, a daemon told to

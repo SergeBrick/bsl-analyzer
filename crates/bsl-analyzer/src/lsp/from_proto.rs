@@ -8,7 +8,15 @@ use crate::global_state::{GlobalState, GlobalStateSnapshot};
 use crate::lsp::PositionEncoding;
 
 pub fn file_id(state: &GlobalState, url: &Url) -> Result<FileId> {
+    if let Some(&file_id) = state.open_file_uri_ids.get(url) {
+        return Ok(file_id);
+    }
     let path = url.to_file_path().map_err(|_| anyhow!("Invalid file URL: {}", url))?;
+    let path = if state.analysis_host.owner().is_some() {
+        crate::workspace::canonicalize_shared_path(&path)
+    } else {
+        path
+    };
 
     let vfs_path = vfs::VfsPath::new(path);
     let vfs = state.vfs.read();

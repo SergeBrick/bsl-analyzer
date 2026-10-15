@@ -140,9 +140,22 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     // cancellation the server could not replay internally reaches the client as
     // ContentModified, an explicit cancellation as RequestCanceled. Retry only those;
     // any other error remains a test failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
     let mut response = Value::Null;
-    for id in 4..=8 {
-        response = lsp.request(id, "textDocument/hover", hover_params.clone());
+    for id in 4.. {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "explicit snapshot never became ready: {response}");
+        lsp.send(json!({
+            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
+            "params": hover_params.clone()
+        }));
+        response = lsp
+            .wait_for_within(remaining, |message| {
+                message["id"] == id
+                    && message["method"].is_null()
+                    && (message.get("result").is_some() || message.get("error").is_some())
+            })
+            .expect("explicit snapshot hover returns within the readiness deadline");
         if response.get("result").is_some() {
             break;
         }
@@ -150,6 +163,11 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
             matches!(response["error"]["code"].as_i64(), Some(-32800 | -32801)),
             "only a reload cancellation may be retried: {response}"
         );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "explicit snapshot never became ready: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
     assert!(response.get("result").is_some(), "explicit snapshot serves hover: {response}");
     assert!(

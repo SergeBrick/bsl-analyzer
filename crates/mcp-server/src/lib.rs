@@ -25,6 +25,7 @@ mod tasks;
 mod tools;
 #[cfg(test)]
 mod walk_probe;
+mod workspace_handle;
 mod workspace_lease;
 
 /// An allocator that counts what the thread it runs on allocates.
@@ -191,10 +192,13 @@ pub use graph_db::{
 pub use http::{serve_http, wildcard_allowed_hosts, MAX_HTTP_REQUEST_BODY_BYTES};
 use state::WorkspaceSearchMode;
 pub use state::{resolve_embedding_token_profile_values, WorkspaceInitError};
-pub use state::{EmbeddingPrefixes, EmbeddingTokenProfile, OnecConnection, SharedState};
+pub use state::{
+    EmbeddingPrefixes, EmbeddingTokenProfile, OnecConnection, SessionConfig, SharedState,
+};
 pub use tools::platform::{
     build_reference_documents, reference_documents_fingerprint, REFERENCE_DOCUMENT_SCHEMA_VERSION,
 };
+pub use workspace_handle::{WorkspaceHandle, WorkspaceRead, WorkspaceReadiness};
 
 fn indexed_search_budget(command: &SearchCommand) -> Option<usize> {
     match command {
@@ -267,7 +271,7 @@ where
 }
 
 /// Cancel RMCP's service task and await its transport cleanup before the broker exits.
-pub(crate) async fn serve_stream_with_shutdown<T, A>(
+pub async fn serve_stream_with_shutdown<T, A>(
     server: McpServer,
     transport: T,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1205,6 +1209,7 @@ pub struct McpServer {
     profile: McpProfile,
     state: SharedState,
     tool_router: ToolRouter<Self>,
+    shutdown_owner: bool,
 }
 
 #[tool_router(router = workspace_tool_router)]
@@ -1216,7 +1221,23 @@ impl McpServer {
 
     /// A server serving what `gate` leaves visible.
     pub fn with_gate(profile: McpProfile, state: SharedState, gate: &ToolGate) -> Self {
-        Self { profile, state, tool_router: Self::gated_router(profile, gate) }
+        Self {
+            profile,
+            state,
+            tool_router: Self::gated_router(profile, gate),
+            shutdown_owner: true,
+        }
+    }
+
+    /// Attach a new MCP session to this shared backend with its own tool surface and
+    /// native 1C/debug context. Dropping the returned server leaves the backend alive.
+    pub fn for_session(&self, config: SessionConfig) -> Self {
+        let gate = ToolGate::for_launch(self.profile, config.enabled_tools());
+        let state = self.state.for_session(config);
+        state.ensure_workspace_services();
+        let mut session = Self::with_gate(self.profile, state, &gate);
+        session.shutdown_owner = false;
+        session
     }
 
     /// The router a profile serves under `gate`. Exposed without state so the declaration
@@ -1239,11 +1260,19 @@ impl McpServer {
     }
 
     pub fn shutdown(&self) {
-        self.state.shutdown();
+        if self.shutdown_owner {
+            self.state.shutdown();
+        }
     }
 
-    pub(crate) fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
+    pub fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
         self.state.scope_transport_stop()
+    }
+
+    /// The state attached to this session. Native clients in this value are session-local;
+    /// its disk/index handles point at the shared backend.
+    pub fn shared_state(&self) -> &SharedState {
+        &self.state
     }
 
     /// Whether a newer daemon generation owns this workspace's derived caches. The broker
@@ -2707,11 +2736,9 @@ impl McpServer {
                 });
                 use crate::diagnostics_state::ResidentOutcome;
                 match outcome {
-                    ResidentOutcome::Ready((result, completeness), freshness) => {
-                        Ok(mark_graph_stale(
-                            tools::diagnostics::envelope(freshness, completeness, result),
-                            response_graph.is_reloading(),
-                        ))
+                    ResidentOutcome::Ready((result, completeness), mut freshness) => {
+                        freshness.stale |= response_graph.is_reloading();
+                        Ok(tools::diagnostics::envelope(freshness, completeness, result))
                     }
                     ResidentOutcome::Loading => {
                         Ok(tools::diagnostics::loading(&session.status_report()))
@@ -2802,11 +2829,9 @@ impl McpServer {
                     tools::diagnostics::workspace_findings(&sweep, generation, max_output_tokens)
                 });
                 match outcome {
-                    ResidentOutcome::Ready((result, completeness), freshness) => {
-                        Ok(mark_graph_stale(
-                            tools::diagnostics::envelope(freshness, completeness, result),
-                            response_graph.is_reloading(),
-                        ))
+                    ResidentOutcome::Ready((result, completeness), mut freshness) => {
+                        freshness.stale |= response_graph.is_reloading();
+                        Ok(tools::diagnostics::envelope(freshness, completeness, result))
                     }
                     ResidentOutcome::Loading => {
                         Ok(tools::diagnostics::loading(&session.status_report()))
@@ -3205,6 +3230,62 @@ impl ServerHandler for McpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         self.state.tasks().cancel_task(&request.task_id)
+    }
+}
+
+#[cfg(test)]
+mod session_config_tests {
+    use super::*;
+
+    #[test]
+    fn sessions_keep_native_context_and_tool_gates_separate() {
+        let shared = SharedState::shared();
+        let backend = McpServer::new(McpProfile::Workspace, shared.clone());
+
+        let mut first_config = SessionConfig::default();
+        first_config.set_onec_client(onec_client::Client::new(
+            "http://session-a.invalid",
+            "user-a",
+            "secret-a",
+        ));
+        first_config.enable_tool("references");
+        let first = backend.for_session(first_config);
+        let second = backend.for_session(SessionConfig::default());
+
+        assert!(first.state.onec_client().is_some());
+        assert!(second.state.onec_client().is_none());
+        assert!(shared.onec_client().is_none());
+        assert!(
+            !std::sync::Arc::ptr_eq(first.state.debug_session(), second.state.debug_session(),)
+        );
+        assert!(first.tool_router.list_all().iter().any(|tool| tool.name == "references"));
+        assert!(!second.tool_router.list_all().iter().any(|tool| tool.name == "references"));
+        assert!(
+            std::sync::Arc::ptr_eq(first.state.search_engine(), second.state.search_engine(),),
+            "session contexts share disk/search backend resources"
+        );
+    }
+
+    #[test]
+    fn dropping_one_workspace_handle_keeps_other_leases_attached() {
+        use std::sync::atomic::Ordering;
+
+        let state = SharedState::shared();
+        let diagnostics = state.diagnostics().clone();
+        let first = state.workspace_handle();
+        let second = state.workspace_handle();
+        assert_eq!(diagnostics.active_workspace_handles.load(Ordering::Acquire), 2);
+
+        drop(first);
+        assert_eq!(diagnostics.active_workspace_handles.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(diagnostics.active_workspace_handles.load(Ordering::Acquire), 0);
+
+        // Handle detach is session-local; it does not call SharedState::shutdown.
+        assert!(matches!(
+            state.diagnostics().status(),
+            crate::diagnostics_state::DiagnosticsStatus::Disabled
+        ));
     }
 }
 
@@ -4506,6 +4587,24 @@ mod graph_supersession_contract {
         let dir = tempfile::tempdir().unwrap();
         crate::graph::test_support::sample_workspace(dir.path());
         std::fs::write(dir.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(
+            dir.path().join("bsl-analyzer.toml"),
+            "[diagnostics.baseline]\npath = \"baseline.json\"\n",
+        )
+        .unwrap();
+        let baseline = ide::diagnostics_baseline::DiagnosticsBaseline {
+            schema_version: ide::diagnostics_baseline::DIAGNOSTICS_BASELINE_SCHEMA_VERSION,
+            scope: ide::diagnostics_baseline::DiagnosticsBaselineScope {
+                source_root: None,
+                extensions: vec![],
+            },
+            diagnostics: vec![],
+        };
+        std::fs::write(
+            dir.path().join("baseline.json"),
+            ide::diagnostics_baseline::diagnostics_baseline_json(&baseline).unwrap(),
+        )
+        .unwrap();
         let state = SharedState::workspace(dir.path().to_path_buf()).unwrap();
         let graph = state.graph().clone();
         let diagnostics = state.diagnostics().clone();
@@ -4518,6 +4617,22 @@ mod graph_supersession_contract {
 
         let server = McpServer::new(McpProfile::Workspace, state);
         let token = tokio_util::sync::CancellationToken::new;
+        let workspace_diagnostics = || {
+            Parameters(DiagnosticsParams {
+                action: "workspace".to_owned(),
+                path: None,
+                root_id: None,
+                codes: Vec::new(),
+                locale: None,
+                min_severity: None,
+                range_start: None,
+                range_end: None,
+                detail: None,
+                max_findings: None,
+                max_files: None,
+                max_output_tokens: None,
+            })
+        };
         let search_status = server
             .workspace_search(
                 Parameters(
@@ -4548,6 +4663,16 @@ mod graph_supersession_contract {
             warmed_search.structured_content.as_ref().unwrap().to_string().contains("Считать"),
             "precondition: warmed search has a positive hit"
         );
+        let baseline_full = server
+            .diagnostics(workspace_diagnostics(), token(), tasks::TaskCapable(false))
+            .await
+            .expect("full diagnostics baseline before graph reload");
+        let rmcp::model::CallToolResponse::Complete(baseline_full) = baseline_full else {
+            panic!("the baseline response was incomplete before graph reload");
+        };
+        let baseline_full = baseline_full.structured_content.expect("baseline response body");
+        assert_eq!(baseline_full["result"]["baseline"]["state"], "full");
+        assert_eq!(baseline_full["result"]["baseline"]["complete"], true);
 
         let resident_symbol = server
             .symbol_info(symbol_params("Сервер.Считать"), token(), tasks::TaskCapable(false))
@@ -4703,6 +4828,20 @@ mod graph_supersession_contract {
                 mirror["freshness"]["stale"], true,
                 "JSON mirror matches structured stale flag"
             );
+
+            let diag_workspace = server
+                .diagnostics(workspace_diagnostics(), token(), tasks::TaskCapable(false))
+                .await
+                .expect("diagnostics workspace response during graph reload");
+            let rmcp::model::CallToolResponse::Complete(diag_workspace) = diag_workspace else {
+                panic!("workspace diagnostics returned an incomplete response during reload");
+            };
+            let diag_workspace =
+                diag_workspace.structured_content.expect("diagnostics workspace body");
+            assert_eq!(diag_workspace["freshness"]["stale"], true);
+            assert_eq!(diag_workspace["result"]["baseline"]["state"], "partial");
+            assert_eq!(diag_workspace["result"]["baseline"]["complete"], false);
+            assert_eq!(diag_workspace["result"]["baseline"]["resolved"], 0);
 
             let old_method_line = shifted_resident
                 [..shifted_resident.find("Функция Считать").unwrap()]

@@ -8,6 +8,7 @@ use base_db::{DiagnosticsConfigInput, Locale};
 use crossbeam_channel::{Receiver, Sender};
 use hir::CallHierarchyReverseIndex;
 use ide::Analysis;
+use ide_host_core::{EditorView, WorkspaceCatalog};
 use lsp_server::{Message, ReqQueue, Request, RequestId, Response};
 use lsp_types::{PublishDiagnosticsParams, Url};
 use parking_lot::RwLock;
@@ -16,7 +17,7 @@ use rustc_hash::FxHashSet;
 use vfs::loader::Handle;
 use vfs::{loader, Vfs};
 
-use crate::analysis_host::AnalysisHost;
+use crate::analysis_host::SessionAnalysisHost;
 use crate::call_hierarchy_index_state::CallHierarchyIndexState;
 use crate::lsp::to_proto::ClientTags;
 use crate::lsp::{PositionEncoding, Progress};
@@ -78,14 +79,24 @@ pub enum Task {
         file_id: vfs::FileId,
         count: usize,
     },
+    SharedWorkspaceChanged {
+        generation: u64,
+    },
+    SharedWorkspaceSeedReady {
+        epoch: u64,
+    },
     DiagnosticsReady {
         uri: Url,
         diagnostics: Vec<lsp_types::Diagnostic>,
+        version: i32,
         generation: u64,
         completed_at: std::time::Instant,
     },
     DiagnosticsCancelled {
+        uri: Url,
+        version: i32,
         generation: u64,
+        kind: salsa::Cancelled,
         completed_at: std::time::Instant,
     },
     PreloadExternalFiles {
@@ -170,7 +181,14 @@ pub struct RequestAttemptKey {
 #[derive(Debug)]
 pub enum LatencyAttemptOutcome {
     Response(Response),
-    Cancelled { kind: salsa::Cancelled, revision: salsa::Revision },
+    Cancelled {
+        kind: salsa::Cancelled,
+        revision: salsa::Revision,
+    },
+    /// Classified against the request's storage before its database clone is dropped.
+    Panicked {
+        revision: salsa::Revision,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +320,7 @@ impl Drop for AnalysisGuard {
 pub struct GlobalState {
     pub sender: Sender<Message>,
     pub req_queue: ReqQueue<(), ()>,
-    pub analysis_host: AnalysisHost,
+    pub analysis_host: SessionAnalysisHost,
     pub vfs: Arc<RwLock<Vfs>>,
     pub mem_docs: MemDocs,
     pub workspace_root: Option<PathBuf>,
@@ -330,6 +348,8 @@ pub struct GlobalState {
 
     pub loader_receiver: Receiver<loader::Message>,
     pub loader: Box<dyn loader::Handle>,
+    /// Keeps the shared-mode loader channel connected while no local loader runs.
+    loader_keepalive: Option<crossbeam_channel::Sender<loader::Message>>,
     pub vfs_progress_config_version: u32,
     pub vfs_done: bool,
     /// The initial project was rejected, so no load will ever open the readiness gate
@@ -349,7 +369,19 @@ pub struct GlobalState {
     pub call_hierarchy_index_rebuilds: FxHashSet<base_db::SourceRootId>,
     pub call_hierarchy_wait_policy: CallHierarchyWaitPolicy,
     pub(crate) next_request_id: AtomicI32,
+    pub(crate) progress_generation: u64,
     pub(crate) diagnostics_config: DiagnosticsConfigInput,
+    pub(crate) shared_view_epoch: u64,
+    pub(crate) shared_view_seeded: bool,
+    pub(crate) shared_seed_snapshot: Arc<std::sync::Mutex<Option<(u64, EditorView)>>>,
+    pub(crate) shared_seed_running: bool,
+    pub(crate) shared_seed_queued: bool,
+    pub(crate) shared_request_generation: u64,
+    pub(crate) shared_owner_generation: Option<u64>,
+    pub(crate) shared_configuration_error: Option<String>,
+    pub(crate) shared_request_stamps: HashMap<RequestId, (u64, salsa::Revision)>,
+    pub(crate) shared_bridge_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) shared_generation_pending: Arc<std::sync::atomic::AtomicBool>,
 
     /// Vendor-diff analysis-scope lifecycle (`[analysis].diff_base`); the
     /// effective scope is mirrored into `diagnostics_config.scope`.
@@ -486,6 +518,9 @@ pub struct GlobalState {
     /// URL encoding/casing can't misclassify an open buffer as closed and route
     /// unsaved edits to a stale disk read.
     pub open_files: FxHashSet<vfs::FileId>,
+    /// Exact shared document URI to its FileId. This binding outlives disk deletion
+    /// while the document remains in MemDocs; snapshots expose it only while admitted.
+    pub(crate) open_file_uri_ids: HashMap<Url, vfs::FileId>,
 
     /// High-water mark of process RSS observed while streaming the initial VFS
     /// load (before `vfs_done`). Sampled per loaded batch, just before that
@@ -536,6 +571,44 @@ impl GlobalState {
         Self::with_loader(sender, Box::new(loader), loader_receiver)
     }
 
+    pub fn new_shared(sender: Sender<Message>, owner: mcp_server::WorkspaceHandle) -> Self {
+        let (loader_sender, loader_receiver) = crossbeam_channel::bounded(1);
+        let updates = owner.subscribe();
+        let mut state = Self::with_loader(sender, Box::new(NoopLoader), loader_receiver);
+        state.loader_keepalive = Some(loader_sender);
+        state.analysis_host = SessionAnalysisHost::shared(owner);
+        state.vfs_done = false;
+        state.shared_view_seeded = false;
+        let task_sender = state.task_pool.pool.sender.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge_stop = Arc::clone(&stop);
+        let generation_pending = Arc::clone(&state.shared_generation_pending);
+        std::thread::Builder::new()
+            .name("bsl-shared-workspace-events".to_owned())
+            .spawn(move || {
+                while !bridge_stop.load(Ordering::Acquire) {
+                    match updates.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(generation) => {
+                            if generation_pending.swap(true, Ordering::AcqRel) {
+                                continue;
+                            }
+                            if task_sender
+                                .send(Task::SharedWorkspaceChanged { generation })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .expect("failed to start shared workspace event bridge");
+        state.shared_bridge_stop = Some(stop);
+        state
+    }
+
     /// Construct with an injected VFS loader. This is the observation seam for
     /// workspace-(re)load tests: a recording [`loader::Handle`] sees exactly the
     /// configs [`Self::set_workspace_root`] emits (include roots, watch set),
@@ -548,7 +621,7 @@ impl GlobalState {
         Self {
             sender,
             req_queue: ReqQueue::default(),
-            analysis_host: AnalysisHost::default(),
+            analysis_host: SessionAnalysisHost::default(),
             vfs: Arc::new(RwLock::new(Vfs::default())),
             mem_docs: MemDocs::default(),
             workspace_root: None,
@@ -563,6 +636,7 @@ impl GlobalState {
             shutdown_requested: false,
             loader,
             loader_receiver,
+            loader_keepalive: None,
             vfs_progress_config_version: 0,
             vfs_done: false,
             project_rejected: false,
@@ -572,6 +646,7 @@ impl GlobalState {
             call_hierarchy_index_rebuilds: FxHashSet::default(),
             call_hierarchy_wait_policy: CallHierarchyWaitPolicy::default(),
             next_request_id: AtomicI32::new(1),
+            progress_generation: 0,
             diagnostics_config: DiagnosticsConfigInput::from_raw(
                 Vec::<String>::new(),
                 Vec::<String>::new(),
@@ -581,6 +656,17 @@ impl GlobalState {
                 Locale::default(),
                 true,
             ),
+            shared_view_epoch: 0,
+            shared_view_seeded: false,
+            shared_seed_snapshot: Arc::new(std::sync::Mutex::new(None)),
+            shared_seed_running: false,
+            shared_seed_queued: false,
+            shared_request_generation: 0,
+            shared_owner_generation: None,
+            shared_configuration_error: None,
+            shared_request_stamps: HashMap::new(),
+            shared_bridge_stop: None,
+            shared_generation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             analysis_scope: crate::analysis_scope::ScopeState::default(),
             scope_generation: 0,
             scope_build_queued: false,
@@ -621,6 +707,7 @@ impl GlobalState {
             skipped_bsl: FxHashSet::default(),
             degraded_files_count: 0,
             open_files: FxHashSet::default(),
+            open_file_uri_ids: HashMap::new(),
             boot_peak_rss_bytes: 0,
             boot_peak_text_bytes: 0,
             analysis_in_flight: 0,
@@ -750,9 +837,24 @@ impl GlobalState {
     }
 
     pub fn clear_batch_push_for(&mut self, uri: &Url) {
-        if self.batch_pushed.remove(uri).is_some() {
+        let file_id = crate::lsp::file_id(self, uri).ok();
+        let published_uris: Vec<_> = self
+            .batch_pushed
+            .keys()
+            .filter(|published_uri| {
+                *published_uri == uri
+                    || file_id.is_some_and(|file_id| {
+                        crate::lsp::file_id(self, published_uri).ok() == Some(file_id)
+                    })
+            })
+            .cloned()
+            .collect();
+        for published_uri in published_uris {
+            if self.batch_pushed.remove(&published_uri).is_none() {
+                continue;
+            }
             let params =
-                PublishDiagnosticsParams { uri: uri.clone(), diagnostics: vec![], version: None };
+                PublishDiagnosticsParams { uri: published_uri, diagnostics: vec![], version: None };
             let notification = lsp_server::Notification::new(
                 "textDocument/publishDiagnostics".to_string(),
                 params,
@@ -833,7 +935,14 @@ impl GlobalState {
         fraction: Option<f64>,
     ) {
         let percentage = fraction.map(|f| (f * 100.0) as u32);
-        let token = lsp_types::ProgressToken::String(format!("bslAnalyzer/{title}"));
+        let token = if self.progress_generation == 0 {
+            lsp_types::ProgressToken::String(format!("bslAnalyzer/{title}"))
+        } else {
+            lsp_types::ProgressToken::String(format!(
+                "bslAnalyzer/{}/{title}",
+                self.progress_generation
+            ))
+        };
 
         let work_done_progress = match state {
             Progress::Begin => {
@@ -922,6 +1031,13 @@ impl GlobalState {
     }
 
     pub fn snapshot(&self) -> GlobalStateSnapshot {
+        let workspace_catalog = self.analysis_host.owner().map(|owner| owner.catalog());
+        let open_file_uri_ids = self
+            .open_file_uri_ids
+            .iter()
+            .filter(|(_, file_id)| self.open_files.contains(file_id))
+            .map(|(uri, file_id)| (uri.clone(), *file_id))
+            .collect();
         GlobalStateSnapshot {
             analysis: self.analysis_host.analysis(),
             vfs: Arc::clone(&self.vfs),
@@ -935,7 +1051,78 @@ impl GlobalState {
             task_sender: self.task_pool.pool.sender.clone(),
             call_hierarchy_index: self.call_hierarchy_index.ensure(),
             scope_dirty_docs: self.scope_dirty_docs.clone(),
+            workspace_catalog,
+            open_file_uri_ids,
         }
+    }
+
+    pub(crate) fn schedule_shared_seed(&mut self) {
+        if !self.shared_seed_queued || self.shared_seed_running || self.open_files.is_empty() {
+            return;
+        }
+        let Some(owner) = self.analysis_host.owner().cloned() else { return };
+        let epoch = self.shared_view_epoch;
+        let slot = Arc::clone(&self.shared_seed_snapshot);
+        let sender = self.task_pool.pool.sender.clone();
+        let stop = self.shared_bridge_stop.clone();
+        self.shared_seed_running = true;
+        self.shared_seed_queued = false;
+        if let Err(error) =
+            std::thread::Builder::new().name("bsl-shared-workspace-seed".into()).spawn(move || {
+                let prepared =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match owner.snapshot() {
+                            mcp_server::WorkspaceRead::Ready(snapshot) => {
+                                EditorView::prepare(snapshot, || {
+                                    stop.as_ref().is_some_and(|stop| stop.load(Ordering::Acquire))
+                                })
+                            }
+                            _ => None,
+                        }
+                    }))
+                    .ok()
+                    .flatten();
+                *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    prepared.map(|view| (epoch, view));
+                let _ = sender.send(Task::SharedWorkspaceSeedReady { epoch });
+            })
+        {
+            self.shared_seed_running = false;
+            self.shared_seed_queued = true;
+            tracing::warn!(%error, "could not prepare shared editor storage");
+        }
+    }
+
+    pub(crate) fn mark_shared_view_changed(&mut self) {
+        self.shared_request_generation = self.shared_request_generation.wrapping_add(1);
+        self.supersede_call_hierarchy_index(base_db::BSL_SOURCE_ROOT);
+        for uri in self.opened_document_uris() {
+            *self.diagnostics_generation.entry(uri.clone()).or_default() += 1;
+            if let Some(token) = self.diagnostics_tokens.remove(&uri) {
+                token.cancel();
+            }
+        }
+        self.mark_workspace_batch_dirty();
+    }
+}
+
+#[derive(Debug)]
+struct NoopLoader;
+
+impl loader::Handle for NoopLoader {
+    fn spawn(_sender: loader::Sender) -> Self
+    where
+        Self: Sized,
+    {
+        Self
+    }
+
+    fn set_config(&mut self, _config: loader::Config) {}
+
+    fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
+
+    fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+        None
     }
 }
 
@@ -954,6 +1141,8 @@ pub struct GlobalStateSnapshot {
     /// Open documents edited since their last save; they count as whole-file
     /// in scope (the disk-derived diff no longer describes their buffer).
     pub scope_dirty_docs: std::collections::HashSet<Url>,
+    pub workspace_catalog: Option<WorkspaceCatalog>,
+    pub open_file_uri_ids: HashMap<Url, vfs::FileId>,
 }
 
 impl GlobalStateSnapshot {
@@ -966,6 +1155,19 @@ impl GlobalStateSnapshot {
         // it must not be answered for as if it were still analysed.
         if self.project.as_ref().is_some_and(|project| project.is_source_excluded(&path)) {
             return Err(anyhow::anyhow!("File is excluded by [source].exclude: {}", url));
+        }
+
+        if self.mem_docs.contains(url) {
+            if let Some(&file_id) = self.open_file_uri_ids.get(url) {
+                return Ok(file_id);
+            }
+        }
+
+        if let Some(catalog) = &self.workspace_catalog {
+            let path = crate::workspace::canonicalize_shared_path(&path);
+            return catalog.file_id(&path).ok_or_else(|| {
+                anyhow::anyhow!("File is not in the shared workspace catalog: {}", url)
+            });
         }
 
         let vfs_path = vfs::VfsPath::new(path);

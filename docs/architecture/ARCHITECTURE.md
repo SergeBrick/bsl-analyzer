@@ -169,10 +169,36 @@ Bounded graph batch сохраняет полный контекстный Sourc
 только своей порции. Начальная MCP DB публикуется для запросов после завершения
 регистрации и metadata bootstrap.
 
-Процессы и DB LSP/MCP сохраняют собственные lifecycle и views. Общий алгоритм
-может вызываться будущим владельцем workspace; совместное хранение DB и
-одновременные session views требуют отдельного решения. Сокращение кода само
-по себе не доказывает уменьшение памяти или latency.
+Локальный broker обслуживает совместимые LSP/MCP sessions через один disk owner
+`ide-host-core::WorkspaceBackend`: один catalog, master Salsa storage, watcher
+ingress и ограниченный журнал опубликованных поколений. Сначала owner применяет
+source batch, затем metadata inputs и публикует поколение целиком. Disk graph/search
+сохраняют собственные существующие owners, leases и только сохранённый текст.
+
+LSP-only backend не запускает graph/search initialization или credential helper.
+Workspace и reference baseline сохраняют план подключения; credentials разрешаются
+в существующих фоновых workers при активации соответствующего MCP consumer.
+
+Для первого допустимого `didOpen` создаётся независимый `EditorView`; холодные
+синтаксические запросы доступны до окончания disk bootstrap. Полное заполнение
+storage происходит в фоне из owner-prepared source/metadata inputs. Salsa IDs
+между storages не передаются. Дельты догоняют view с сохранением его buffers;
+при разрыве журнала новый storage готовится вне event loop. Последний `didClose`
+освобождает editor storage. Исключённые документы остаются только в MemDocs.
+
+Resident writer и admissions сериализованы FIFO; новые readers не обходят
+ожидающего writer. Request-owned clones освобождаются перед передачей результата
+или постановкой retry. Panic stamp принадлежит тому же Salsa storage, поэтому
+одинаковые revision разных views не смешиваются. Каналы и обработка сообщений
+ограничивают очереди и дают прогресс запросам и обновлениям workspace.
+
+Верхний бинарник соединяет adapters с broker через приватный handshake и передаёт
+публичные LSP/MCP frames. MCP tools/native context изолирован по session. При
+validated scope retirement LSP восстанавливает buffers через private rebind с
+повторным admission URI и прежними negotiated capabilities; MCP завершает
+transport до reconnect. Неожиданный crash завершает обе публичные sessions без
+replay. CLI, direct stdio/HTTP и reference/library callers используют тот же core
+через прежние entrypoints. Уменьшение памяти или latency требует отдельного измерения.
 
 ### Владение данными и диагностиками
 

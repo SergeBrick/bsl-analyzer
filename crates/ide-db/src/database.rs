@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use stdx::case::CaseExt;
 
 use dashmap::DashMap;
@@ -12,6 +12,7 @@ use hir::{
     ConditionalTree, DefDatabase, ItemTree, ModuleBodies, ModuleData, ModuleId, RegionTree,
     SymbolTree,
 };
+use salsa::Revision;
 use vfs::FileId;
 
 use crate::features::FeaturesInput;
@@ -89,6 +90,15 @@ impl EffectiveMetadataMemberValue {
 #[salsa::db]
 pub struct RootDatabaseImpl {
     storage: salsa::Storage<Self>,
+
+    /// Newest revision where a real panic ran in this Salsa storage. Cloned
+    /// database handles share storage and therefore share this stamp as well.
+    panic_revision: Arc<Mutex<Option<Revision>>>,
+
+    /// Seeded editor storages may load whole configurations only from their
+    /// accepted metadata listing and file inputs. Batch/standalone databases keep
+    /// the legacy filesystem loader unless explicitly opted into this mode.
+    prepared_metadata_inputs: bool,
 
     files: Files,
 
@@ -168,6 +178,8 @@ impl Clone for RootDatabaseImpl {
     fn clone(&self) -> Self {
         Self {
             storage: self.storage.clone(),
+            panic_revision: Arc::clone(&self.panic_revision),
+            prepared_metadata_inputs: self.prepared_metadata_inputs,
             files: self.files.clone(),
             config_revisions: Arc::clone(&self.config_revisions),
             metadata_listings: Arc::clone(&self.metadata_listings),
@@ -195,6 +207,12 @@ impl RootDatabaseImpl {
         Self::new_inner(true)
     }
 
+    /// Restrict whole-configuration loading to metadata inputs prepared by the
+    /// shared workspace owner. Call only after seeding a complete editor view.
+    pub fn use_prepared_metadata_inputs(&mut self) {
+        self.prepared_metadata_inputs = true;
+    }
+
     fn new_inner(events_enabled: bool) -> Self {
         // Install the event callback (if any) before any input is created so it
         // observes the whole database lifetime, including the singleton inputs below.
@@ -211,6 +229,8 @@ impl RootDatabaseImpl {
         };
         let db = Self {
             storage,
+            panic_revision: Arc::new(Mutex::new(None)),
+            prepared_metadata_inputs: false,
             files: Files::new(),
             config_revisions: Arc::new(DashMap::default()),
             metadata_listings: Arc::new(DashMap::default()),
@@ -248,6 +268,29 @@ impl RootDatabaseImpl {
         .durability(Durability::MEDIUM)
         .new(&db);
         db
+    }
+
+    /// Record a real panic observed while this database's Salsa storage was
+    /// attached. This is shared by clones of the same storage, not other views.
+    pub fn record_query_panic(&self, revision: Revision) {
+        let mut seen = self.panic_revision.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seen.is_none_or(|previous| previous < revision) {
+            *seen = Some(revision);
+        }
+    }
+
+    /// Whether a real panic in this storage can be replayed in `revision`.
+    pub fn query_panicked_in(&self, revision: Revision) -> bool {
+        self.panic_revision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|seen| seen >= revision)
+    }
+
+    /// Clear this storage's panic stamp for an isolated test.
+    #[doc(hidden)]
+    pub fn reset_query_panic_for_test(&self) {
+        *self.panic_revision.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub(crate) fn type_kernel_inner(&self) -> &Arc<TypeKernelInner> {
@@ -849,9 +892,19 @@ impl RootDatabaseImpl {
     /// so previously recorded `config_index`/`resolve_metadata_object` dependencies
     /// stay valid and re-derive from the new structure.
     pub fn set_metadata_listing(&mut self, root: &str, listing: metadata::MetadataListingData) {
+        self.set_metadata_listing_snapshot(root, listing.into());
+    }
+
+    /// Install owner-prepared listing data while creating this storage's own
+    /// Salsa input IDs. The Arc payloads can remain shared across storages.
+    pub fn set_metadata_listing_snapshot(
+        &mut self,
+        root: &str,
+        listing: metadata::MetadataListingSnapshot,
+    ) {
         use salsa::Setter;
         let key = metadata::canonicalize_configuration_path(root);
-        let metadata::MetadataListingData {
+        let metadata::MetadataListingSnapshot {
             entries,
             defined_types,
             common_modules,
@@ -864,17 +917,6 @@ impl RootDatabaseImpl {
             subsystems,
             common_attributes,
         } = listing;
-        let entries = Arc::new(entries);
-        let defined_types = Arc::new(defined_types);
-        let common_modules = Arc::new(common_modules);
-        let event_subscriptions = Arc::new(event_subscriptions);
-        let scheduled_jobs = Arc::new(scheduled_jobs);
-        let roles = Arc::new(roles);
-        let http_services = Arc::new(http_services);
-        let web_services = Arc::new(web_services);
-        let integration_services = Arc::new(integration_services);
-        let subsystems = Arc::new(subsystems);
-        let common_attributes = Arc::new(common_attributes);
         match self.metadata_listings.get(&key).map(|e| *e.value()) {
             Some(input) => {
                 input.set_entries(self).to(entries);
@@ -915,6 +957,47 @@ impl RootDatabaseImpl {
     pub fn metadata_listing(&self, root: &str) -> Option<metadata::MetadataListingInput> {
         let key = metadata::canonicalize_configuration_path(root);
         self.metadata_listings.get(&key).map(|e| *e.value())
+    }
+
+    /// Copy a prepared metadata listing into storage-neutral values. A second
+    /// Salsa storage must create its own inputs rather than reuse this input ID.
+    pub fn metadata_listing_data(&self, root: &str) -> Option<metadata::MetadataListingData> {
+        let snapshot = self.metadata_listing_snapshot(root)?;
+        Some(metadata::MetadataListingData {
+            entries: snapshot.entries.as_ref().clone(),
+            defined_types: snapshot.defined_types.as_ref().clone(),
+            common_modules: snapshot.common_modules.as_ref().clone(),
+            event_subscriptions: snapshot.event_subscriptions.as_ref().clone(),
+            scheduled_jobs: snapshot.scheduled_jobs.as_ref().clone(),
+            roles: snapshot.roles.as_ref().clone(),
+            http_services: snapshot.http_services.as_ref().clone(),
+            web_services: snapshot.web_services.as_ref().clone(),
+            integration_services: snapshot.integration_services.as_ref().clone(),
+            subsystems: snapshot.subsystems.as_ref().clone(),
+            common_attributes: snapshot.common_attributes.as_ref().clone(),
+        })
+    }
+
+    /// Clone the prepared Arc-backed fields without copying metadata names or
+    /// allocating Salsa IDs from the source storage.
+    pub fn metadata_listing_snapshot(
+        &self,
+        root: &str,
+    ) -> Option<metadata::MetadataListingSnapshot> {
+        let input = self.metadata_listing(root)?;
+        Some(metadata::MetadataListingSnapshot {
+            entries: input.entries(self).clone(),
+            defined_types: input.defined_types(self).clone(),
+            common_modules: input.common_modules(self).clone(),
+            event_subscriptions: input.event_subscriptions(self).clone(),
+            scheduled_jobs: input.scheduled_jobs(self).clone(),
+            roles: input.roles(self).clone(),
+            http_services: input.http_services(self).clone(),
+            web_services: input.web_services(self).clone(),
+            integration_services: input.integration_services(self).clone(),
+            subsystems: input.subsystems(self).clone(),
+            common_attributes: input.common_attributes(self).clone(),
+        })
     }
 
     /// The ONE per-file visibility resolver: the config roots a file may see.
@@ -3677,6 +3760,17 @@ impl metadata::MetadataDb for RootDatabaseImpl {
         // the finalize flip recomputes everything resolved against this stub.
         if !self.workspace_load_complete() {
             tracing::debug!("workspace load incomplete; whole-config load gated to empty");
+            return Arc::new(bsl_metadata::Configuration::new("Configuration"));
+        }
+
+        if self.prepared_metadata_inputs && self.graph_config_cache.is_none() {
+            let root = path_input.path(self);
+            if let Some(listing) = self.metadata_listing(root) {
+                return metadata::load_configuration_from_prepared_inputs(
+                    self, path_input, listing,
+                );
+            }
+            tracing::warn!(%root, "prepared metadata listing missing; returning empty configuration");
             return Arc::new(bsl_metadata::Configuration::new("Configuration"));
         }
 

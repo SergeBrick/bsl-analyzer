@@ -32,15 +32,20 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-use crate::broker::name::{backend_name, BackendKey};
+use crate::broker::name::{backend_name, shared_backend_name, BackendKey, SharedBackendKey};
 #[cfg(windows)]
 use crate::broker::security::pipe_security_descriptor_for_current_user;
+use crate::broker::transport::{
+    connect_endpoint, read_session_context, server_handshake, AdapterKind, Handshake, LspChannel,
+    HANDSHAKE_TIMEOUT,
+};
 use crate::{serve_stream_with_shutdown, McpServer};
 
 /// Cap on connections held while the resident state builds. The listener keeps draining
 /// past this (so a concurrent liveness probe still succeeds), but excess connections are
 /// dropped rather than parked, bounding memory against a runaway local client.
 const MAX_PARKED_DURING_BUILD: usize = 128;
+const MAX_SHARED_HANDSHAKES: usize = 128;
 
 /// How long a superseded backend lets its answers in flight reach their clients, once its
 /// graph reads are done, before it closes the sessions.
@@ -108,6 +113,198 @@ where
     // the stdio path, before the process exits.
     let result = serve(server, listener, parked, orphan_grace, idle_ttl).await;
     guard.shutdown();
+    result
+}
+
+/// A connection accepted by the mixed-protocol broker.
+pub trait BrokerIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> BrokerIo for T {}
+
+pub type BoxedBrokerStream = Box<dyn BrokerIo>;
+
+pub enum SharedSession {
+    Mcp(BoxedBrokerStream),
+    Lsp(LspChannel),
+}
+
+/// Bind and serve adapter sessions as soon as the lightweight owner callback exists.
+pub async fn run_shared<F, Fut>(
+    key: SharedBackendKey,
+    on_session: F,
+    scope_retired: CancellationToken,
+    orphan_grace: Duration,
+    idle_ttl: Duration,
+    lease_state: impl Fn() -> (bool, bool) + Send + 'static,
+    on_shutdown: impl FnOnce() + Send + 'static,
+) -> anyhow::Result<()>
+where
+    F: Fn(Handshake, Vec<u8>, SharedSession, CancellationToken, CancellationToken) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let Some(listener) = bind_shared(&key).await? else {
+        tracing::info!("shared backend already serving this workspace");
+        return Ok(());
+    };
+    serve_shared(
+        key,
+        listener,
+        Arc::new(on_session),
+        scope_retired,
+        orphan_grace,
+        idle_ttl,
+        lease_state,
+        on_shutdown,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Each callback belongs to the upper adapter owner.
+async fn serve_shared<F, Fut>(
+    key: SharedBackendKey,
+    listener: TokioListener,
+    on_session: Arc<F>,
+    scope_retired: CancellationToken,
+    orphan_grace: Duration,
+    idle_ttl: Duration,
+    lease_state: impl Fn() -> (bool, bool) + Send + 'static,
+    on_shutdown: impl FnOnce() + Send + 'static,
+) -> anyhow::Result<()>
+where
+    F: Fn(Handshake, Vec<u8>, SharedSession, CancellationToken, CancellationToken) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let active = Arc::new(AtomicU64::new(0));
+    let warmed = Arc::new(AtomicBool::new(false));
+    let shutdown = CancellationToken::new();
+    let _shutdown_guard = shutdown.clone().drop_guard();
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_SHARED_HANDSHAKES));
+    let mut sessions = tokio::task::JoinSet::new();
+    let poll =
+        (orphan_grace.min(idle_ttl) / 4).clamp(Duration::from_millis(100), Duration::from_secs(15));
+    let mut ticker = interval(poll);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+    let mut idle_since = Some(Instant::now());
+    let mut result = Ok(());
+    let mut superseded = false;
+
+    tracing::info!(pid = std::process::id(), "shared broker listening");
+    loop {
+        tokio::select! {
+            biased;
+            _ = scope_retired.cancelled() => {
+                tracing::info!("shared workspace scope retired; closing broker endpoint");
+                break;
+            }
+            accepted = listener.accept() => {
+                let conn = match accepted {
+                    Ok(conn) => conn,
+                    Err(error) => { result = Err(error.into()); break; }
+                };
+                if !peer_authorized(&conn) {
+                    tracing::warn!("rejected shared broker connection from an unauthorized peer");
+                    continue;
+                }
+                let Ok(handshake_slot) = Arc::clone(&handshakes).try_acquire_owned() else {
+                    tracing::warn!("shared broker handshake limit reached");
+                    continue;
+                };
+                let active_guard = ActiveGuard::new(Arc::clone(&active));
+                let callback = Arc::clone(&on_session);
+                let key = key.clone();
+                let shutdown = shutdown.clone();
+                let scope_retired_session = scope_retired.clone();
+                let warmed = Arc::clone(&warmed);
+                sessions.spawn(async move {
+                    let _active_guard = active_guard;
+                    let mut conn = conn;
+                    let handshake = match server_handshake(&mut conn, &key).await {
+                        Ok(handshake) => handshake,
+                        Err(_) => return,
+                    };
+                    let context = match read_session_context(&mut conn).await {
+                        Ok(context) => context,
+                        Err(_) => return,
+                    };
+                    drop(handshake_slot);
+                    let session = match handshake.adapter {
+                        AdapterKind::Mcp => {
+                            let warmed = Arc::clone(&warmed);
+                            SharedSession::Mcp(Box::new(FirstByteProbe::new(conn, move || {
+                                warmed.store(true, Ordering::SeqCst)
+                            })))
+                        }
+                        AdapterKind::Lsp => {
+                            let warmed = Arc::clone(&warmed);
+                            SharedSession::Lsp(LspChannel::new(conn, move || warmed.store(true, Ordering::SeqCst)))
+                        }
+                    };
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {},
+                        result = callback(handshake, context, session, shutdown.clone(), scope_retired_session) => {
+                            if result.is_err() {
+                                tracing::warn!("shared broker adapter session ended with error");
+                            }
+                        }
+                    }
+                });
+            }
+            _ = ticker.tick() => {
+                while let Some(result) = sessions.try_join_next() {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "shared broker session task failed");
+                    }
+                }
+                if lease_state().0 {
+                    tracing::info!("shared backend superseded; closing endpoint and waiting for graph reads");
+                    superseded = true;
+                    break;
+                }
+                if active.load(Ordering::SeqCst) != 0 {
+                    idle_since = None;
+                } else {
+                    let since = *idle_since.get_or_insert_with(Instant::now);
+                    let grace = if warmed.load(Ordering::SeqCst) { idle_ttl } else { orphan_grace };
+                    if since.elapsed() >= grace { break; }
+                }
+            }
+        }
+    }
+
+    let retired = scope_retired.is_cancelled();
+    drop(listener);
+    if superseded {
+        while !lease_state().1 {
+            tokio::time::sleep(poll.min(Duration::from_millis(200))).await;
+        }
+        tokio::time::sleep(SUPERSEDED_DRAIN).await;
+    }
+    if retired {
+        let drain = async { while sessions.join_next().await.is_some() {} };
+        if tokio::time::timeout(SUPERSEDED_DRAIN, drain).await.is_err() {
+            shutdown.cancel();
+            while let Some(result) = sessions.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "shared broker session task failed during retirement");
+                }
+            }
+        }
+    } else {
+        shutdown.cancel();
+        while let Some(result) = sessions.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "shared broker session task failed during shutdown");
+            }
+        }
+    }
+    on_shutdown();
     result
 }
 
@@ -398,6 +595,82 @@ async fn bind(key: &BackendKey) -> anyhow::Result<Option<TokioListener>> {
     }
 }
 
+async fn bind_shared(key: &SharedBackendKey) -> anyhow::Result<Option<TokioListener>> {
+    match listener_options_shared(key)?.create_tokio() {
+        Ok(listener) => Ok(Some(listener)),
+        Err(error) if is_name_in_use(&error) => {
+            if probe_shared_live(key).await? {
+                return Ok(None);
+            }
+            #[cfg(unix)]
+            {
+                let path = key.socket_path()?;
+                let _ = std::fs::remove_file(path);
+            }
+            match listener_options_shared(key)?.create_tokio() {
+                Ok(listener) => Ok(Some(listener)),
+                Err(error) if is_name_in_use(&error) && probe_shared_live(key).await? => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn listener_options_shared(key: &SharedBackendKey) -> io::Result<ListenerOptions<'static>> {
+    let options = ListenerOptions::new().name(shared_backend_name(key)?);
+    #[cfg(windows)]
+    {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+        return Ok(options.security_descriptor(pipe_security_descriptor_for_current_user()?));
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(options)
+    }
+}
+
+async fn probe_shared_live(key: &SharedBackendKey) -> anyhow::Result<bool> {
+    match connect_endpoint(shared_backend_name(key)?, HANDSHAKE_TIMEOUT).await {
+        Ok(stream) => {
+            #[cfg(windows)]
+            {
+                let trusted = crate::broker::security::verify_pipe_server_trusted(&stream);
+                drop(stream);
+                Ok(trusted)
+            }
+            #[cfg(not(windows))]
+            {
+                drop(stream);
+                Ok(true)
+            }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                if windows_pipe_busy_or_timeout(&error) {
+                    return Ok(true);
+                }
+                const ERROR_ACCESS_DENIED: i32 = 5;
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+                {
+                    return Ok(true);
+                }
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn listener_options(key: &BackendKey) -> io::Result<ListenerOptions<'static>> {
     let options = ListenerOptions::new().name(backend_name(key)?);
     #[cfg(windows)]
@@ -432,7 +705,8 @@ fn is_name_in_use(e: &std::io::Error) -> bool {
 
 /// Is a backend actually accepting on this name? A successful connect proves a live
 /// listener (queued in its backlog even mid-build); a refused/not-found connect
-/// means the name is stale.
+/// means the name is stale. On Windows, a finite busy/timeout result is inconclusive:
+/// keep the name reserved and defer rather than risk rebinding an existing pipe.
 ///
 /// On Windows the connect succeeding does not by itself prove the listener is a
 /// backend we trust: the pipe name is deterministic and a hostile local user
@@ -445,7 +719,7 @@ fn is_name_in_use(e: &std::io::Error) -> bool {
 /// name) `bind` returns Err and the launching proxy falls back to in-process
 /// stdio.
 async fn probe_live(key: &BackendKey) -> anyhow::Result<bool> {
-    match TokioStream::connect(backend_name(key)?).await {
+    match connect_endpoint(backend_name(key)?, HANDSHAKE_TIMEOUT).await {
         Ok(control) => {
             // The probe connection is never used to exchange MCP bytes; it is
             // just a liveness + identity check. Drop it deterministically.
@@ -482,6 +756,9 @@ async fn probe_live(key: &BackendKey) -> anyhow::Result<bool> {
         Err(e) => {
             #[cfg(windows)]
             {
+                if windows_pipe_busy_or_timeout(&e) {
+                    return Ok(true);
+                }
                 const ERROR_ACCESS_DENIED: i32 = 5;
                 if e.kind() == std::io::ErrorKind::PermissionDenied
                     || e.raw_os_error() == Some(ERROR_ACCESS_DENIED)
@@ -497,6 +774,14 @@ async fn probe_live(key: &BackendKey) -> anyhow::Result<bool> {
             Ok(true)
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_pipe_busy_or_timeout(error: &io::Error) -> bool {
+    const ERROR_SEM_TIMEOUT: i32 = 121;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        || matches!(error.raw_os_error(), Some(ERROR_SEM_TIMEOUT) | Some(ERROR_PIPE_BUSY))
 }
 
 /// Reject a peer running as a different user. On unix this reads `SO_PEERCRED`; the
@@ -521,4 +806,504 @@ fn peer_authorized(conn: &TokioStream) -> bool {
 #[cfg(not(unix))]
 fn peer_authorized(_conn: &TokioStream) -> bool {
     true
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    use crate::broker::name::shared_backend_name;
+    use crate::broker::transport::{
+        client_handshake, write_session_context, AdapterKind, MAX_HANDSHAKE_BYTES,
+    };
+    use crate::broker::{SharedBackendIdentity, SharedBackendKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn incomplete_shared_handshakes_and_private_probe_do_not_warm_or_start_adapter() {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            crate::WorkspaceCacheLayout::for_workspace(source.path()).root(),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        let key = SharedBackendKey::new(identity.clone());
+        let listener = bind_shared(&key).await.unwrap().unwrap();
+        let adapter_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&adapter_calls);
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_seen = Arc::clone(&shutdown_called);
+        let (attached_tx, mut attached_rx) = tokio::sync::mpsc::channel(1);
+        let (finished_tx, mut finished_rx) = tokio::sync::mpsc::channel(1);
+        let daemon = tokio::spawn(serve_shared(
+            key.clone(),
+            listener,
+            Arc::new(
+                move |_hello, _context, mut session, shutdown: CancellationToken, _retired| {
+                    let calls = Arc::clone(&callback_calls);
+                    let attached = attached_tx.clone();
+                    let finished = finished_tx.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        attached.send(()).await.unwrap();
+                        let SharedSession::Mcp(stream) = &mut session else {
+                            anyhow::bail!("MCP adapter expected")
+                        };
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {},
+                            _ = stream.read_u8() => {},
+                        }
+                        finished.send(()).await.unwrap();
+                        Ok(())
+                    }
+                },
+            ),
+            CancellationToken::new(),
+            Duration::from_secs(3),
+            Duration::from_secs(60),
+            || (false, false),
+            move || shutdown_seen.store(true, Ordering::SeqCst),
+        ));
+
+        // Keep the new daemon active until its real five-second handshake deadline.
+        // The server must close the accepted stream without invoking the adapter.
+        let mut partial =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        partial.write_u8(0).await.unwrap();
+        partial.flush().await.unwrap();
+        let partial_eof = tokio::time::timeout(Duration::from_secs(7), partial.read_u8())
+            .await
+            .expect("partial handshake is bounded by the server deadline");
+        assert!(partial_eof.is_err(), "slow handshake closes without an accept record");
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+        let mut malformed =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        malformed.write_u32(1).await.unwrap();
+        malformed.write_u8(b'{').await.unwrap();
+        malformed.flush().await.unwrap();
+        assert_eq!(malformed.read_u8().await.unwrap(), 1);
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+        let mut oversized =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        oversized.write_u32((MAX_HANDSHAKE_BYTES as u32) + 1).await.unwrap();
+        oversized.flush().await.unwrap();
+        assert_eq!(oversized.read_u8().await.unwrap(), 1);
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+        let probe =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        drop(probe);
+        tokio::task::yield_now().await;
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+
+        // Positive control: private handshake/context reach the callback, but no public
+        // MCP byte is sent, so this session must still be reaped by the orphan grace.
+        let mut client =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        client_handshake(&mut client, &Handshake { identity, adapter: AdapterKind::Mcp })
+            .await
+            .unwrap();
+        write_session_context(&mut client, &[]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), attached_rx.recv())
+            .await
+            .expect("valid handshake starts the adapter")
+            .expect("adapter attached");
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(3), finished_rx.recv())
+            .await
+            .expect("the adapter observes peer EOF")
+            .expect("adapter finished");
+
+        tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("private-only attach must not extend the 3s orphan grace to the 60s idle TTL")
+            .unwrap()
+            .unwrap();
+        assert!(shutdown_called.load(Ordering::SeqCst));
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_endpoint_rejects_each_identity_mismatch_before_adapter_admission() {
+        let source = tempfile::tempdir().unwrap();
+        let other_source = tempfile::tempdir().unwrap();
+        let cache = source.path().join("cache");
+        let identity = |source_dir: &std::path::Path,
+                        cache_dir: &std::path::Path,
+                        scope: u8,
+                        config: u8,
+                        platform: u8,
+                        build: u8| {
+            SharedBackendIdentity::new(
+                source_dir,
+                cache_dir,
+                [scope; 32],
+                [config; 32],
+                [platform; 32],
+                [build; 32],
+            )
+        };
+        let expected = identity(source.path(), &cache, 1, 2, 3, 4);
+        let key = SharedBackendKey::new(expected.clone());
+        let listener = bind_shared(&key).await.unwrap().unwrap();
+        let adapter_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&adapter_calls);
+        let retired = CancellationToken::new();
+        let daemon_retired = retired.clone();
+        let (attached_tx, mut attached_rx) = tokio::sync::mpsc::channel(1);
+        let daemon = tokio::spawn(serve_shared(
+            key.clone(),
+            listener,
+            Arc::new(
+                move |_hello, _context, mut session, shutdown: CancellationToken, _retired| {
+                    let calls = Arc::clone(&calls);
+                    let attached = attached_tx.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        attached.send(()).await.unwrap();
+                        let SharedSession::Mcp(stream) = &mut session else {
+                            anyhow::bail!("MCP adapter expected")
+                        };
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {},
+                            _ = stream.read_u8() => {},
+                        }
+                        Ok(())
+                    }
+                },
+            ),
+            daemon_retired,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            || (false, false),
+            || {},
+        ));
+
+        // Every variant is created by this same package/build; only the listed identity axis
+        // changes, so the differing build fingerprint is independent of package version.
+        let mismatches = [
+            identity(other_source.path(), &cache, 1, 2, 3, 4),
+            identity(source.path(), &source.path().join("other-cache"), 1, 2, 3, 4),
+            identity(source.path(), &cache, 9, 2, 3, 4),
+            identity(source.path(), &cache, 1, 9, 3, 4),
+            identity(source.path(), &cache, 1, 2, 9, 4),
+            identity(source.path(), &cache, 1, 2, 3, 9),
+        ];
+        for mismatch in mismatches {
+            let mut stream =
+                connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT)
+                    .await
+                    .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client_handshake(
+                    &mut stream,
+                    &Handshake { identity: mismatch, adapter: AdapterKind::Mcp },
+                ),
+            )
+            .await
+            .expect("identity mismatch handshake is bounded");
+            assert!(result.is_err(), "incompatible identity must be rejected before attach");
+            assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
+        }
+
+        let mut compatible =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        client_handshake(
+            &mut compatible,
+            &Handshake { identity: expected, adapter: AdapterKind::Mcp },
+        )
+        .await
+        .expect("exact identity remains admissible after mismatches");
+        write_session_context(&mut compatible, &[]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), attached_rx.recv())
+            .await
+            .expect("exact identity reaches adapter")
+            .expect("adapter attached");
+        assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
+        drop(compatible);
+        retired.cancel();
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("endpoint exits after explicit shutdown")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_client_handshake_rejects_a_legacy_raw_mcp_server() {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            source.path().join("cache"),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        let key = SharedBackendKey::new(identity.clone());
+        let listener = listener_options_shared(&key).unwrap().create_tokio().unwrap();
+        let legacy = tokio::spawn(async move {
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("new client reaches fake legacy endpoint before deadline")
+                .unwrap();
+            let length = tokio::time::timeout(Duration::from_secs(5), stream.read_u32())
+                .await
+                .expect("new client private handshake header is bounded")
+                .unwrap() as usize;
+            assert!(
+                length <= MAX_HANDSHAKE_BYTES,
+                "new client handshake stays under the protocol's advertised bound"
+            );
+            let mut received = vec![0; length];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+                .await
+                .expect("new client private handshake body is bounded")
+                .unwrap();
+            stream.write_all(b"Content-Length: 2\r\n\r\n{}").await.unwrap();
+            stream.flush().await.unwrap();
+            received
+        });
+
+        let mut stream = crate::broker::proxy::connect_or_launch_stream(
+            key.clone(),
+            std::process::Command::new("unused-daemon-command"),
+        )
+        .await
+        .expect("new shared client connects to the existing endpoint without launching a daemon");
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_handshake(&mut stream, &Handshake { identity, adapter: AdapterKind::Mcp }),
+        )
+        .await
+        .expect("legacy endpoint response is bounded");
+        assert!(attempt.is_err(), "raw MCP endpoint is not a compatible shared backend");
+        drop(stream);
+        let private_handshake = legacy.await.unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&private_handshake).unwrap();
+        assert_eq!(wire["version"], crate::broker::SHARED_PROTOCOL_VERSION);
+        assert_eq!(wire["adapter"], "mcp");
+        assert!(
+            !private_handshake
+                .windows(b"initialize-marker".len())
+                .any(|w| w == b"initialize-marker"),
+            "no public initialize payload is part of the rejected private handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn supersession_closes_shared_endpoint_then_waits_for_graph_reads_before_sessions() {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            crate::WorkspaceCacheLayout::for_workspace(source.path()).root(),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        let key = SharedBackendKey::new(identity.clone());
+        let listener = bind_shared(&key).await.unwrap().unwrap();
+        let superseded = Arc::new(AtomicBool::new(false));
+        let graph_released = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (attached_tx, mut attached_rx) = tokio::sync::mpsc::channel(1);
+        let (lease, graph, shutdown_seen) =
+            (superseded.clone(), graph_released.clone(), stopped.clone());
+        let retired = CancellationToken::new();
+        let daemon = tokio::spawn(serve_shared(
+            key.clone(),
+            listener,
+            Arc::new(
+                move |_hello, _context, mut session, shutdown: CancellationToken, _retired| {
+                    let attached = attached_tx.clone();
+                    async move {
+                        let SharedSession::Mcp(stream) = &mut session else {
+                            panic!("MCP session")
+                        };
+                        attached.send(()).await.unwrap();
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {},
+                            _ = stream.read_u8() => {},
+                        }
+                        Ok(())
+                    }
+                },
+            ),
+            retired.clone(),
+            Duration::from_millis(400),
+            Duration::from_secs(60),
+            move || (lease.load(Ordering::SeqCst), graph.load(Ordering::SeqCst)),
+            move || {
+                shutdown_seen.store(true, Ordering::SeqCst);
+            },
+        ));
+        let mut client =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        client_handshake(&mut client, &Handshake { identity, adapter: AdapterKind::Mcp })
+            .await
+            .unwrap();
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, write_session_context(&mut client, &[]))
+            .await
+            .expect("test session context write is bounded")
+            .unwrap();
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, attached_rx.recv())
+            .await
+            .expect("adapter admission is bounded")
+            .expect("the session attached");
+        superseded.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match connect_endpoint(
+                    shared_backend_name(&key).unwrap(),
+                    Duration::from_millis(50),
+                )
+                .await
+                {
+                    Ok(probe) => drop(probe),
+                    Err(error) => {
+                        #[cfg(windows)]
+                        assert!(
+                            windows_pipe_busy_or_timeout(&error),
+                            "the still-connected session makes the named pipe busy: {error:?}"
+                        );
+                        #[cfg(not(windows))]
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                            ),
+                            "the superseded Unix endpoint is no longer listening: {error:?}"
+                        );
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("supersession closes endpoint while the client remains attached");
+        assert!(!daemon.is_finished(), "in-flight graph reads still own the file");
+        assert!(!stopped.load(Ordering::SeqCst));
+        assert!(!retired.is_cancelled(), "lease loss does not authorize scope rebind");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.read_u8()).await.is_err(),
+            "the session stays open until graph reads return"
+        );
+        graph_released.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), daemon).await.unwrap().unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, client.read_u8())
+                .await
+                .expect("old session closes after bounded read handover")
+                .is_err(),
+            "old session ends after read handover"
+        );
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn mixed_sessions_are_admitted_and_one_can_disconnect_independently() {
+        let source = tempfile::tempdir().unwrap();
+        let identity = SharedBackendIdentity::new(
+            source.path(),
+            crate::WorkspaceCacheLayout::for_workspace(source.path()).root(),
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        let key = SharedBackendKey::new(identity.clone());
+        let listener = bind_shared(&key).await.unwrap().unwrap();
+        let retired = CancellationToken::new();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let callback_events = events_tx.clone();
+        let server_retired = retired.clone();
+        let daemon = tokio::spawn(serve_shared(
+            key.clone(),
+            listener,
+            Arc::new(
+                move |handshake: Handshake,
+                      _context,
+                      mut session,
+                      shutdown: CancellationToken,
+                      retired: CancellationToken| {
+                    let events = callback_events.clone();
+                    async move {
+                        events.send(handshake.adapter).unwrap();
+                        match &mut session {
+                            SharedSession::Mcp(stream) => loop {
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => break,
+                                    _ = retired.cancelled() => break,
+                                    byte = stream.read_u8() => if byte.is_err() { break; },
+                                }
+                            },
+                            SharedSession::Lsp(channel) => loop {
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => break,
+                                    _ = retired.cancelled() => break,
+                                    byte = channel.io.read_u8() => match byte {
+                                        Ok(_) => { let _ = events.send(AdapterKind::Lsp); },
+                                        Err(_) => break,
+                                    },
+                                }
+                            },
+                        }
+                        Ok(())
+                    }
+                },
+            ),
+            server_retired,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            || (false, false),
+            || {},
+        ));
+
+        let mut mcp =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        client_handshake(
+            &mut mcp,
+            &Handshake { identity: identity.clone(), adapter: AdapterKind::Mcp },
+        )
+        .await
+        .unwrap();
+        write_session_context(&mut mcp, &[]).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await.unwrap(),
+            Some(AdapterKind::Mcp)
+        ));
+
+        let lsp_wire =
+            connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
+        let mut lsp_wire = lsp_wire;
+        client_handshake(&mut lsp_wire, &Handshake { identity, adapter: AdapterKind::Lsp })
+            .await
+            .unwrap();
+        write_session_context(&mut lsp_wire, &[]).await.unwrap();
+        let mut lsp = LspChannel::new(lsp_wire, || {});
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await.unwrap(),
+            Some(AdapterKind::Lsp)
+        ));
+
+        mcp.shutdown().await.unwrap();
+        lsp.io.write_all(b"still alive").await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await.unwrap(),
+            Some(AdapterKind::Lsp)
+        ));
+        assert!(!daemon.is_finished());
+
+        retired.cancel();
+        tokio::time::timeout(Duration::from_secs(5), daemon).await.unwrap().unwrap().unwrap();
+    }
 }

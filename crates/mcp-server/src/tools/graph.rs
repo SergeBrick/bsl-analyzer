@@ -558,21 +558,42 @@ mod tests {
             .with_lease(lease.clone());
         graph.ensure_first_build();
         crate::graph::test_support::wait_ready(&graph);
+        // Keep the heartbeat from observing the deliberately held OS lock as Unknown and
+        // pausing the graph pool while the request-only checkout is being measured.
+        let mut verdict = lease.hold_lifecycle_lock_for_test();
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
-        lease.invalidate_verdict_for_test();
+        *verdict = None;
 
-        let started = Instant::now();
-        let first = graph.snapshot().expect("a resident descriptor needs no lease refresh");
-        let descriptors: Vec<_> = (1..crate::graph::SNAPSHOT_POOL_CAP)
-            .map(|_| graph.snapshot().expect("published descriptor"))
-            .collect();
-        assert!(graph.snapshot().is_none());
-        assert!(started.elapsed() < Duration::from_millis(100));
+        let worker_graph = graph.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = (|| {
+                let first = worker_graph
+                    .snapshot()
+                    .ok_or("a resident descriptor needs no lease refresh")?;
+                let descriptors: Vec<_> = (1..crate::graph::SNAPSHOT_POOL_CAP)
+                    .map(|_| worker_graph.snapshot().ok_or("published descriptor"))
+                    .collect::<Result<_, _>>()?;
+                let exhausted = worker_graph.snapshot().is_none();
+                let elapsed = started.elapsed();
+                drop(first);
+                drop(descriptors);
+                Ok::<_, &'static str>((exhausted, elapsed))
+            })();
+            let _ = result_tx.send(result);
+        });
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
 
         drop(held_lease);
-        drop(first);
-        drop(descriptors);
+        drop(verdict);
+        worker.join().expect("snapshot worker did not panic");
+        let (exhausted, elapsed) = result
+            .expect("snapshot checkout did not wait on lease ownership")
+            .expect("the installed pool lends exactly its available descriptors");
+        assert!(exhausted, "all resident descriptors are checked out");
+        assert!(elapsed < Duration::from_millis(100));
         lease.release();
     }
 

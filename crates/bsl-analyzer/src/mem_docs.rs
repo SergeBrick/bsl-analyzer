@@ -87,9 +87,32 @@ impl MemDocs {
         changes: Vec<TextDocumentContentChangeEvent>,
         encoding: PositionEncoding,
     ) -> Result<()> {
+        self.apply_changes(uri, changes, encoding, None)
+    }
+
+    pub fn update_versioned(
+        &mut self,
+        uri: &Url,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        encoding: PositionEncoding,
+        version: i32,
+    ) -> Result<()> {
+        self.apply_changes(uri, changes, encoding, Some(version))
+    }
+
+    fn apply_changes(
+        &mut self,
+        uri: &Url,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        encoding: PositionEncoding,
+        version: Option<i32>,
+    ) -> Result<()> {
         let mut docs = self.docs.write();
 
         if let Some(data) = docs.get_mut(uri) {
+            if version.is_some_and(|version| version <= data.version) {
+                anyhow::bail!("document version did not advance");
+            }
             // The batch lands whole or not at all: on an error the caller leaves
             // the VFS untouched, so a half-applied batch would split the two.
             let mut text = data.text.clone();
@@ -108,7 +131,7 @@ impl MemDocs {
             }
             data.text = text;
             data.line_index = line_index;
-            data.version += 1;
+            data.version = version.unwrap_or_else(|| data.version + 1);
             data.identity = self.next_identity.fetch_add(1, Ordering::Relaxed) + 1;
         } else {
             tracing::warn!("Attempted to update non-existent document: {}", uri);
@@ -211,6 +234,37 @@ mod tests {
         assert_eq!(mem_docs.get(&uri), Some(text));
         assert_eq!(mem_docs.get_version(&uri), Some(1));
         assert!(mem_docs.contains(&uri));
+    }
+
+    #[test]
+    fn wire_versions_may_skip_and_rejected_edits_preserve_text_and_version() {
+        let mut docs = MemDocs::new();
+        let uri = crate::test_uri::file_uri("version.bsl");
+        docs.insert(uri.clone(), "old".into(), 17);
+        let edit = |text: &str| TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.into(),
+        };
+        docs.update_versioned(&uri, vec![edit("new")], PositionEncoding::Utf16, 42).unwrap();
+        let identity = docs.identity(&uri);
+        assert_eq!(docs.get_version(&uri), Some(42));
+        assert_eq!(docs.freeze().get(&uri).unwrap().version(), 42);
+        assert!(docs
+            .update_versioned(&uri, vec![edit("stale")], PositionEncoding::Utf16, 41)
+            .is_err());
+        let invalid = TextDocumentContentChangeEvent {
+            range: Some(lsp_types::Range::new(
+                lsp_types::Position::new(0, 99),
+                lsp_types::Position::new(0, 100),
+            )),
+            range_length: None,
+            text: "invalid".into(),
+        };
+        assert!(docs.update_versioned(&uri, vec![invalid], PositionEncoding::Utf16, 50).is_err());
+        assert_eq!(docs.get(&uri).as_deref(), Some("new"));
+        assert_eq!(docs.get_version(&uri), Some(42));
+        assert_eq!(docs.identity(&uri), identity);
     }
 
     #[test]

@@ -16,7 +16,8 @@ use interprocess::local_socket::tokio::Stream as TokioStream;
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
-use crate::broker::name::{backend_name, BackendKey};
+use crate::broker::name::{backend_name, shared_backend_name, BackendKey, SharedBackendKey};
+use crate::broker::transport::{connect_endpoint, HANDSHAKE_TIMEOUT};
 
 /// Upper bound on waiting for a backend to become reachable. The backend binds
 /// before its heavy build, so this only needs to cover process startup — but we
@@ -80,6 +81,28 @@ pub async fn connect_required(key: BackendKey, expected_pid: u32) -> anyhow::Res
     relay_stdio(stream).await
 }
 
+/// Connect to the shared LSP/MCP backend, launching it if absent, after the existing
+/// platform peer-trust checks. The caller performs the private protocol handshake next.
+pub async fn connect_or_launch_stream(
+    key: SharedBackendKey,
+    daemon_cmd: Command,
+) -> anyhow::Result<TokioStream> {
+    connect_with_launch(&key, daemon_cmd).await
+}
+
+/// Connect to the exact supervised shared backend process without launching a fallback.
+pub async fn connect_required_stream(
+    key: &SharedBackendKey,
+    expected_pid: u32,
+) -> anyhow::Result<TokioStream> {
+    connect_existing_key(key, expected_pid).await
+}
+
+/// Relay stdio over an already connected and verified broker stream.
+pub async fn relay_stream(stream: TokioStream) -> anyhow::Result<()> {
+    relay(tokio::io::stdin(), tokio::io::stdout(), stream).await
+}
+
 /// Connection half of [`connect_required`], split out so the identity check can be exercised
 /// without the stdio relay. Crate-private: the transport's contract is the whole operation, and
 /// a raw stream handed to a caller would let it skip the relay the mode exists to guarantee.
@@ -88,7 +111,44 @@ pub(crate) async fn connect_existing(
     key: &BackendKey,
     expected_pid: u32,
 ) -> anyhow::Result<TokioStream> {
-    let stream = TokioStream::connect(backend_name(key)?)
+    connect_existing_key(key, expected_pid).await
+}
+
+trait EndpointKey {
+    fn endpoint_name(&self) -> std::io::Result<interprocess::local_socket::Name<'static>>;
+    fn log_path(&self) -> std::io::Result<std::path::PathBuf>;
+    fn digest(&self) -> String;
+}
+
+impl EndpointKey for BackendKey {
+    fn endpoint_name(&self) -> std::io::Result<interprocess::local_socket::Name<'static>> {
+        backend_name(self)
+    }
+    fn log_path(&self) -> std::io::Result<std::path::PathBuf> {
+        self.runtime_log_path()
+    }
+    fn digest(&self) -> String {
+        BackendKey::digest(self)
+    }
+}
+
+impl EndpointKey for SharedBackendKey {
+    fn endpoint_name(&self) -> std::io::Result<interprocess::local_socket::Name<'static>> {
+        shared_backend_name(self)
+    }
+    fn log_path(&self) -> std::io::Result<std::path::PathBuf> {
+        self.runtime_log_path()
+    }
+    fn digest(&self) -> String {
+        SharedBackendKey::digest(self)
+    }
+}
+
+async fn connect_existing_key<K: EndpointKey>(
+    key: &K,
+    expected_pid: u32,
+) -> anyhow::Result<TokioStream> {
+    let stream = connect_endpoint(key.endpoint_name()?, HANDSHAKE_TIMEOUT)
         .await
         .map_err(|error| anyhow::anyhow!("required broker backend is unavailable: {error}"))?;
     // Naming the owner is what tells a supervisor which of two different things happened: its
@@ -117,10 +177,12 @@ pub(crate) async fn connect_existing(
     Ok(stream)
 }
 
-async fn connect_with_launch(
-    key: &BackendKey,
+async fn connect_with_launch<K: EndpointKey>(
+    key: &K,
     mut daemon_cmd: Command,
 ) -> anyhow::Result<TokioStream> {
+    let deadline = Instant::now() + LAUNCH_TIMEOUT;
+    let initial_budget = deadline.saturating_duration_since(Instant::now()).min(HANDSHAKE_TIMEOUT);
     // Initial direct connect.
     //
     // On Unix the per-user runtime dir is the trust boundary (mode 0700, owner
@@ -133,14 +195,29 @@ async fn connect_with_launch(
     // loop below. A trusted already-running backend is reused; an unverified
     // pipe is dropped and we fall through to launch + verify our own child.
     #[cfg(unix)]
-    if let Ok(stream) = TokioStream::connect(backend_name(key)?).await {
-        return Ok(stream);
+    {
+        if !initial_budget.is_zero() {
+            if let Ok(stream) = connect_endpoint(key.endpoint_name()?, initial_budget).await {
+                return Ok(stream);
+            }
+        }
     }
     #[cfg(windows)]
-    if let Ok(stream) = TokioStream::connect(backend_name(key)?).await {
-        if let Some(trusted) = verify_or_drop_peer(stream) {
-            return Ok(trusted);
+    {
+        if !initial_budget.is_zero() {
+            if let Ok(stream) = connect_endpoint(key.endpoint_name()?, initial_budget).await {
+                if let Some(trusted) = verify_or_drop_peer(stream) {
+                    return Ok(trusted);
+                }
+            }
         }
+    }
+
+    if Instant::now() >= deadline {
+        return Err(anyhow::anyhow!(
+            "broker backend did not become reachable within {}s: connect budget expired",
+            LAUNCH_TIMEOUT.as_secs()
+        ));
     }
 
     // No backend yet: launch one detached, then poll-connect. If the backend never
@@ -149,23 +226,31 @@ async fn connect_with_launch(
     let mut children: Vec<Child> = Vec::new();
     children.push(spawn_detached(key, &mut daemon_cmd)?);
 
-    let deadline = Instant::now() + LAUNCH_TIMEOUT;
     let mut next_respawn = Instant::now() + RESPAWN_INTERVAL;
     let mut delay = Duration::from_millis(25);
     loop {
-        let last_err = match TokioStream::connect(backend_name(key)?).await {
-            Ok(stream) => {
-                if let Some(trusted) = verify_or_drop_peer(stream) {
-                    reap(&mut children);
-                    return Ok(trusted);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            reap(&mut children);
+            return Err(anyhow::anyhow!(
+                "broker backend did not become reachable within {}s: connect budget expired",
+                LAUNCH_TIMEOUT.as_secs()
+            ));
+        }
+        let last_err =
+            match connect_endpoint(key.endpoint_name()?, remaining.min(HANDSHAKE_TIMEOUT)).await {
+                Ok(stream) => {
+                    if let Some(trusted) = verify_or_drop_peer(stream) {
+                        reap(&mut children);
+                        return Ok(trusted);
+                    }
+                    // Windows: the pre-existing pipe did not pass the trust gate.
+                    // Keep polling — our own launched backend may win the bind on a
+                    // later attempt; surface the last real connect error on timeout.
+                    None
                 }
-                // Windows: the pre-existing pipe did not pass the trust gate.
-                // Keep polling — our own launched backend may win the bind on a
-                // later attempt; surface the last real connect error on timeout.
-                None
-            }
-            Err(e) => Some(e),
-        };
+                Err(e) => Some(e),
+            };
         if Instant::now() >= deadline {
             reap(&mut children);
             let detail = last_err
@@ -181,7 +266,7 @@ async fn connect_with_launch(
             children.push(spawn_detached(key, &mut daemon_cmd)?);
             next_respawn = Instant::now() + RESPAWN_INTERVAL;
         }
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(delay.min(deadline.saturating_duration_since(Instant::now()))).await;
         delay = (delay * 2).min(Duration::from_millis(500));
     }
 }
@@ -299,8 +384,8 @@ where
 /// detached, new-group process (windows), with stdin closed and stdout+stderr
 /// redirected to a per-backend log file in the runtime dir. Returns the child
 /// handle so a fast-exiting race loser can be reaped.
-fn spawn_detached(key: &BackendKey, cmd: &mut Command) -> anyhow::Result<Child> {
-    let log_path = key.runtime_log_path()?;
+fn spawn_detached<K: EndpointKey>(key: &K, cmd: &mut Command) -> anyhow::Result<Child> {
+    let log_path = key.log_path()?;
     // Bound the per-backend log instead of appending forever: roll it over when it
     // passes the cap. A concurrent race-loser's truncate is harmless — losers exit
     // immediately and write next to nothing.
@@ -356,7 +441,7 @@ mod tests {
     }
 
     async fn connect(key: &BackendKey) -> std::io::Result<TokioStream> {
-        TokioStream::connect(backend_name(key)?).await
+        connect_endpoint(backend_name(key)?, HANDSHAKE_TIMEOUT).await
     }
 
     #[tokio::test]

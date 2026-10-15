@@ -386,6 +386,41 @@ impl SyntaxKind {
         )
     }
 
+    /// Аннотация — директива компиляции (`&НаКлиенте`, `&НаСервере`, …).
+    ///
+    /// Подмножество `is_annotation`: директива задаёт контекст исполнения
+    /// метода, а аннотации расширений (`&Перед`, `&После`, `&Вместо`,
+    /// `&ИзменениеИКонтроль`) и пользовательские аннотации — нет.
+    pub fn is_compilation_directive(self) -> bool {
+        matches!(
+            self,
+            SyntaxKind::ANN_AT_CLIENT
+                | SyntaxKind::ANN_AT_SERVER
+                | SyntaxKind::ANN_AT_SERVER_NO_CONTEXT
+                | SyntaxKind::ANN_AT_CLIENT_AT_SERVER_NO_CONTEXT
+                | SyntaxKind::ANN_AT_CLIENT_AT_SERVER
+        )
+    }
+
+    /// Ключевое слово объявления: заголовок и конец метода, объявление
+    /// переменной, параметр по значению, признак экспорта и асинхронности.
+    ///
+    /// Подмножество `is_keyword`; остальные ключевые слова управляют
+    /// исполнением (`Если`, `Цикл`, `Возврат`, …) или строят выражения.
+    pub fn is_declaration_keyword(self) -> bool {
+        matches!(
+            self,
+            SyntaxKind::KW_PROCEDURE
+                | SyntaxKind::KW_END_PROCEDURE
+                | SyntaxKind::KW_FUNCTION
+                | SyntaxKind::KW_END_FUNCTION
+                | SyntaxKind::KW_EXPORT
+                | SyntaxKind::KW_VAL
+                | SyntaxKind::KW_VAR
+                | SyntaxKind::KW_ASYNC
+        )
+    }
+
     pub fn is_operator(self) -> bool {
         matches!(
             self,

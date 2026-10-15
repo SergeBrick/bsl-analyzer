@@ -121,21 +121,21 @@ fn module_shape_token_stream() {
         code,
         expect![[r##"
             0..15 Preprocessor "#Область"
-            35..45 Keyword "Перем"
+            35..45 Keyword [DECLARATION] "Перем"
             46..84 Variable [EXPORT+DECLARATION] "МодульнаяПеременная"
-            85..99 Keyword "Экспорт"
+            85..99 Keyword [DECLARATION] "Экспорт"
             101..122 Comment "// модульная"
-            123..133 Keyword "Перем"
+            123..133 Keyword [DECLARATION] "Перем"
             134..170 Variable [DECLARATION] "ЛокальнаяМодульная"
-            173..192 Annotation "&НаСервере"
-            193..211 Keyword "Процедура"
+            173..192 CompilerDirective "&НаСервере"
+            193..211 Keyword [DECLARATION] "Процедура"
             212..232 Procedure [EXPORT+DEFINITION] "Обработать"
             233..250 Parameter [DECLARATION] "Параметр1"
             252..269 Parameter [DECLARATION] "Параметр2"
             270..271 Operator "="
             272..274 NumberLiteral "10"
-            276..290 Keyword "Экспорт"
-            295..305 Keyword "Перем"
+            276..290 Keyword [DECLARATION] "Экспорт"
+            295..305 Keyword [DECLARATION] "Перем"
             306..316 Variable [DECLARATION] "Явная"
             322..332 Variable "Явная"
             333..334 Operator "="
@@ -154,8 +154,8 @@ fn module_shape_token_stream() {
             519..520 NumberLiteral "2"
             527..543 BuiltinFunction [EXPORT] "Сообщить"
             544..558 StringLiteral "\"готово\""
-            561..589 Keyword "КонецПроцедуры"
-            591..605 Keyword "Функция"
+            561..589 Keyword [DECLARATION] "КонецПроцедуры"
+            591..605 Keyword [DECLARATION] "Функция"
             606..624 Function [DEFINITION] "Вычислить"
             631..640 Preprocessor "#Если"
             654..664 Keyword "Тогда"
@@ -165,7 +165,7 @@ fn module_shape_token_stream() {
             718..732 Keyword "Возврат"
             733..741 BooleanLiteral "Ложь"
             747..766 Preprocessor "#КонецЕсли"
-            767..791 Keyword "КонецФункции"
+            767..791 Keyword [DECLARATION] "КонецФункции"
             792..817 Preprocessor "#КонецОбласти"
             819..855 Variable "ЛокальнаяМодульная"
             856..857 Operator "="
@@ -189,7 +189,7 @@ fn mdo_and_typed_member_token_stream() {
     check_token_stream_with_config(
         code,
         expect![[r#"
-            0..18 Keyword "Процедура"
+            0..18 Keyword [DECLARATION] "Процедура"
             19..27 Procedure [DEFINITION] "Тест"
             28..44 Parameter [DECLARATION] "Значение"
             50..74 Variable [DECLARATION] "НаборЗаписей"
@@ -206,7 +206,7 @@ fn mdo_and_typed_member_token_stream() {
             334..344 Keyword "Новый"
             382..406 Variable "НаборЗаписей"
             407..423 Function [EXPORT] "Записать"
-            427..455 Keyword "КонецПроцедуры"
+            427..455 Keyword [DECLARATION] "КонецПроцедуры"
         "#]],
     );
 }
@@ -232,7 +232,7 @@ fn sdbl_query_token_stream() {
     check_token_stream(
         code,
         expect![[r#"
-            0..14 Keyword "Функция"
+            0..14 Keyword [DECLARATION] "Функция"
             15..29 Function [DEFINITION] "Выбрать"
             30..44 Parameter [DECLARATION] "Партнер"
             50..62 Variable [DECLARATION] "Запрос"
@@ -263,7 +263,7 @@ fn sdbl_query_token_stream() {
             454..476 Property "Регистратор"
             483..497 Keyword "Возврат"
             498..510 Variable "Запрос"
-            512..536 Keyword "КонецФункции"
+            512..536 Keyword [DECLARATION] "КонецФункции"
         "#]],
     );
 }
@@ -281,10 +281,10 @@ fn documentation_token_stream() {
             23..26 Comment " - "
             26..32 Type [DOCUMENTATION] "String"
             32..39 Comment " - text"
-            40..49 Keyword "Procedure"
+            40..49 Keyword [DECLARATION] "Procedure"
             50..54 Procedure [DEFINITION] "Test"
             55..60 Parameter [DECLARATION] "Value"
-            62..74 Keyword "EndProcedure"
+            62..74 Keyword [DECLARATION] "EndProcedure"
         "#]],
     );
 }

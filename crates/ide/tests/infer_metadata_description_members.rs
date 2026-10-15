@@ -293,3 +293,156 @@ fn a_loop_variable_written_in_its_body_stays_soft() {
     );
     assert!(found.is_empty(), "{found:?}");
 }
+
+#[test]
+fn a_loop_over_a_local_collection_of_two_kinds_stays_soft() {
+    // `Коллекция` holds catalogs on one path and documents on the other; the walk types it by
+    // the documents written last, yet `Иерархический` is valid on the catalog path.
+    let found = unresolved_fields(
+        r#"Процедура Тест(Условие)
+    Коллекция = Метаданные.Справочники;
+    Если Условие Тогда
+        Коллекция = Метаданные.Документы;
+    КонецЕсли;
+    Для Каждого Элемент Из Коллекция Цикл
+        Иер = Элемент.Иерархический;
+    КонецЦикла;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_chain_through_a_local_collection_of_two_shapes_stays_soft() {
+    let found = unresolved_fields(
+        r#"Процедура Тест(Условие)
+    Если Условие Тогда
+        Коллекция = Новый Структура("Справочник1", Новый Структура("Нет", 1));
+    Иначе
+        Коллекция = Метаданные.Справочники;
+    КонецЕсли;
+    Х = Коллекция.Справочник1.Нет;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_description_copied_from_a_local_of_two_shapes_stays_soft() {
+    let found = unresolved_fields(
+        r#"Процедура Тест(Условие)
+    Если Условие Тогда
+        Коллекция = Новый Структура("Справочник1", Новый Структура("Нет", 1));
+    Иначе
+        Коллекция = Метаданные.Справочники;
+    КонецЕсли;
+    Описание = Коллекция.Справочник1;
+    Х = Описание.Нет;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_local_passed_by_reference_stays_soft() {
+    // A parameter without `Знач` is passed by reference: the callee may have replaced the
+    // description with one that has the member.
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Описание = Метаданные.Справочники.Справочник1;
+    Заполнить(Описание);
+    Изм = Описание.Измерения;
+КонецПроцедуры
+
+Процедура Заполнить(Парам)
+    Парам = Метаданные.РегистрыСведений.РегистрСведений1;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_local_rewritten_by_execute_stays_soft() {
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Описание = Метаданные.Справочники.Справочник1;
+    Выполнить("Описание = Метаданные.РегистрыСведений.РегистрСведений1");
+    Изм = Описание.Измерения;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_write_overwritten_later_in_a_try_body_reaches_the_code_after_it() {
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Описание = Метаданные.РегистрыСведений.РегистрСведений1;
+    Попытка
+        Описание = Метаданные.Справочники.Справочник1;
+        Х = 1 / 0;
+        Описание = Метаданные.РегистрыСведений.РегистрСведений1;
+    Исключение
+    КонецПопытки;
+    Есть = Описание.Иерархический;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_write_interrupted_in_a_try_body_reaches_the_handler() {
+    // The handler is entered after the catalog write and before the register one.
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Описание = Метаданные.РегистрыСведений.РегистрСведений1;
+    Попытка
+        Описание = Метаданные.Справочники.Справочник1;
+        Х = 1 / 0;
+        Описание = Метаданные.РегистрыСведений.РегистрСведений1;
+    Исключение
+        Есть = Описание.Иерархический;
+    КонецПопытки;
+КонецПроцедуры
+"#,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_write_inside_a_try_body_is_checked_within_it() {
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Попытка
+        Описание = Метаданные.Справочники.Справочник1;
+        Нет = Описание.Измерения;
+    Исключение
+    КонецПопытки;
+КонецПроцедуры
+"#,
+    );
+    assert_eq!(found, vec!["Измерения".to_string()]);
+}
+
+#[test]
+fn a_loop_over_a_local_collection_of_one_kind_is_checked() {
+    let found = unresolved_fields(
+        r#"Процедура Тест()
+    Коллекция = Метаданные.Справочники;
+    Для Каждого Элемент Из Коллекция Цикл
+        Есть = Элемент.Иерархический;
+        Нет = Элемент.Измерения;
+    КонецЦикла;
+    Описание = Коллекция.Справочник1;
+    ТожеНет = Описание.Измерения;
+КонецПроцедуры
+"#,
+    );
+    assert_eq!(found, vec!["Измерения".to_string(), "Измерения".to_string()]);
+}

@@ -295,7 +295,7 @@ fn lookup_metadata_object_collection_member(
     })
 }
 
-fn is_configuration_metadata_root(db: &dyn TypeKernelDb, receiver: TypeId) -> bool {
+pub(crate) fn is_configuration_metadata_root(db: &dyn TypeKernelDb, receiver: TypeId) -> bool {
     let TypeKind::PlatformObject(facet) = db.lookup_type(receiver) else {
         return false;
     };

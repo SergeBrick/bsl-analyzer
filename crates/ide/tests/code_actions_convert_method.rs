@@ -209,8 +209,11 @@ fn incomplete_method_is_not_offered() {
 
 #[test]
 fn function_called_from_a_string_is_not_offered() {
-    for call in ["Итог = Вычислить(\"Проверить()\");", "Выполнить(\"Итог = Проверить ();\");"]
-    {
+    for call in [
+        "Итог = Вычислить(\"Проверить()\");",
+        "Выполнить(\"Итог = Проверить ();\");",
+        "Итог = Вычислить(\"Проверить\" + \"()\");",
+    ] {
         let code = with_caller(call);
         assert!(
             assists_at(&code, "Проверить()\n    А").is_empty(),
@@ -218,8 +221,8 @@ fn function_called_from_a_string_is_not_offered() {
         );
     }
 
-    // Control: the name in a string that does not call it — a notification handler name.
-    let code = with_caller("Оповещение = Новый ОписаниеОповещения(\"Проверить\", ЭтотОбъект);");
+    // Control: a string holding the name only as a part of a longer word.
+    let code = with_caller("Итог = Вычислить(\"ПроверитьВсё()\");");
     assert_eq!(assists_at(&code, "Проверить()\n    А").len(), 1);
 }
 
@@ -274,4 +277,22 @@ fn method_an_extension_intercepts_is_not_offered() {
     let analysis = with_extension(base, extension);
     assert_eq!(assists_in(&analysis, EXTENSION, extension, "Расш_Свой").len(), 1);
     assert_eq!(assists_in(&analysis, BASE, base, "Записать()").len(), 1);
+}
+
+#[test]
+fn interceptor_inside_a_preprocessor_branch_still_binds_the_method() {
+    let base = "Процедура Записать() Экспорт\n    А = 1;\nКонецПроцедуры\n";
+    for branch in
+        ["#Если Сервер Тогда\n{}#КонецЕсли\n", "#Если Клиент Тогда\n#Иначе\n{}#КонецЕсли\n"]
+    {
+        let extension = branch.replace(
+            "{}",
+            "&Вместо(\"Записать\")\nПроцедура Расш_Записать()\n    А = 2;\nКонецПроцедуры\n",
+        );
+        let analysis = with_extension(base, &extension);
+        assert!(
+            assists_in(&analysis, BASE, base, "Записать()").is_empty(),
+            "offered although an interceptor in `{branch}` binds it"
+        );
+    }
 }

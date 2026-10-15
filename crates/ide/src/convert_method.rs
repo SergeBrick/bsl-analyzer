@@ -17,7 +17,7 @@ use crate::references::find_references_in_file;
 /// The reverse is offered only when nothing depends on the function returning a value:
 /// it has no `Возврат <выражение>` (a procedure does not compile one), no call in the
 /// module uses its result (a procedure call is not an expression), no string in the module
-/// calls it (`Вычислить("Имя()")`), and it is not `Экспорт` — callers in other modules are
+/// names it (`Вычислить("Имя()")`), and it is not `Экспорт` — callers in other modules are
 /// not searched here, so an exported function is never converted.
 ///
 /// Neither direction is offered for a method an extension binds by name, nor for an
@@ -101,9 +101,11 @@ fn bound_by_extension<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Synta
     let name = name.text().to_lowercase();
     let source_root = db.file_source_root_input(file_id).source_root_id(db);
     db.module_index(source_root).sibling_bodies(file_id).into_iter().any(|sibling| {
+        // A method under `#Если` is a descendant of the directive, not a child of the file.
         db.parse(sibling)
             .syntax_node()
-            .children()
+            .descendants()
+            .filter(|n| matches!(n.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF))
             .filter_map(|other| extension_target(&other))
             .any(|target| target.to_lowercase() == name)
     })
@@ -151,21 +153,22 @@ fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Syn
 }
 
 /// `Вычислить("Имя()")` and `Выполнить("Х = Имя();")` call the method from a string, which
-/// no reference search sees. The name followed by `(` in any string literal counts as a call
-/// reading the result; the bare name, as a notification handler takes it, does not call it.
+/// no reference search sees. A call may also be assembled from pieces
+/// (`Вычислить("Имя" + "()")`), so the name as a whole word in any string literal counts as
+/// a call reading the result.
 fn called_from_a_string(root: &SyntaxNode, name: &str) -> bool {
     let name = name.to_lowercase();
     root.descendants_with_tokens()
         .filter_map(|element| element.into_token())
         .filter(|token| token.kind().is_string_literal())
-        .any(|token| calls_by_name(&token.text().to_lowercase(), &name))
+        .any(|token| holds_word(&token.text().to_lowercase(), &name))
 }
 
-fn calls_by_name(text: &str, name: &str) -> bool {
+fn holds_word(text: &str, word: &str) -> bool {
     let is_name_char = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices(name).any(|(at, _)| {
+    text.match_indices(word).any(|(at, _)| {
         !text[..at].chars().next_back().is_some_and(is_name_char)
-            && text[at + name.len()..].trim_start().starts_with('(')
+            && !text[at + word.len()..].chars().next().is_some_and(is_name_char)
     })
 }
 

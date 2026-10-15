@@ -15,10 +15,11 @@ use crate::references::find_references_in_file;
 /// added: a function that never returns a value is valid and returns `Неопределено`.
 ///
 /// The reverse is offered only when nothing depends on the function returning a value:
-/// it has no `Возврат <выражение>` (a procedure does not compile one), no call in the
-/// module uses its result (a procedure call is not an expression), the module runs no
-/// dynamic code (`Вычислить`, `Выполнить`), and it is not `Экспорт` — callers in other modules are
-/// not searched here, so an exported function is never converted.
+/// it has no `Возврат <выражение>` (a procedure does not compile one), no call in any body
+/// of the module — the configuration's or an extension's — uses its result (a procedure
+/// call is not an expression), those bodies run no dynamic code (`Вычислить`,
+/// `Выполнить`), and it is not `Экспорт` — callers in other modules are not searched here,
+/// so an exported function is never converted.
 ///
 /// Neither direction is offered for a method an extension binds by name, nor for an
 /// extension's interceptor itself: see [`bound_by_extension`].
@@ -99,16 +100,23 @@ fn bound_by_extension<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Synta
         return false;
     };
     let name = name.text().to_lowercase();
-    let source_root = db.file_source_root_input(file_id).source_root_id(db);
-    db.module_index(source_root).sibling_bodies(file_id).into_iter().any(|sibling| {
+    sibling_roots(db, file_id).iter().any(|root| {
         // A method under `#Если` is a descendant of the directive, not a child of the file.
-        db.parse(sibling)
-            .syntax_node()
-            .descendants()
+        root.descendants()
             .filter(|n| matches!(n.kind(), SyntaxKind::PROCEDURE_DEF | SyntaxKind::FUNCTION_DEF))
             .filter_map(|other| extension_target(&other))
             .any(|target| target.to_lowercase() == name)
     })
+}
+
+/// The other bodies of this module: the configuration's and those of its extensions.
+fn sibling_roots<DB: RootDatabase>(db: &DB, file_id: FileId) -> Vec<SyntaxNode> {
+    let source_root = db.file_source_root_input(file_id).source_root_id(db);
+    db.module_index(source_root)
+        .sibling_bodies(file_id)
+        .into_iter()
+        .map(|sibling| db.parse(sibling).syntax_node())
+        .collect()
 }
 
 /// The base method an extension method intercepts or changes, by name.
@@ -142,20 +150,35 @@ fn may_become_procedure<DB: RootDatabase>(db: &DB, file_id: FileId, method: &Syn
     if runs_dynamic_code(&root) {
         return false;
     }
-    find_references_in_file(db, file_id, &symbol)
+    let read_here = find_references_in_file(db, file_id, &symbol)
         .into_iter()
         .filter(|reference| reference.range != name.text_range())
-        .all(|reference| {
-            root.token_at_offset(reference.range.start())
+        .any(|reference| {
+            !root
+                .token_at_offset(reference.range.start())
                 .right_biased()
                 .is_some_and(|token| is_call_statement(&token))
-        })
+        });
+    // An extension body resolves the base module's methods, `Экспорт` or not, so its calls
+    // are callers too. They are matched by name: a same-named method of that body shadowing
+    // this one only keeps the function as it is.
+    !read_here
+        && sibling_roots(db, file_id)
+            .iter()
+            .all(|sibling| !runs_dynamic_code(sibling) && !reads_by_name(sibling, name.text()))
+}
+
+fn reads_by_name(root: &SyntaxNode, name: &str) -> bool {
+    let name = name.to_lowercase();
+    root.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| token.kind().is_name_token() && token.text().to_lowercase() == name)
+        .any(|token| !is_call_statement(&token))
 }
 
 /// `Выполнить` and `Вычислить` run text that is known only at run time, however it is
 /// assembled, and it may call the function and read its result. A function without
-/// `Экспорт` is reachable from no other module, so dynamic code in this module is the only
-/// such caller.
+/// `Экспорт` is reachable only from the bodies of its own module.
 fn runs_dynamic_code(root: &SyntaxNode) -> bool {
     root.descendants().any(|node| match node.kind() {
         SyntaxKind::EXECUTE_STMT => true,

@@ -307,3 +307,27 @@ fn interceptor_inside_a_preprocessor_branch_still_binds_the_method() {
         );
     }
 }
+
+#[test]
+fn function_an_extension_body_reads_is_not_offered() {
+    // A method of the extension body resolves the base module's methods, `Экспорт` or not.
+    let base = "Функция Проверить()\n    А = 1;\nКонецФункции\n";
+    for body in [
+        "    Значение = Проверить();\n",
+        "    Если ПРОВЕРИТЬ() Тогда\n    КонецЕсли;\n",
+        "    Итог = Вычислить(Текст);\n",
+        "    Выполнить Текст;\n",
+    ] {
+        let extension = format!("Процедура Расш_Свой()\n{body}КонецПроцедуры\n");
+        let analysis = with_extension(base, &extension);
+        assert!(
+            assists_in(&analysis, BASE, base, "Проверить()").is_empty(),
+            "offered although the extension body has `{body}`"
+        );
+    }
+
+    // Control: the extension body calls it as a statement.
+    let extension = "Процедура Расш_Свой()\n    Проверить();\nКонецПроцедуры\n";
+    let analysis = with_extension(base, extension);
+    assert_eq!(assists_in(&analysis, BASE, base, "Проверить()").len(), 1);
+}

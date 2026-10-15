@@ -21,8 +21,10 @@ pub(crate) const AUTO_DAEMON_ENV: &str = "BSL_SHARED_AUTO_DAEMON";
 /// and therefore never perform network or corpus I/O.
 pub(crate) fn prepare_platform_identity(source: &Path) -> Result<()> {
     let project = mcp_server::project::at(source)?;
-    let request = platform_help::requested_source(Some(&project.config), source)
-        .map_err(anyhow::Error::msg)?;
+    // An invalid selection serves no help (see `platform_help::bootstrap`): nothing to prime.
+    let Ok(request) = platform_help::requested_source(Some(&project.config), source) else {
+        return Ok(());
+    };
     if let bsl_platform::PlatformHelpRequest::ExternalUrl(url) = request {
         let context = platform_help::LoadContext::from_environment();
         if platform_help::external::snapshot_fingerprint(&url, &context).is_none() {
@@ -53,9 +55,11 @@ pub(crate) fn identity(
     config_hash.update(
         &mcp_server::broker::embedding_config_fingerprint_with_prefixes(&embedding).to_le_bytes(),
     );
-    let help = platform_help::requested_source(Some(config), source).map_err(anyhow::Error::msg)?;
     let mut platform_hash = blake3::Hasher::new();
-    fingerprint_platform_source(&mut platform_hash, &help);
+    fingerprint_requested_platform_source(
+        &mut platform_hash,
+        platform_help::requested_source(Some(config), source),
+    );
     let platform = platform_hash.finalize();
     let stamp = cache.scope_stamp();
     let scope =
@@ -104,6 +108,22 @@ fn safe_config_fingerprint(config: &project_model::ProjectConfig) -> Vec<u8> {
         "analysis": format!("{:?}", config.analysis),
     });
     serde_json::to_vec(&safe).expect("safe config fingerprint serializes")
+}
+
+/// A selection the process cannot read is served as missing help rather than failing the
+/// server (see `platform_help::bootstrap`), so it is an identity of its own, named by why
+/// it was refused.
+fn fingerprint_requested_platform_source(
+    hasher: &mut blake3::Hasher,
+    request: Result<bsl_platform::PlatformHelpRequest, String>,
+) {
+    match request {
+        Ok(request) => fingerprint_platform_source(hasher, &request),
+        Err(reason) => {
+            hasher.update(b"invalid\0");
+            hasher.update(reason.as_bytes());
+        }
+    }
 }
 
 fn fingerprint_platform_source(
@@ -691,6 +711,21 @@ mod tests {
             SharedBackendKey::new(second).digest(),
             "effective project config must fork the daemon rendezvous key",
         );
+    }
+
+    /// A server started without the broker serves an invalid help selection as missing
+    /// help; the broker path must not refuse to start over the same selection.
+    #[test]
+    fn an_invalid_help_selection_is_an_identity_not_a_failure() {
+        let fingerprint = |request| {
+            let mut hasher = blake3::Hasher::new();
+            fingerprint_requested_platform_source(&mut hasher, request);
+            hasher.finalize()
+        };
+        let invalid = fingerprint(Err("the value looks like a URL but was not parsed".to_owned()));
+
+        assert_ne!(invalid, fingerprint(Ok(bsl_platform::PlatformHelpRequest::None)));
+        assert_ne!(invalid, fingerprint(Err("another reason".to_owned())));
     }
 
     #[test]

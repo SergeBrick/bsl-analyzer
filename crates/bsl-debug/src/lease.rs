@@ -47,7 +47,11 @@ impl Lease {
             return name;
         }
         let suffix = format!("_{:016x}.lease", fnv64(name.as_bytes()));
-        let keep = NAME_MAX - suffix.len();
+        let mut keep = NAME_MAX - suffix.len();
+        // Lowercase non-ASCII letters stay as UTF-8, so a byte index can fall inside one.
+        while !name.is_char_boundary(keep) {
+            keep -= 1;
+        }
         format!("{}{suffix}", &name[..keep])
     }
 
@@ -259,6 +263,9 @@ mod tests {
         assert!(cyr.len() <= 255, "{cyr} is {} bytes", cyr.len());
         assert_ne!(upper, cyr);
         assert_ne!(upper, Lease::file_name("localhost", 1550, &"A".repeat(81)));
+        let lower = Lease::file_name("localhost", 1550, &"и".repeat(130));
+        assert!(lower.len() <= 255, "{lower} is {} bytes", lower.len());
+        assert_ne!(lower, Lease::file_name("localhost", 1550, &"и".repeat(131)));
 
         let dir = tempfile::tempdir().unwrap();
         assert!(Lease::acquire(dir.path(), &upper, "id-1").unwrap().is_some());

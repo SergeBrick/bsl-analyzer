@@ -42,9 +42,9 @@ pub struct DebugSession {
     last_stop: Option<StopEvent>,
     watches: Vec<String>,
     pending_eval_results: HashMap<String, Vec<u8>>,
-    /// Result ids whose wait already ended. A late answer for one of them is not a result anyone
-    /// is still reading, and keeping the ping body would only grow.
-    abandoned_evals: Vec<String>,
+    /// The evaluation whose answer is being waited for. A result for any other id, including one
+    /// whose wait already ended, is not stored: nothing would ever remove it.
+    waiting_eval: Option<String>,
     /// Refusals of requests the event handler makes on its own. They are not stops, so they must
     /// not abort `wait_for_stop`; the caller still has to hear about them.
     runtime_warnings: Vec<String>,
@@ -296,7 +296,7 @@ impl DebugSession {
             last_stop: None,
             watches: Vec::new(),
             pending_eval_results: HashMap::new(),
-            abandoned_evals: Vec::new(),
+            waiting_eval: None,
             runtime_warnings: Vec::new(),
             known_targets: Vec::new(),
             setup_warnings,
@@ -933,20 +933,33 @@ impl DebugSession {
         result_id: &str,
     ) -> Result<EvalPayload, ClientError> {
         if payload.values.is_empty() && payload.error.is_none() {
-            self.wait_for_eval_result(result_id, Duration::from_secs(5)).ok_or_else(|| {
-                ClientError::EvalFailed("the debug server returned no result within 5 s".into())
-            })
+            self.wait_for_eval_result(result_id, Duration::from_secs(5))
         } else {
             Ok(payload)
         }
     }
 
-    fn wait_for_eval_result(&mut self, result_id: &str, timeout: Duration) -> Option<EvalPayload> {
+    fn wait_for_eval_result(
+        &mut self,
+        result_id: &str,
+        timeout: Duration,
+    ) -> Result<EvalPayload, ClientError> {
+        self.waiting_eval = Some(result_id.to_string());
+        let result = self.poll_eval_result(result_id, timeout);
+        self.waiting_eval = None;
+        result
+    }
+
+    fn poll_eval_result(
+        &mut self,
+        result_id: &str,
+        timeout: Duration,
+    ) -> Result<EvalPayload, ClientError> {
         let deadline = std::time::Instant::now() + timeout;
 
         loop {
             if let Some(xml) = self.pending_eval_results.remove(result_id) {
-                return Some(responses::parse_eval_result(&xml));
+                return Ok(responses::parse_eval_result(&xml));
             }
 
             match self.events.try_recv() {
@@ -960,25 +973,18 @@ impl DebugSession {
                 Err(mpsc::error::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= deadline {
                         debug!(result_id, "eval result timeout");
-                        self.note_abandoned_eval(result_id);
-                        return None;
+                        return Err(ClientError::EvalFailed(
+                            "the debug server returned no result within 5 s".into(),
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.note_abandoned_eval(result_id);
-                    return None;
+                    return Err(ClientError::EvalFailed(
+                        "the event channel closed before the evaluation result arrived".into(),
+                    ));
                 }
             }
-        }
-    }
-
-    fn note_abandoned_eval(&mut self, result_id: &str) {
-        self.abandoned_evals.push(result_id.to_string());
-        const CAP: usize = 32;
-        if self.abandoned_evals.len() > CAP {
-            let extra = self.abandoned_evals.len() - CAP;
-            self.abandoned_evals.drain(0..extra);
         }
     }
 
@@ -1304,8 +1310,7 @@ impl DebugSession {
                 }))
             }
             DebugEvent::ExprEvaluated { result_id, raw_xml } => {
-                if self.abandoned_evals.iter().any(|id| id == &result_id) {
-                    self.abandoned_evals.retain(|id| id != &result_id);
+                if self.waiting_eval.as_deref() != Some(result_id.as_str()) {
                     return Ok(None);
                 }
                 debug!(result_id, "async expression evaluated, buffering");

@@ -30,7 +30,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default)]
 pub struct ExcludedPaths {
     entries: Vec<Excluded>,
-    patterns: Option<Patterns>,
+    /// Boxed so a set without patterns stays as small as it was: the set is embedded by
+    /// value in many structures, enums among them.
+    patterns: Option<Box<Patterns>>,
 }
 
 /// Glob patterns and the base they are relative to.
@@ -163,7 +165,7 @@ impl ExcludedPaths {
             push_anchor(&mut anchors, resolved, PathBuf::new());
         }
         let globs = Arc::new(CompiledGlobs { sources, set });
-        self.patterns = Some(Patterns { declared_base, anchors, globs });
+        self.patterns = Some(Box::new(Patterns { declared_base, anchors, globs }));
         Ok(self)
     }
 
@@ -222,7 +224,8 @@ impl ExcludedPaths {
                 Excluded { declared: entry.declared.clone(), spellings }
             })
             .collect();
-        let patterns = self.patterns.as_ref().map(|patterns| patterns.respelled_under(&roots));
+        let patterns =
+            self.patterns.as_ref().map(|patterns| Box::new(patterns.respelled_under(&roots)));
         Self { entries, patterns }
     }
 
@@ -346,7 +349,8 @@ impl ExcludedPaths {
     /// The heap this set owns: the entries and every spelling of each.
     pub fn heap_bytes(&self) -> usize {
         let patterns = self.patterns.as_ref().map_or(0, |patterns| {
-            patterns.declared_base.capacity()
+            std::mem::size_of::<Patterns>()
+                + patterns.declared_base.capacity()
                 + crate::heap::vec_bytes::<(PathBuf, PathBuf)>(patterns.anchors.capacity())
                 + patterns
                     .anchors

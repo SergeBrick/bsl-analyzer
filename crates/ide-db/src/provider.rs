@@ -295,6 +295,13 @@ pub trait AnalysisProvider {
         None
     }
 
+    /// Which execution environments the project compiles client and server code
+    /// for. The default matches an unconfigured database, so a provider without
+    /// project settings does not invent a stricter availability gate.
+    fn env_options(&self) -> hir::execution_env::EnvOptions {
+        hir::execution_env::EnvOptions::default()
+    }
+
     fn parse(&self, file_id: FileId) -> Parse<SyntaxNode>;
 
     fn file_text(&self, file_id: FileId) -> String;

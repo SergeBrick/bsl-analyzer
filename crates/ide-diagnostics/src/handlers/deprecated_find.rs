@@ -1,17 +1,17 @@
-use crate::AnalysisContext;
+use crate::BodyContext;
 use crate::{Diagnostic, DiagnosticCode, Fix, TextEdit};
 use bsl_platform::deprecation::{DeprecationEntry, LifecycleGroup};
 use hir::LocalRange;
 
 use super::deprecated_platform_facts::{
-    canonical_name_for, global_function_fact, is_russian_alias, replacement_compiles_here,
-    replacement_for_name,
+    canonical_name_for, global_function_fact, is_russian_alias, module_owns_bare_call,
+    replacement_compiles_here, replacement_for_name,
 };
 
 pub fn from_hir(
     name: &str,
     range: LocalRange,
-    ctx: &AnalysisContext,
+    ctx: &BodyContext,
 ) -> Option<Diagnostic<LocalRange>> {
     let code = DiagnosticCode::DeprecatedPlatformApi;
 
@@ -39,8 +39,11 @@ fn get_fix(
     name: &str,
     fact: &DeprecationEntry,
     range: LocalRange,
-    ctx: &AnalysisContext,
+    ctx: &BodyContext,
 ) -> Option<Fix<LocalRange>> {
+    if module_owns_bare_call(name, ctx) {
+        return None;
+    }
     let replacement = replacement_for_name(fact, name)?;
     if !replacement_compiles_here(replacement, ctx) {
         return None;

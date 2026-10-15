@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use hir::execution_env::{EnvFlags, EnvOptions};
 use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, TextEdit};
@@ -36,8 +37,29 @@ fn designer_fixture() -> PathBuf {
 
 /// `source` as the module of a managed form of the designer fixture.
 fn form_module_diagnostics(source: &str) -> Vec<Diagnostic> {
+    form_module_diagnostics_with(source, EnvOptions::default())
+}
+
+fn form_module_diagnostics_with(source: &str, options: EnvOptions) -> Vec<Diagnostic> {
     let path =
         designer_fixture().join("DataProcessors/ТестоваяОбработка/Forms/Форма/Ext/Form/Module.bsl");
+    assert!(path.exists(), "fixture missing: {}", path.display());
+    let mut db = RootDatabaseImpl::new();
+    db.set_env_options(options);
+    let file_id = FileId(0);
+    let mut files = FileSet::default();
+    files.insert(file_id, VfsPath::new(path.to_string_lossy().into_owned()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(file_id, source);
+    db.set_all_config_paths(vec![(None, designer_fixture())], None);
+    ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+}
+
+/// `source` as a module of the designer fixture, so its metadata (form kind,
+/// common-module flags) is the fixture's, not an empty stand-in.
+fn fixture_module_diagnostics(relative: &str, source: &str) -> Vec<Diagnostic> {
+    let path = designer_fixture().join(relative);
     assert!(path.exists(), "fixture missing: {}", path.display());
     let mut db = RootDatabaseImpl::new();
     let file_id = FileId(0);
@@ -166,6 +188,93 @@ fn english_current_date_becomes_current_session_date() {
     let fixes = fixes_of(source, &diagnostics, DiagnosticCode::DeprecatedPlatformApi);
     assert!(fixes.contains("[fix_all=false]"), "got: {fixes}");
     assert!(fixes.contains("Date = CurrentSessionDate();"), "got: {fixes}");
+}
+
+#[test]
+fn current_date_has_no_fix_where_the_session_date_does_not_compile() {
+    // `ТекущаяДатаСеанса` is absent on the thin and web clients. A client method,
+    // and a client common module, must not be offered a rename that will not compile.
+    let client_form =
+        "&НаКлиенте\nПроцедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let client_diags = form_module_diagnostics(client_form);
+    assert_eq!(
+        fixes_of(client_form, &client_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 3:12 no fix"
+    );
+
+    let client_module = "Процедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let module_diags = fixture_module_diagnostics(
+        "CommonModules/КлиентскийОбщийМодуль/Ext/Module.bsl",
+        client_module,
+    );
+    assert_eq!(
+        fixes_of(client_module, &module_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 2:12 no fix"
+    );
+
+    // Compiles on the client as well as the server, so the rename still will not.
+    let both = "&НаКлиентеНаСервереБезКонтекста\nПроцедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let both_diags = form_module_diagnostics(both);
+    assert_eq!(
+        fixes_of(both, &both_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 3:12 no fix"
+    );
+}
+
+#[test]
+fn current_date_keeps_the_fix_when_the_project_has_no_thin_client() {
+    // A configuration that targets only the thick managed client can call
+    // `ТекущаяДатаСеанса` from `&НаКлиенте`. The gate must follow the project
+    // settings, not withhold every client method.
+    let source = "&НаКлиенте\nПроцедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let options = EnvOptions {
+        client_environments: EnvFlags::THICK_CLIENT_MANAGED,
+        checked_environments: EnvFlags::THICK_CLIENT_MANAGED | EnvFlags::SERVER,
+        ..EnvOptions::default()
+    };
+    let diagnostics = form_module_diagnostics_with(source, options);
+    let fixes = fixes_of(source, &diagnostics, DiagnosticCode::DeprecatedPlatformApi);
+    assert!(fixes.contains("Дата = ТекущаяДатаСеанса();"), "got: {fixes}");
+    assert!(fixes.contains("[fix_all=false]"), "got: {fixes}");
+}
+
+#[test]
+fn current_date_keeps_the_manual_fix_on_the_server() {
+    let server_form =
+        "&НаСервере\nПроцедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let form_diags = form_module_diagnostics(server_form);
+    assert_eq!(
+        fixes_of(server_form, &form_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 3:12 Заменить на \"ТекущаяДатаСеанса\" (время в часовом поясе сеанса) [fix_all=false]\n\
+         &НаСервере\nПроцедура Обновить()\n    Дата = ТекущаяДатаСеанса();\nКонецПроцедуры\n"
+    );
+
+    let server_module = "Процедура Обновить()\n    Дата = ТекущаяДата();\nКонецПроцедуры\n";
+    let module_diags = fixture_module_diagnostics(
+        "CommonModules/ГлобальныйСерверныйМодуль/Ext/Module.bsl",
+        server_module,
+    );
+    let fixes = fixes_of(server_module, &module_diags, DiagnosticCode::DeprecatedPlatformApi);
+    assert!(fixes.contains("[fix_all=false]"), "got: {fixes}");
+    assert!(fixes.contains("Дата = ТекущаяДатаСеанса();"), "got: {fixes}");
+}
+
+#[test]
+fn a_module_method_of_the_same_name_is_not_renamed() {
+    // The bare call resolves to the module method, not the platform global.
+    let find = "Процедура Найти(Строка, Что)\nКонецПроцедуры\n\nПроцедура Тест()\n    Найти(\"Строка\", \"о\");\nКонецПроцедуры\n";
+    let find_diags = module_diagnostics(find, Project::default());
+    assert_eq!(
+        fixes_of(find, &find_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 5:5 no fix"
+    );
+
+    let date = "Процедура ТекущаяДата()\nКонецПроцедуры\n\nПроцедура Тест()\n    ТекущаяДата();\nКонецПроцедуры\n";
+    let date_diags = module_diagnostics(date, Project::default());
+    assert_eq!(
+        fixes_of(date, &date_diags, DiagnosticCode::DeprecatedPlatformApi),
+        "DeprecatedPlatformApi @ 5:5 no fix"
+    );
 }
 
 // --- InvalidCharacterInFile ----------------------------------------------------------

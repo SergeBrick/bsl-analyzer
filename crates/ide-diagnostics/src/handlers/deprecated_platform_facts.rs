@@ -1,7 +1,8 @@
-use crate::AnalysisContext;
+use crate::BodyContext;
 use bsl_platform::deprecation::{
     self, CompatibilityBucket, DeprecationEntry, DisplayKind, ElementKind, LifecycleGroup, Lookup,
 };
+use hir::execution_env::EnvFlags;
 use hir::DeprecatedKind8312;
 use stdx::case::CaseExt;
 
@@ -82,11 +83,13 @@ pub(crate) fn is_russian_alias(entry: &DeprecationEntry, input_name: &str) -> bo
     input_name.fold_lower() == entry.ru.fold_lower()
 }
 
-/// Whether a call to the global function `replacement` compiles in this project:
-/// neither the configuration's compatibility mode hides it nor the project's minimum
-/// platform release predates it. A quick fix that swaps in a name the code cannot
-/// compile with would trade a warning for an error.
-pub(crate) fn replacement_compiles_here(replacement: &str, ctx: &AnalysisContext) -> bool {
+/// Whether a call to the global function `replacement` compiles here: the
+/// compatibility mode does not hide it, the project's minimum platform release
+/// does not predate it, and it is not missing from an environment this call is
+/// compiled for. A quick fix that swaps in a name the code cannot compile with
+/// would trade a warning for an error. An unknown mode, release or environment
+/// does not withhold the fix — absence of data is not evidence the replacement fails.
+pub(crate) fn replacement_compiles_here(replacement: &str, ctx: &BodyContext) -> bool {
     if let (Some(mode), Some(visible_from)) =
         (ctx.compatibility_mode(), hir::compat_mode::hidden_global(replacement))
     {
@@ -101,7 +104,57 @@ pub(crate) fn replacement_compiles_here(replacement: &str, ctx: &AnalysisContext
             return false;
         }
     }
-    true
+    !replacement_missing_from_call_env(replacement, ctx)
+}
+
+/// A method of this module named `name` owns a bare call of that spelling, ahead
+/// of any platform global. Renaming the call would retarget that method.
+pub(crate) fn module_owns_bare_call(name: &str, ctx: &BodyContext) -> bool {
+    ctx.interface_method_named(&hir::Name::new(name)).is_some()
+}
+
+fn replacement_missing_from_call_env(replacement: &str, ctx: &BodyContext) -> bool {
+    let Some(member_env) = global_function_env(replacement) else {
+        return false;
+    };
+    if member_env.is_empty() {
+        return false;
+    }
+    let call_env = call_compile_env(ctx);
+    if call_env.is_empty() {
+        return false;
+    }
+    !(call_env.without(member_env) & ctx.env_options().checked_environments).is_empty()
+}
+
+fn global_function_env(name: &str) -> Option<EnvFlags> {
+    hir::builtin_functions().get(name).and_then(|sigs| sigs.first().map(|sig| sig.env()))
+}
+
+/// Environments the call is compiled for, from the position-free declaration:
+/// the method directive (or the module default) intersected with the module-level
+/// `#Если` regions around the method. Empty means unknown — a weaving interceptor
+/// inherits a directive this module cannot see, and a common module without
+/// metadata has no flags. An intra-method `#Если` is not folded in: a body check
+/// does not read file positions, and the declaration already says which
+/// environments the method as a whole is compiled for.
+fn call_compile_env(ctx: &BodyContext) -> EnvFlags {
+    let opts = ctx.env_options();
+    let metadata = ctx.module_metadata();
+    if ctx.method_id().is_none() {
+        return hir::execution_env::module_code_env(&metadata, &opts);
+    }
+    let Some(decl) = ctx.decl() else {
+        return EnvFlags::EMPTY;
+    };
+    if decl.directives.iter().any(|kind| kind.is_interception()) {
+        return EnvFlags::EMPTY;
+    }
+    let env = hir::execution_env::body_env(&metadata, &decl.directives, &opts);
+    if env.is_empty() {
+        return EnvFlags::EMPTY;
+    }
+    env.intersection(decl.preproc_env)
 }
 
 pub(crate) fn deprecated_8312_replacement(name: &str, kind: DeprecatedKind8312) -> &'static str {

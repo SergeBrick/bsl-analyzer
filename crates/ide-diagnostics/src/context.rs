@@ -190,6 +190,11 @@ impl<'a> AnalysisContext<'a> {
         hir::compat_mode::effective_mode(self.provider.compatibility_mode().as_deref())
     }
 
+    /// Project settings for which environments a call is compiled into.
+    pub fn env_options(&self) -> hir::execution_env::EnvOptions {
+        self.provider.env_options()
+    }
+
     pub fn main_configuration(&self) -> Option<Arc<bsl_metadata::Configuration>> {
         self.visible_configurations()
             .into_iter()

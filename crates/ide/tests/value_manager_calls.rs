@@ -52,8 +52,17 @@ fn db(caller: &str) -> (RootDatabaseImpl, Vec<FileId>) {
 
 /// As [`db`], plus file 5 — an object module of `Справочник1` — when one is given.
 fn db_with(caller: &str, catalog_object_module: Option<&str>) -> (RootDatabaseImpl, Vec<FileId>) {
+    db_with_modules(caller, VALUE_MANAGER_MODULE, catalog_object_module)
+}
+
+/// As [`db_with`], with `value_manager_module` as the text of file 0.
+fn db_with_modules(
+    caller: &str,
+    value_manager_module: &str,
+    catalog_object_module: Option<&str>,
+) -> (RootDatabaseImpl, Vec<FileId>) {
     let mut files = vec![
-        ("Constants/СтрокаКонст/Ext/ValueManagerModule.bsl", VALUE_MANAGER_MODULE),
+        ("Constants/СтрокаКонст/Ext/ValueManagerModule.bsl", value_manager_module),
         ("CommonModules/Вызывающий/Ext/Module.bsl", caller),
         ("Constants/СтрокаКонст.xml", STRING_CONSTANT_XML),
         ("Constants/ЧислоКонст.xml", NUMBER_CONSTANT_XML),
@@ -368,5 +377,34 @@ fn a_constant_without_a_value_manager_module_is_judged_like_a_catalog_without_an
                 "Константы.ЧислоКонст.СоздатьМенеджерЗначения().НетВКонстанте".to_string()
             ),
         ],
+    );
+}
+
+/// An export variable of the value-manager module is a field of the value manager, the
+/// way an object-module export variable is a field of a catalog object. The catalog
+/// lines are the control that the harness resolves such a field at all.
+#[test]
+fn an_export_variable_of_the_value_manager_module_is_a_field() {
+    let caller = "\
+Процедура Прогон() Экспорт
+    Объект = Справочники.Справочник1.СоздатьЭлемент();
+    Х = Объект.СчетчикОбъекта;
+    МенеджерЗначения = Константы.СтрокаКонст.СоздатьМенеджерЗначения();
+    Х = МенеджерЗначения.Счетчик;
+    МенеджерЗначения.Счетчик = 1;
+    Х = Константы.СтрокаКонст.СоздатьМенеджерЗначения().Счетчик;
+    Х = МенеджерЗначения.НетТакогоПоля;
+КонецПроцедуры
+";
+    let value_manager_module = "\
+Перем Счетчик Экспорт;
+Перем Внутренний;
+";
+    let object_module = "Перем СчетчикОбъекта Экспорт;\n";
+    let (db, ids) = db_with_modules(caller, value_manager_module, Some(object_module));
+    let analysis = Analysis::from_database(db);
+    assert_eq!(
+        unresolved(&analysis, caller, ids[CALLER]),
+        vec![("UnresolvedField".to_string(), "МенеджерЗначения.НетТакогоПоля".to_string())],
     );
 }

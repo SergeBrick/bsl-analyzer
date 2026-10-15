@@ -54,7 +54,9 @@ pub fn resolve_qualified_call(
     Ok(MethodResolution::new(resolution.method_id, resolution.is_export, signature))
 }
 
-fn object_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadata::MdoType> {
+/// The object family whose `ObjectModule` slot holds the user module of a value of
+/// `kind`: its export methods and export variables are the value's user members.
+pub(crate) fn object_kind_to_mdo(kind: hir_def::ty::MetadataKind) -> Option<bsl_metadata::MdoType> {
     use bsl_metadata::MdoType;
     use hir_def::ty::MetadataKind;
     Some(match kind {

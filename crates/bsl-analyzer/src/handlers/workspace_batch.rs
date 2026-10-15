@@ -512,6 +512,47 @@ mod shared_owner_tests {
         }
     }
 
+    /// A retry compares the revision a request ran at with the current one; both must come
+    /// from the store requests run on. Without an editor view that is the owner's database,
+    /// and the session's fallback counts revisions of its own.
+    #[test]
+    fn a_shared_request_revision_reads_the_store_requests_run_on() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .expect("write project config");
+        std::fs::write(root.path().join("Module.bsl"), "Процедура П() КонецПроцедуры\n")
+            .expect("write source");
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        drop(wait_for_owner_analysis(&owner));
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let state = GlobalState::new_shared(sender, owner);
+        assert!(state.analysis_host.view().is_none());
+
+        let request = salsa::plumbing::current_revision(state.analysis_host.analysis().database());
+
+        assert_eq!(state.analysis_host.request_revision(), request);
+        assert_ne!(
+            salsa::plumbing::current_revision(state.analysis_host.raw_database()),
+            request,
+            "without a view the fallback database is a different store"
+        );
+    }
+
     #[test]
     fn shared_batch_reports_closed_disk_file_from_owner_without_session_vfs_copy() {
         let root = tempfile::tempdir().expect("create shared workspace");

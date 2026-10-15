@@ -127,6 +127,13 @@ impl SessionAnalysisHost {
         }
     }
 
+    /// The revision of the store [`Self::analysis`] reads, which is the store a request takes
+    /// its own revision from. Without an editor view that is the owner's database, not the
+    /// fallback [`Self::raw_database`] returns, and the two count revisions independently.
+    pub fn request_revision(&self) -> salsa::Revision {
+        salsa::plumbing::current_revision(self.analysis().database())
+    }
+
     pub fn raw_database(&self) -> &RootDatabaseImpl {
         match self {
             Self::Standalone(host) => host.raw_database(),

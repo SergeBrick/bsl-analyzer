@@ -18,13 +18,34 @@ pub struct RegisterResource {
     #[serde(default)]
     type_str: String,
 
+    /// `Балансовый` of an accounting-register resource; `None` for every other register kind.
+    /// A non-balance resource of a correspondence register is named by its sides (`<Ресурс>Дт`)
+    /// and is the only kind that has the correspondent-turnover fields (`<Ресурс>КорОборот`).
+    #[serde(default)]
+    balance: Option<bool>,
+
     #[serde(skip)]
     attr_type: Option<crate::metadata_object::AttributeType>,
 }
 
 impl RegisterResource {
     pub fn new(uuid: Uuid, name: impl Into<String>) -> Self {
-        Self { uuid, name: name.into(), name_en: None, type_str: String::new(), attr_type: None }
+        Self {
+            uuid,
+            name: name.into(),
+            name_en: None,
+            type_str: String::new(),
+            balance: None,
+            attr_type: None,
+        }
+    }
+
+    pub fn balance(&self) -> Option<bool> {
+        self.balance
+    }
+
+    pub fn set_balance(&mut self, balance: Option<bool>) {
+        self.balance = balance;
     }
 
     pub fn uuid(&self) -> &Uuid {
@@ -201,6 +222,17 @@ pub struct Register {
 
     #[serde(rename = "commonAttributesOpen", default)]
     common_attributes_open: bool,
+
+    /// `ПоддержкаКорреспонденции` of an accounting register; `None` for other kinds. It decides
+    /// whether the records carry one account (`Счет`, `ВидДвижения`) or two (`СчетДт`, `СчетКт`).
+    #[serde(rename = "correspondence", default)]
+    correspondence: Option<bool>,
+
+    /// Name of the chart of accounts an accounting register is kept on, without the
+    /// `ChartOfAccounts.` prefix. Its `МаксКоличествоСубконто` fixes how many `Субконто<N>`
+    /// fields the register's query tables have.
+    #[serde(rename = "chartOfAccounts", default)]
+    chart_of_accounts: Option<String>,
 }
 
 impl Register {
@@ -306,6 +338,14 @@ impl Register {
         self.common_attributes_open = applied.open;
     }
 
+    pub fn correspondence(&self) -> Option<bool> {
+        self.correspondence
+    }
+
+    pub fn chart_of_accounts(&self) -> Option<&str> {
+        self.chart_of_accounts.as_deref()
+    }
+
     /// Overlay an extension's adopted copy of this register onto the base: merge
     /// dimensions, resources, and attributes by name (1C lets an extension add new
     /// measurements/resources/attributes to a borrowed register, or replace a
@@ -314,14 +354,36 @@ impl Register {
     /// so the whole-config merge and the per-register resolver share one rule.
     pub fn apply_extension_overlay(&mut self, overlay: &Register) {
         for dimension in &overlay.dimensions {
+            let mut dimension = dimension.clone();
+            // An omitted Balance is "the XML did not say", not "this member is no longer
+            // balance". Replacing a known flag with None makes every spelling provisional.
+            if dimension.balance().is_none() {
+                if let Some(existing) = self
+                    .dimensions
+                    .iter()
+                    .find(|existing| stdx::case::eq_ignore_case(existing.name(), dimension.name()))
+                {
+                    dimension.set_balance(existing.balance());
+                }
+            }
             self.dimensions
                 .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), dimension.name()));
-            self.dimensions.push(dimension.clone());
+            self.dimensions.push(dimension);
         }
         for resource in &overlay.resources {
+            let mut resource = resource.clone();
+            if resource.balance().is_none() {
+                if let Some(existing) = self
+                    .resources
+                    .iter()
+                    .find(|existing| stdx::case::eq_ignore_case(existing.name(), resource.name()))
+                {
+                    resource.set_balance(existing.balance());
+                }
+            }
             self.resources
                 .retain(|existing| !stdx::case::eq_ignore_case(existing.name(), resource.name()));
-            self.resources.push(resource.clone());
+            self.resources.push(resource);
         }
         for attribute in &overlay.attributes {
             self.attributes
@@ -333,6 +395,12 @@ impl Register {
         }
         if overlay.register_type.is_some() {
             self.register_type = overlay.register_type;
+        }
+        if overlay.correspondence.is_some() {
+            self.correspondence = overlay.correspondence;
+        }
+        if overlay.chart_of_accounts.is_some() {
+            self.chart_of_accounts.clone_from(&overlay.chart_of_accounts);
         }
         crate::common_attribute::merge_common_attribute_fields(
             &mut self.common_attributes,
@@ -379,6 +447,7 @@ impl Register {
     /// heap-owning fields must be added here too.
     pub fn estimated_heap_size(&self) -> usize {
         self.name.capacity()
+            + self.chart_of_accounts.as_ref().map_or(0, String::capacity)
             + stdx::heap::vec_bytes::<Dimension>(self.dimensions.len())
             + self.dimensions.iter().map(Dimension::estimated_heap_size).sum::<usize>()
             + stdx::heap::vec_bytes::<RegisterResource>(self.resources.len())
@@ -433,6 +502,8 @@ pub struct RegisterBuilder {
     recorder_subordinate: bool,
     enable_totals_slice_first: bool,
     enable_totals_slice_last: bool,
+    correspondence: Option<bool>,
+    chart_of_accounts: Option<String>,
 }
 
 impl RegisterBuilder {
@@ -513,6 +584,16 @@ impl RegisterBuilder {
         self
     }
 
+    pub fn correspondence(mut self, correspondence: Option<bool>) -> Self {
+        self.correspondence = correspondence;
+        self
+    }
+
+    pub fn chart_of_accounts(mut self, chart_of_accounts: Option<String>) -> Self {
+        self.chart_of_accounts = chart_of_accounts;
+        self
+    }
+
     pub fn build(self) -> Register {
         Register {
             uuid: self.uuid.unwrap_or_else(Uuid::new_v4),
@@ -530,6 +611,8 @@ impl RegisterBuilder {
             enable_totals_slice_last: self.enable_totals_slice_last,
             common_attributes: Vec::new(),
             common_attributes_open: false,
+            correspondence: self.correspondence,
+            chart_of_accounts: self.chart_of_accounts,
         }
     }
 }
@@ -631,6 +714,62 @@ mod tests {
             .build();
 
         assert_eq!(reg1, reg2);
+    }
+
+    #[test]
+    fn extension_overlay_keeps_balance_when_the_replacement_omits_it() {
+        let mut base = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .dimensions(vec![Dimension::builder().name("Измерение1").balance(Some(false)).build()])
+            .resources(vec![{
+                let mut resource = RegisterResource::new(Uuid::new_v4(), "Ресурс1");
+                resource.set_balance(Some(false));
+                resource
+            }])
+            .build();
+        let overlay = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .dimensions(vec![Dimension::builder().name("Измерение1").build()])
+            .resources(vec![RegisterResource::new(Uuid::new_v4(), "Ресурс1")])
+            .build();
+        base.apply_extension_overlay(&overlay);
+        assert_eq!(base.dimensions()[0].balance(), Some(false));
+        assert_eq!(base.resources()[0].balance(), Some(false));
+
+        let explicit = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .dimensions(vec![Dimension::builder().name("Измерение1").balance(Some(true)).build()])
+            .build();
+        base.apply_extension_overlay(&explicit);
+        assert_eq!(base.dimensions()[0].balance(), Some(true));
+    }
+
+    #[test]
+    fn extension_overlay_takes_correspondence_and_chart_when_specified() {
+        let mut base = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .correspondence(Some(false))
+            .chart_of_accounts(Some("План1".to_string()))
+            .build();
+        let overlay = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .correspondence(Some(true))
+            .chart_of_accounts(Some("План2".to_string()))
+            .build();
+        base.apply_extension_overlay(&overlay);
+        assert_eq!(base.correspondence(), Some(true));
+        assert_eq!(base.chart_of_accounts(), Some("План2"));
+
+        let silent =
+            Register::builder().name("Бухгалтерия1").mdo_type(MdoType::AccountingRegister).build();
+        base.apply_extension_overlay(&silent);
+        assert_eq!(base.correspondence(), Some(true), "an omitted scalar stays with the base");
+        assert_eq!(base.chart_of_accounts(), Some("План2"));
     }
 
     #[test]

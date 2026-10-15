@@ -58,7 +58,9 @@ pub(crate) fn child_bool(node: roxmltree::Node<'_, '_>, tag: &str) -> bool {
 }
 
 pub(crate) fn child_u32(node: roxmltree::Node<'_, '_>, tag: &str) -> Option<u32> {
-    child_text(node, tag).and_then(|s| s.parse().ok())
+    // Configurator XML is tight, but a dumped or hand-edited element can carry a newline or a
+    // space around the digits. Parsing that as absent would drop a count the file did state.
+    child_text(node, tag).and_then(|s| s.trim().parse().ok())
 }
 
 pub(crate) fn find_mdo_element<'a>(

@@ -408,3 +408,29 @@ fn an_export_variable_of_the_value_manager_module_is_a_field() {
         vec![("UnresolvedField".to_string(), "МенеджерЗначения.НетТакогоПоля".to_string())],
     );
 }
+
+/// The type of a value manager is the constant, so goto type definition lands on the
+/// constant's XML. The catalog object is the control that the harness navigates a
+/// metadata type at all.
+#[test]
+fn type_definition_of_a_value_manager_is_the_constant() {
+    let caller = "\
+Процедура Прогон() Экспорт
+    Объект = Справочники.Справочник1.СоздатьЭлемент();
+    Объект.Записать();
+    МенеджерЗначения = Константы.СтрокаКонст.СоздатьМенеджерЗначения();
+    МенеджерЗначения.Метод1(1);
+КонецПроцедуры
+";
+    let (db, ids) = db(caller);
+    let analysis = Analysis::from_database(db);
+    let target_of = |needle: &str| {
+        analysis
+            .type_definition(ids[CALLER], at(caller, needle, 0, 2))
+            .unwrap_or_else(|| panic!("no type target for `{needle}`"))
+    };
+    assert_eq!(target_of("Объект.Записать").file_id, ids[4], "the catalog control");
+    let target = target_of("МенеджерЗначения.Метод1");
+    assert_eq!(target.file_id, ids[2]);
+    assert_eq!(target.name, "СтрокаКонст");
+}

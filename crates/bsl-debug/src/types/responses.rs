@@ -62,7 +62,13 @@ pub fn exception_descr(data: &[u8]) -> Option<String> {
         rest = tail;
     }
     out.push_str(rest);
-    Some(out.trim().to_string())
+    let out = out.trim().to_string();
+    // An empty description is not a message: the caller falls back to the raw body only on None.
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -598,6 +604,11 @@ mod tests {
         assert_eq!(payload.values.len(), 1, "one value, got {:?}", payload.values);
         assert_eq!(payload.values[0].type_name, "Строка");
         assert_eq!(payload.values[0].presentation, "\"2026\"");
+    }
+
+    #[test]
+    fn a_whitespace_only_descr_is_not_a_message() {
+        assert_eq!(exception_descr(b"<exception><descr>\n</descr></exception>"), None);
     }
 
     #[test]

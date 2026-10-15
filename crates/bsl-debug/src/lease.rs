@@ -16,6 +16,9 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// `NAME_MAX` on Linux, macOS and Windows: a longer file name is refused by `open`.
+const NAME_MAX: usize = 255;
+
 pub struct Lease {
     file: File,
     path: PathBuf,
@@ -36,7 +39,16 @@ impl Lease {
     /// parts are joined by a character the escaping never leaves in place, so two endpoints never
     /// share a file. Host names are case-insensitive; aliases are kept as given.
     pub fn file_name(host: &str, port: u16, infobase: &str) -> String {
-        format!("{}_{port}_{}.lease", escape_part(&host.to_lowercase()), escape_part(infobase))
+        let name =
+            format!("{}_{port}_{}.lease", escape_part(&host.to_lowercase()), escape_part(infobase));
+        // A name longer than NAME_MAX never creates a file, and the session would then have no
+        // lease at all: a later one could not take a dead registration over.
+        if name.len() <= NAME_MAX {
+            return name;
+        }
+        let suffix = format!("_{:016x}.lease", fnv64(name.as_bytes()));
+        let keep = NAME_MAX - suffix.len();
+        format!("{}{suffix}", &name[..keep])
     }
 
     /// Records `debugger_id` for the endpoint and holds the file locked. `Ok(None)` when another
@@ -107,6 +119,15 @@ impl Lease {
 /// Lowercase letters, digits, `-` and `.` stay readable; every other character becomes `%XX`
 /// per UTF-8 byte. `_` and `%` are escaped, which keeps the escaping reversible, and so are
 /// uppercase letters, which keeps two names apart on a case-insensitive file system.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 fn escape_part(part: &str) -> String {
     let mut out = String::with_capacity(part.len());
     for c in part.chars() {
@@ -228,5 +249,18 @@ mod tests {
     #[test]
     fn the_host_name_is_case_insensitive() {
         assert_eq!(Lease::file_name("LocalHost", 1550, "DefAlias"), NAME);
+    }
+
+    #[test]
+    fn a_long_alias_still_fits_in_a_file_name_and_stays_distinct() {
+        let upper = Lease::file_name("localhost", 1550, &"A".repeat(80));
+        let cyr = Lease::file_name("localhost", 1550, &"ИБ".repeat(40));
+        assert!(upper.len() <= 255, "{upper} is {} bytes", upper.len());
+        assert!(cyr.len() <= 255, "{cyr} is {} bytes", cyr.len());
+        assert_ne!(upper, cyr);
+        assert_ne!(upper, Lease::file_name("localhost", 1550, &"A".repeat(81)));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Lease::acquire(dir.path(), &upper, "id-1").unwrap().is_some());
     }
 }

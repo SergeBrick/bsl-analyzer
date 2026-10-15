@@ -338,10 +338,12 @@ pub fn debug_wait_stop(
                     let _ = writeln!(out, "  {}: {} (line {})", i, frame.presentation, frame.line);
                 }
             }
+            append_runtime_warnings(session, &mut out);
             Ok(text_within_budget(out, max_output_tokens, STACK_NOTE))
         }
         None => {
             let mut out = String::from("Timeout — no stop event received");
+            append_runtime_warnings(session, &mut out);
             // A debugger the server no longer counts as registered receives no event at all; a
             // bare timeout would read as "the code did not run".
             if let Some(error) = session.event_channel_error() {
@@ -401,6 +403,12 @@ pub fn debug_stack_trace(
     Ok(text_within_budget(out, max_output_tokens, STACK_NOTE))
 }
 
+fn append_runtime_warnings(session: &mut bsl_debug::session::DebugSession, out: &mut String) {
+    for warning in session.take_runtime_warnings() {
+        let _ = writeln!(out, "Warning: {warning}");
+    }
+}
+
 pub fn debug_locals(
     session_mutex: &Arc<Mutex<Option<DebugSession>>>,
     stack_level: Option<u32>,
@@ -413,8 +421,15 @@ pub fn debug_locals(
     let vars = session
         .locals(level)
         .map_err(|e| McpError::internal_error(format!("Failed to get locals: {e}"), None))?;
+    let mut warnings = String::new();
+    append_runtime_warnings(session, &mut warnings);
     if vars.is_empty() {
-        return Ok(CallToolResult::success(vec![ContentBlock::text("No local variables")]));
+        let mut out = String::from("No local variables");
+        if !warnings.is_empty() {
+            out.push('\n');
+            out.push_str(&warnings);
+        }
+        return Ok(CallToolResult::success(vec![ContentBlock::text(out)]));
     }
     let mut out = format!("# Local Variables (stack level {})\n\n", level);
     let _ = writeln!(out, "| Name | Type | Value |");
@@ -422,6 +437,9 @@ pub fn debug_locals(
     for v in &vars {
         let expandable = if v.expandable { " >" } else { "" };
         let _ = writeln!(out, "| {}{expandable} | {} | {} |", v.name, v.type_name, v.value);
+    }
+    if !warnings.is_empty() {
+        out.push_str(&warnings);
     }
     Ok(text_within_budget(out, max_output_tokens, LOCALS_NOTE))
 }

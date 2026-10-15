@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
   из `exceptionStr`. Предмет, остановленный до `attach`, находится через
   `getDbgAllTargetStates` и продолжается (`continue`/`step`, параметр `target`);
   `disconnect` продолжает остановленные предметы перед отключением (github#421).
+  `locals` и `expand` без ответа за 5 с — ошибка, а не пустой успех; имя файла
+  аренды отладчика не длиннее 255 байт.
 
 ## [0.3.2] - 2026-10-11
 

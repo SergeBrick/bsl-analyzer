@@ -35,8 +35,8 @@ pub enum ClientError {
     #[error("debug server refused {cmd} (HTTP {status}): {message}")]
     Server { cmd: String, status: u16, message: String },
 
-    #[error("the debug server did not answer {cmd} within {secs} s")]
-    Timeout { cmd: String, secs: u64 },
+    #[error("the debug server did not answer {cmd} within {shown}")]
+    Timeout { cmd: String, shown: String },
 
     #[error("evaluation failed: {0}")]
     EvalFailed(String),
@@ -281,7 +281,7 @@ impl DebugClient {
             Err(e) if e.is_timeout() => {
                 return Err(ClientError::Timeout {
                     cmd: cmd.to_string(),
-                    secs: timeout.unwrap_or(REQUEST_TIMEOUT).as_secs(),
+                    shown: format_wait(timeout.unwrap_or(REQUEST_TIMEOUT)),
                 })
             }
             Err(e) => return Err(e.into()),
@@ -306,9 +306,31 @@ pub const CALL_STACK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// the wait it reports.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Whole seconds when the wait is an exact number of them, otherwise milliseconds: `as_secs`
+/// alone turns a sub-second budget into "0 s".
+fn format_wait(wait: std::time::Duration) -> String {
+    let ms = wait.as_millis();
+    if ms >= 1000 && ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
 fn server_error(cmd: &str, status: u16, data: &[u8]) -> ClientError {
     let message = responses::exception_descr(data).unwrap_or_else(|| {
         String::from_utf8_lossy(data).chars().take(300).collect::<String>().trim().into()
     });
     ClientError::Server { cmd: cmd.to_string(), status, message }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sub_second_wait_is_not_reported_as_zero_seconds() {
+        assert_eq!(format_wait(std::time::Duration::from_millis(500)), "500 ms");
+        assert_eq!(format_wait(std::time::Duration::from_secs(30)), "30 s");
+    }
 }

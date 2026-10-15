@@ -78,13 +78,16 @@ pub fn parse_ping_events(data: &[u8]) -> Vec<DebugEvent> {
     let mut exception_descr = String::new();
 
     let mut result_id = String::new();
+    let mut result_start = 0usize;
 
     loop {
+        let event_start = reader.buffer_position() as usize;
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let local = local_name(e.name().as_ref());
                 match local.as_slice() {
                     b"result" => {
+                        result_start = event_start;
                         in_result = true;
                         cmd_id.clear();
                         target_id.clear();
@@ -205,10 +208,16 @@ pub fn parse_ping_events(data: &[u8]) -> Vec<DebugEvent> {
                                     call_stack: frames,
                                 })
                             }
-                            "exprEvaluated" => Some(DebugEvent::ExprEvaluated {
-                                result_id: result_id.clone(),
-                                raw_xml: data.to_vec(),
-                            }),
+                            "exprEvaluated" => {
+                                // The whole ping may carry another evaluation's result. Parsing
+                                // that body would return the first value for every id in it.
+                                let end = reader.buffer_position() as usize;
+                                let raw_xml = result_slice(data, result_start, end, &result_id);
+                                Some(DebugEvent::ExprEvaluated {
+                                    result_id: result_id.clone(),
+                                    raw_xml,
+                                })
+                            }
                             "rteProcessing" => Some(DebugEvent::RuntimeException {
                                 target_id: target_id.clone(),
                                 description: exception_descr.clone(),
@@ -256,6 +265,21 @@ pub fn parse_ping_events(data: &[u8]) -> Vec<DebugEvent> {
     events
 }
 
+/// Bytes of one `<result>` element. A slice that does not contain the id is not that element
+/// (the reader position did not land on it), and the caller then sees the whole ping, as before.
+fn result_slice(data: &[u8], start: usize, end: usize, result_id: &str) -> Vec<u8> {
+    let Some(slice) = data.get(start..end).filter(|slice| !slice.is_empty()) else {
+        return data.to_vec();
+    };
+    let holds_id = result_id.is_empty()
+        || slice.windows(result_id.len()).any(|window| window == result_id.as_bytes());
+    if holds_id {
+        slice.to_vec()
+    } else {
+        data.to_vec()
+    }
+}
+
 fn base64_decode_utf8(encoded: &str) -> String {
     let clean: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
     let mut buf = vec![0u8; clean.len()];
@@ -299,4 +323,42 @@ fn base64_decode_slice(input: &[u8], output: &mut [u8]) -> usize {
         si += 4;
     }
     di
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::responses::parse_eval_result;
+
+    #[test]
+    fn two_evaluation_results_in_one_ping_keep_their_own_values() {
+        let ping = concat!(
+            r#"<response xmlns:debugRDBGRequestResponse=\"http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse\">"#,
+            r#"<debugRDBGRequestResponse:result xsi:type=\"debugRDBGRequestResponse:DBGUIExtCmdInfoExprEvaluated\">"#,
+            "<cmdID>exprEvaluated</cmdID><evalExprResult>",
+            "<evalResultState>correctly</evalResultState>",
+            "<expressionResultID>A1</expressionResultID>",
+            "<resultValueInfo><typeName>\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}</typeName><pres>IkEi</pres></resultValueInfo>",
+            "</evalExprResult></debugRDBGRequestResponse:result>",
+            r#"<debugRDBGRequestResponse:result xsi:type=\"debugRDBGRequestResponse:DBGUIExtCmdInfoExprEvaluated\">"#,
+            "<cmdID>exprEvaluated</cmdID><evalExprResult>",
+            "<evalResultState>correctly</evalResultState>",
+            "<expressionResultID>B2</expressionResultID>",
+            "<resultValueInfo><typeName>\u{0421}\u{0442}\u{0440}\u{043e}\u{043a}\u{0430}</typeName><pres>IkIi</pres></resultValueInfo>",
+            "</evalExprResult></debugRDBGRequestResponse:result></response>",
+        );
+        let events = parse_ping_events(ping.as_bytes());
+        assert_eq!(events.len(), 2, "{events:?}");
+        let DebugEvent::ExprEvaluated { result_id, raw_xml } = &events[1] else {
+            panic!("second event is not an evaluation: {events:?}");
+        };
+        assert_eq!(result_id, "B2");
+        let payload = parse_eval_result(raw_xml);
+        assert_eq!(
+            payload.values.first().map(|v| v.presentation.as_str()),
+            Some("\"B\""),
+            "the second result must not be read as the first: {payload:?} xml={}",
+            String::from_utf8_lossy(raw_xml)
+        );
+    }
 }

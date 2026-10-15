@@ -42,6 +42,12 @@ pub struct DebugSession {
     last_stop: Option<StopEvent>,
     watches: Vec<String>,
     pending_eval_results: HashMap<String, Vec<u8>>,
+    /// Result ids whose wait already ended. A late answer for one of them is not a result anyone
+    /// is still reading, and keeping the ping body would only grow.
+    abandoned_evals: Vec<String>,
+    /// Refusals of requests the event handler makes on its own. They are not stops, so they must
+    /// not abort `wait_for_stop`; the caller still has to hear about them.
+    runtime_warnings: Vec<String>,
     /// Listed once while connecting, because a second `getDbgTargets` can answer differently and
     /// its failure must not undo an attach that already happened.
     known_targets: Vec<TargetInfo>,
@@ -290,6 +296,8 @@ impl DebugSession {
             last_stop: None,
             watches: Vec::new(),
             pending_eval_results: HashMap::new(),
+            abandoned_evals: Vec::new(),
+            runtime_warnings: Vec::new(),
             known_targets: Vec::new(),
             setup_warnings,
             pending_suspended: VecDeque::new(),
@@ -430,6 +438,12 @@ impl DebugSession {
     /// Why polling the event channel fails, while it does.
     pub fn event_channel_error(&self) -> Option<String> {
         self.listener.last_error()
+    }
+
+    /// Refusals of requests this session made while handling events, oldest first. Taking them
+    /// clears the list, so each refusal is reported once.
+    pub fn take_runtime_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.runtime_warnings)
     }
 
     pub fn disconnect(mut self) -> DisconnectReport {
@@ -891,7 +905,7 @@ impl DebugSession {
 
         let result_id = Uuid::new_v4().to_string();
         let payload = self.client.eval_local_vars(&target_id, stack_level as i64, &result_id)?;
-        let payload = self.settle_eval(payload, &result_id);
+        let payload = self.settle_eval(payload, &result_id)?;
 
         if let Some(message) = payload.error {
             return Err(ClientError::EvalFailed(message));
@@ -910,21 +924,29 @@ impl DebugSession {
     }
 
     /// An evaluation answers HTTP 200 with an empty body and reports on the ping channel, so an
-    /// empty synchronous payload is a promise of a later one, not a result.
-    fn settle_eval(&mut self, payload: EvalPayload, result_id: &str) -> EvalPayload {
+    /// empty synchronous payload is a promise of a later one, not a result. No answer within the
+    /// wait is an error: an empty payload is also what a frame with no variables looks like, and
+    /// the two must not be the same `Ok`.
+    fn settle_eval(
+        &mut self,
+        payload: EvalPayload,
+        result_id: &str,
+    ) -> Result<EvalPayload, ClientError> {
         if payload.values.is_empty() && payload.error.is_none() {
-            self.wait_for_eval_result(result_id, Duration::from_secs(5))
+            self.wait_for_eval_result(result_id, Duration::from_secs(5)).ok_or_else(|| {
+                ClientError::EvalFailed("the debug server returned no result within 5 s".into())
+            })
         } else {
-            payload
+            Ok(payload)
         }
     }
 
-    fn wait_for_eval_result(&mut self, result_id: &str, timeout: Duration) -> EvalPayload {
+    fn wait_for_eval_result(&mut self, result_id: &str, timeout: Duration) -> Option<EvalPayload> {
         let deadline = std::time::Instant::now() + timeout;
 
         loop {
             if let Some(xml) = self.pending_eval_results.remove(result_id) {
-                return responses::parse_eval_result(&xml);
+                return Some(responses::parse_eval_result(&xml));
             }
 
             match self.events.try_recv() {
@@ -938,14 +960,25 @@ impl DebugSession {
                 Err(mpsc::error::TryRecvError::Empty) => {
                     if std::time::Instant::now() >= deadline {
                         debug!(result_id, "eval result timeout");
-                        return EvalPayload::default();
+                        self.note_abandoned_eval(result_id);
+                        return None;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return EvalPayload::default();
+                    self.note_abandoned_eval(result_id);
+                    return None;
                 }
             }
+        }
+    }
+
+    fn note_abandoned_eval(&mut self, result_id: &str) {
+        self.abandoned_evals.push(result_id.to_string());
+        const CAP: usize = 32;
+        if self.abandoned_evals.len() > CAP {
+            let extra = self.abandoned_evals.len() - CAP;
+            self.abandoned_evals.drain(0..extra);
         }
     }
 
@@ -955,7 +988,7 @@ impl DebugSession {
         let result_id = Uuid::new_v4().to_string();
         let payload =
             self.client.eval_expr(&target_id, expression, stack_level as i64, &result_id)?;
-        let payload = self.settle_eval(payload, &result_id);
+        let payload = self.settle_eval(payload, &result_id)?;
 
         if let Some(message) = payload.error {
             return Err(ClientError::EvalFailed(message));
@@ -963,10 +996,10 @@ impl DebugSession {
 
         match payload.values.into_iter().next() {
             Some(first) => Ok(EvalResult { value: first.presentation, type_name: first.type_name }),
-            // An empty value here is not an empty variable: nothing came back at all, and
-            // returning one would read as a successful evaluation of nothing.
+            // A result that arrived and carried no value is not a timeout: the wait already
+            // ended in `settle_eval` when nothing came back at all.
             None => Err(ClientError::EvalFailed(
-                "the debug server returned no result within 5 s".into(),
+                "the debug server returned an empty evaluation result".into(),
             )),
         }
     }
@@ -982,7 +1015,7 @@ impl DebugSession {
         let result_id = Uuid::new_v4().to_string();
         let payload =
             self.client.eval_expand(&target_id, path, view, stack_level as i64, &result_id)?;
-        let payload = self.settle_eval(payload, &result_id);
+        let payload = self.settle_eval(payload, &result_id)?;
 
         if let Some(message) = payload.error {
             return Err(ClientError::EvalFailed(message));
@@ -1113,7 +1146,14 @@ impl DebugSession {
                     return Ok(None);
                 }
                 info!(target_id, target_type, "target started");
-                self.client.attach_targets(&[&target_id])?;
+                // A refusal here is not a stop. Failing the wait would drop every later event
+                // of this poll and tell the caller the wait itself broke.
+                if let Err(e) = self.client.attach_targets(&[&target_id]) {
+                    self.runtime_warnings.push(format!(
+                        "attach of started target {target_id} ({target_type}) refused: {e}"
+                    ));
+                    return Ok(None);
+                }
                 self.attached_targets.insert(target_id.clone(), target_type);
                 Ok(None)
             }
@@ -1134,7 +1174,11 @@ impl DebugSession {
                 ..
             } => {
                 if send_message_only {
-                    self.client.step(&target_id, "Continue")?;
+                    if let Err(e) = self.client.step(&target_id, "Continue") {
+                        self.runtime_warnings.push(format!(
+                            "continue of a message-only stop of {target_id} refused: {e}"
+                        ));
+                    }
                     return Ok(None);
                 }
 
@@ -1260,6 +1304,10 @@ impl DebugSession {
                 }))
             }
             DebugEvent::ExprEvaluated { result_id, raw_xml } => {
+                if self.abandoned_evals.iter().any(|id| id == &result_id) {
+                    self.abandoned_evals.retain(|id| id != &result_id);
+                    return Ok(None);
+                }
                 debug!(result_id, "async expression evaluated, buffering");
                 self.pending_eval_results.insert(result_id, raw_xml);
                 Ok(None)
@@ -1948,5 +1996,66 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(error.contains("часть отладки не зарегистрирована"), "{error}");
+    }
+
+    /// A locals read whose asynchronous answer never arrives must not look like an empty frame.
+    #[test]
+    fn locals_without_an_answer_is_an_error_not_an_empty_frame() {
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = served.clone();
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
+            "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                (200, ping_response(&stop_on_line_4()))
+            }
+            "evalLocalVariables" => {
+                assert!(body.contains("expressionResultID"), "{body}");
+                (200, String::new())
+            }
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+        wait_until(&served);
+        session.wait_for_stop(Duration::from_secs(1)).unwrap().expect("the stop");
+
+        let err = session.locals(0).unwrap_err();
+        assert!(
+            err.to_string().contains("no result within 5 s"),
+            "a missing locals answer must not read as an empty frame: {err}"
+        );
+    }
+
+    #[test]
+    fn a_message_only_stop_whose_continue_is_refused_does_not_fail_the_wait() {
+        let served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = served.clone();
+        let server = FakeServer::start(Box::new(move |cmd: &str, body: &str| match cmd {
+            "pingDebugUIParams" if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) => (
+                200,
+                ping_response(&format!(
+                    concat!(
+                        r#"<debugRDBGRequestResponse:result xsi:type=\"debugRDBGRequestResponse:DBGUIExtCmdInfoCallStackFormed\">"#,
+                        "<cmdID>callStackFormed</cmdID><targetID><id>{target}</id></targetID>",
+                        "<sendMessageOnly>true</sendMessageOnly>",
+                        "</debugRDBGRequestResponse:result>"
+                    ),
+                    target = SERVER_TARGET,
+                )),
+            ),
+            "step" => (400, NOT_REGISTERED.into()),
+            "getDbgAllTargetStates" => (200, String::new()),
+            _ => halted_server(cmd, body),
+        }));
+        let root = config_root();
+        let mut session = connect(&server, root.path(), None).expect("attach");
+        wait_until(&served);
+
+        let stop = session.wait_for_stop(Duration::from_millis(200)).unwrap();
+        assert!(stop.is_none(), "a message-only stop is not a stop: {stop:?}");
+        let warnings = session.take_runtime_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("message-only") && w.contains("refused")),
+            "{warnings:?}"
+        );
     }
 }

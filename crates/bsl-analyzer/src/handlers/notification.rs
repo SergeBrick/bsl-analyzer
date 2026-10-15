@@ -727,6 +727,7 @@ pub fn handle_cancel(state: &mut GlobalState, params: lsp_types::CancelParams) -
                 .pending_latency_retries
                 .retain(|pending| pending.id != id || pending.generation != generation);
             state.request_lifecycles.remove(&id);
+            state.shared_request_stamps.remove(&id);
             if state
                 .request_token_owners
                 .get(&id)

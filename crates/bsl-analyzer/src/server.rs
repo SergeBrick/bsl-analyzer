@@ -408,6 +408,97 @@ mod shared_backend_tests {
         assert_eq!(extract_workspace_root(&unsupported), None);
     }
 
+    /// A shared view change retires the in-flight diagnostics of every open document, not
+    /// only of the one that was edited. The retired result is discarded as stale, so the
+    /// document whose work was in flight must be queued again or its last edit is never
+    /// published; a document whose diagnostics had already finished is left alone.
+    #[test]
+    fn a_shared_view_change_requeues_diagnostics_it_retired_in_flight() {
+        use crate::global_state::Task;
+        use salsa::Database as _;
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        let in_flight = crate::test_uri::file_uri("in_flight.bsl");
+        let finished = crate::test_uri::file_uri("finished.bsl");
+        state.mem_docs.insert(in_flight.clone(), "in flight".into(), 3);
+        state.mem_docs.insert(finished.clone(), "finished".into(), 5);
+        let token = state.analysis_host.raw_database().cancellation_token();
+        state.diagnostics_tokens.insert(in_flight.clone(), token.clone());
+        state.diagnostics_generation.insert(in_flight.clone(), 7);
+        state
+            .diagnostics_tokens
+            .insert(finished.clone(), state.analysis_host.raw_database().cancellation_token());
+        state.diagnostics_generation.insert(finished.clone(), 2);
+        handle_task(
+            &mut state,
+            Task::DiagnosticsReady {
+                uri: finished.clone(),
+                diagnostics: Vec::new(),
+                version: 5,
+                generation: 2,
+                completed_at: std::time::Instant::now(),
+            },
+        )
+        .unwrap();
+
+        state.mark_shared_view_changed();
+        handle_task(
+            &mut state,
+            Task::DiagnosticsCancelled {
+                uri: in_flight.clone(),
+                version: 3,
+                generation: 7,
+                kind: salsa::Cancelled::Local,
+                completed_at: std::time::Instant::now(),
+            },
+        )
+        .unwrap();
+
+        assert!(token.is_cancelled(), "the retired diagnostics kept running");
+        assert_eq!(
+            state.pending_diagnostics_uris,
+            vec![in_flight],
+            "only the document whose diagnostics were in flight is queued again"
+        );
+    }
+
+    /// A retry the client cancels while it waits in the queue never finishes, so nothing
+    /// else would drop the stamp its earlier attempt left behind.
+    #[test]
+    fn cancelling_a_queued_retry_drops_its_shared_stamp() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        let id = lsp_server::RequestId::from(17);
+        state.request_lifecycles.insert(
+            id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 1,
+                method: "textDocument/hover".into(),
+                request: None,
+                attempt: 1,
+                phase: RequestLifecyclePhase::RetryQueued,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: None,
+                client_cancelled: false,
+            },
+        );
+        state.shared_request_stamps.insert(
+            id.clone(),
+            (0, salsa::plumbing::current_revision(state.analysis_host.raw_database())),
+        );
+
+        crate::handlers::notification::handle_cancel(
+            &mut state,
+            lsp_types::CancelParams { id: lsp_types::NumberOrString::Number(17) },
+        )
+        .unwrap();
+
+        assert!(!state.request_lifecycles.contains_key(&id));
+        assert!(state.shared_request_stamps.is_empty(), "the cancelled retry left its stamp");
+    }
+
     #[test]
     fn shared_stamp_rejects_a_success_from_an_old_view_and_preserves_client_cancel() {
         for client_cancelled in [false, true] {
@@ -1154,6 +1245,10 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
         }
         Task::DiagnosticsReady { uri, diagnostics, version, generation, completed_at } => {
             let current = state.diagnostics_generation.get(&uri).copied().unwrap_or(0);
+            // The latest schedule has finished, so its token no longer marks work in flight.
+            if generation == current {
+                state.diagnostics_tokens.remove(&uri);
+            }
             // Publish only the latest schedule for this uri (`== current`) and only
             // while it is still open — a result that finished after the document was
             // closed must not be published for a closed file.
@@ -1188,6 +1283,9 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 publish_delay_ms = completed_at.elapsed().as_millis() as u64,
                 "diagnostics cancelled",
             );
+            if state.diagnostics_generation.get(&uri) == Some(&generation) {
+                state.diagnostics_tokens.remove(&uri);
+            }
             // Batch LRU writes can cancel the latest open-buffer diagnostics too.
             if matches!(kind, salsa::Cancelled::PendingWrite | salsa::Cancelled::Local)
                 && state.diagnostics_generation.get(&uri) == Some(&generation)

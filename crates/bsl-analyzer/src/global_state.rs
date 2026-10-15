@@ -1098,8 +1098,12 @@ impl GlobalState {
         self.supersede_call_hierarchy_index(base_db::BSL_SOURCE_ROOT);
         for uri in self.opened_document_uris() {
             *self.diagnostics_generation.entry(uri.clone()).or_default() += 1;
+            // A token outlives its task only until the result is handled, so one still here
+            // is work in flight. Its result will be discarded as stale, and nothing else
+            // schedules this document again until it is edited.
             if let Some(token) = self.diagnostics_tokens.remove(&uri) {
                 token.cancel();
+                self.enqueue_pending_diagnostics(uri);
             }
         }
         self.mark_workspace_batch_dirty();

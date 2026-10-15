@@ -199,3 +199,23 @@ fn declaration_keywords_english_carry_the_declaration_modifier() {
         assert_kind(source, &hls, keyword, "keyword", false);
     }
 }
+
+#[test]
+fn declaration_keyword_used_as_member_name_is_not_a_declaration() {
+    let source = "А = Б.Функция;\n\
+                  А = Б.Экспорт;\n\
+                  А = Б.Перем;\n\
+                  А = Б.Знач;\n\
+                  А = Б.Асинх;\n\
+                  Б.КонецФункции();\n\
+                  А = Б.Procedure;\n";
+    let hls = highlights(source);
+    for member in ["Функция", "Экспорт", "Перем", "Знач", "Асинх", "КонецФункции", "Procedure"]
+    {
+        let kinds = kinds_of(source, &hls, member);
+        assert!(!kinds.is_empty(), "{member:?} is not highlighted at all: {hls:?}");
+        for (_, mods) in kinds {
+            assert!(!mods.contains(&"declaration"), "{member:?} after `.`: {mods:?}");
+        }
+    }
+}

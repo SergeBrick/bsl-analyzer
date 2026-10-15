@@ -303,8 +303,11 @@ fn highlight_token<DB: RootDatabase>(
     } else if kind.is_keyword() {
         // Declaration keywords stay `keyword` for clients that ignore
         // modifiers; the standard `declaration` modifier lets a theme colour
-        // them apart from control-flow keywords.
-        if kind.is_declaration_keyword() {
+        // them apart from control-flow keywords. After `.` the keyword is a
+        // member name (`Б.Функция`), not a declaration.
+        let is_member_name =
+            token.parent().is_some_and(|parent| parent.kind() == SyntaxKind::FIELD_EXPR);
+        if kind.is_declaration_keyword() && !is_member_name {
             modifiers = modifiers.with(HlMod::DECLARATION);
         }
         HlTag::Keyword

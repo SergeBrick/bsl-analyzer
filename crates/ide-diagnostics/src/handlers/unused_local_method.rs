@@ -289,6 +289,8 @@ fn line_above(token: &SyntaxToken) -> Option<LineAbove> {
         match candidate.kind() {
             SyntaxKind::WHITESPACE => prev = candidate.prev_token(),
             SyntaxKind::NEWLINE => break,
+            // The byte order mark opens the file without being text of its first line.
+            SyntaxKind::BOM => return None,
             _ => return Some(LineAbove::Code),
         }
     }
@@ -303,7 +305,7 @@ fn line_above(token: &SyntaxToken) -> Option<LineAbove> {
     }
     let Some(token) = prev else { return Some(LineAbove::Blank) };
     match token.kind() {
-        SyntaxKind::NEWLINE => Some(LineAbove::Blank),
+        SyntaxKind::NEWLINE | SyntaxKind::BOM => Some(LineAbove::Blank),
         SyntaxKind::COMMENT if line_start(&token).is_some() => Some(LineAbove::Comment(token)),
         _ => Some(LineAbove::Code),
     }
@@ -319,7 +321,7 @@ fn line_start(token: &SyntaxToken) -> Option<TextSize> {
                 start = candidate.text_range().start();
                 prev = candidate.prev_token();
             }
-            SyntaxKind::NEWLINE => return Some(start),
+            SyntaxKind::NEWLINE | SyntaxKind::BOM => return Some(start),
             _ => return None,
         }
     }

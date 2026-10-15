@@ -226,3 +226,66 @@ fn notification_handler_gets_no_diagnostic() {
                   Процедура ПослеОтвета(Ответ, Параметры)\nКонецПроцедуры\n";
     assert_eq!(delete_fix(source), "");
 }
+
+#[test]
+fn guard_goes_after_local_variables_inside_a_leading_region() {
+    let source =
+        "Процедура ПередЗаписью(Отказ)\n\t#Область Служебная\n\tПерем Итог;\n\tИтог = 1;\n\
+                  \t#КонецОбласти\nКонецПроцедуры\n";
+    assert_eq!(
+        guard_fix(source),
+        "DataExchangeLoading @ 1:11 Добавить проверку ОбменДанными.Загрузка [fix_all=false]\n\
+         Процедура ПередЗаписью(Отказ)\n\t#Область Служебная\n\tПерем Итог;\n\
+         \tЕсли ОбменДанными.Загрузка Тогда\n\t\tВозврат;\n\tКонецЕсли;\n\
+         \tИтог = 1;\n\t#КонецОбласти\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn declarations_sharing_a_directive_with_statements_get_no_guard_fix() {
+    let source = "Процедура ПередЗаписью(Отказ)\n#Если Сервер Тогда\n\tПерем Итог;\n\tИтог = 1;\n\
+                  #КонецЕсли\nКонецПроцедуры\n";
+    assert_eq!(guard_fix(source), "DataExchangeLoading @ 1:11 no fix");
+}
+
+#[test]
+fn dead_method_on_the_first_line_of_a_bom_file_is_deleted_with_its_doc_comment() {
+    let source = "\u{FEFF}// Док Лишней\nПроцедура Лишняя()\nКонецПроцедуры\n\n\
+                  Процедура Вторая() Экспорт\nКонецПроцедуры\n";
+    assert_eq!(
+        delete_fix(source),
+        "UnusedLocalMethod @ 2:11 Удалить неиспользуемый метод \"Лишняя\" [fix_all=false]\n\
+         \u{FEFF}Процедура Вторая() Экспорт\nКонецПроцедуры\n"
+    );
+    let source = "\u{FEFF}Процедура Лишняя()\nКонецПроцедуры\n\nПроцедура Вторая() Экспорт\nКонецПроцедуры\n";
+    assert_eq!(
+        delete_fix(source),
+        "UnusedLocalMethod @ 1:12 Удалить неиспользуемый метод \"Лишняя\" [fix_all=false]\n\
+         \u{FEFF}Процедура Вторая() Экспорт\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn guard_goes_after_a_directive_wrapping_only_local_variables() {
+    let source = "Процедура ПередЗаписью(Отказ)\n#Если Сервер Тогда\n\tПерем Итог;\n#КонецЕсли\n\
+                  \tИтог = 1;\nКонецПроцедуры\n";
+    assert_eq!(
+        guard_fix(source),
+        "DataExchangeLoading @ 1:11 Добавить проверку ОбменДанными.Загрузка [fix_all=false]\n\
+         Процедура ПередЗаписью(Отказ)\n#Если Сервер Тогда\n\tПерем Итог;\n#КонецЕсли\n\
+         \tЕсли ОбменДанными.Загрузка Тогда\n\t\tВозврат;\n\tКонецЕсли;\n\
+         \tИтог = 1;\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn guard_stays_unconditional_before_a_leading_directive_without_declarations() {
+    let source = "Процедура ПередЗаписью(Отказ)\n#Если Сервер Тогда\n\tИтог = 1;\n#КонецЕсли\n\
+                  КонецПроцедуры\n";
+    assert_eq!(
+        guard_fix(source),
+        "DataExchangeLoading @ 1:11 Добавить проверку ОбменДанными.Загрузка [fix_all=false]\n\
+         Процедура ПередЗаписью(Отказ)\nЕсли ОбменДанными.Загрузка Тогда\n\tВозврат;\n\
+         КонецЕсли;\n#Если Сервер Тогда\n\tИтог = 1;\n#КонецЕсли\nКонецПроцедуры\n"
+    );
+}

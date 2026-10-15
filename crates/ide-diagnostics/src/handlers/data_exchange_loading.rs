@@ -103,12 +103,28 @@ fn insert_guard_fix(root: &SyntaxNode, source_range: TextRange) -> Vec<Fix> {
         .find(|token| token.kind() == SyntaxKind::KW_PROCEDURE)
         .is_some_and(|keyword| keyword.text().is_ascii());
 
-    let first_statement = method
-        .children()
-        .find(|node| node.kind() == SyntaxKind::STMT_LIST)
-        .and_then(|list| list.children().find(|stmt| stmt.kind() != SyntaxKind::VAR_DEF));
+    let list = method.children().find(|node| node.kind() == SyntaxKind::STMT_LIST);
+    // A directive may wrap declarations (`#Если` holds them as its own children), and
+    // the guard has to follow every one of them.
+    let declarations_end = list
+        .iter()
+        .flat_map(|list| list.descendants())
+        .filter(|node| node.kind() == SyntaxKind::VAR_DEF)
+        .map(|node| node.text_range().end())
+        .max();
+    let statements: Vec<SyntaxNode> = list
+        .iter()
+        .flat_map(|list| list.children())
+        .filter(|node| node.kind() != SyntaxKind::VAR_DEF)
+        .collect();
+    let first_statement = statements
+        .iter()
+        .find(|stmt| declarations_end.is_none_or(|end| stmt.text_range().start() >= end));
 
     let Line { start, indent, newline } = match first_statement {
+        // Declarations and statements under one directive leave no line at this level
+        // that follows the declarations and precedes the statements.
+        None if !statements.is_empty() => return Vec::new(),
         Some(stmt) => {
             // A statement sharing its line with the header or another statement has
             // no line of its own to put the guard above.
@@ -168,6 +184,8 @@ fn own_line(token: &SyntaxToken) -> Option<Line> {
                 let newline = if crlf { "\r\n" } else { "\n" }.to_string();
                 return Some(Line { start, indent, newline });
             }
+            // The byte order mark opens the file without being text of its first line.
+            SyntaxKind::BOM => break,
             _ => return None,
         }
     }

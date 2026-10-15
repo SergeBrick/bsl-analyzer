@@ -122,19 +122,24 @@ fn numbered(
 /// follows, so whichever of the two candidate spellings the tables above did not use is offered
 /// too, provisionally: an English query must not be told that a field it spelled correctly is
 /// missing.
+///
+/// The entry is that English spelling alone. The Russian name is already an explicit field of
+/// the same table; a second, provisional entry under it would make
+/// [`ResolvedTable::column_is_provisional`] treat the known field as optional, and two sources
+/// that both offer it would not be reported ambiguous.
 fn split_balance_spellings(member: &Member, prefix_en: &str, out: &mut Vec<FieldDef>) {
-    let (ru_prefix, other) = match prefix_en {
-        "" => ("", "Splitted"),
-        "Opening" => ("Начальный", "Extended"),
-        _ => ("Конечный", "Extended"),
+    let other = match prefix_en {
+        "" => "Splitted",
+        _ => "Extended",
     };
-    for (side, side_en) in [("Дт", "Dr"), ("Кт", "Cr")] {
-        out.push(member.derived(
-            &format!("{ru_prefix}РазвернутыйОстаток{side}"),
-            &format!("{prefix_en}{other}Balance{side_en}"),
+    let base_en = member.name_en.as_deref().unwrap_or(&member.name);
+    for side_en in ["Dr", "Cr"] {
+        let mut field = FieldDef::new(
+            format!("{base_en}{prefix_en}{other}Balance{side_en}"),
             member.ty.clone(),
-            true,
-        ));
+        );
+        field.provisional = true;
+        out.push(field);
     }
 }
 

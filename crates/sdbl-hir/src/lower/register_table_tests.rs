@@ -505,6 +505,37 @@ fn an_ambiguous_output_is_reported_once_with_its_sources() {
     );
 }
 
+/// A split balance the reference names outright is an occurrence in every source that offers
+/// it. `Ресурс1ОстатокДт` already is; the extended spelling must be too.
+#[test]
+fn an_explicit_split_balance_is_ambiguous_across_two_balance_tables() {
+    let query = "ВЫБРАТЬ Ресурс1РазвернутыйОстатокДт КАК Р ИЗ РегистрБухгалтерии.Бухгалтерия1.Остатки(&Начало, , , ) КАК Начало ЛЕВОЕ СОЕДИНЕНИЕ РегистрБухгалтерии.Бухгалтерия1.Остатки(&Конец, , , ) КАК Конец ПО Начало.Счет = Конец.Счет";
+    assert_eq!(
+        ambiguity_reports_in(configuration(true), query),
+        vec![(
+            "Ресурс1РазвернутыйОстатокДт".to_string(),
+            vec!["Конец".to_string(), "Начало".to_string()],
+        )],
+    );
+
+    for name in ["Ресурс1НачальныйРазвернутыйОстатокДт", "Ресурс1КонечныйРазвернутыйОстатокДт"]
+    {
+        let query = format!(
+            "ВЫБРАТЬ {name} КАК Р ИЗ РегистрБухгалтерии.Бухгалтерия1.ОстаткиИОбороты(&Начало, &Конец, , , , , ) КАК Начало ЛЕВОЕ СОЕДИНЕНИЕ РегистрБухгалтерии.Бухгалтерия1.ОстаткиИОбороты(&Начало, &Конец, , , , , ) КАК Конец ПО Начало.Счет = Конец.Счет"
+        );
+        assert_eq!(
+            ambiguity_reports_in(configuration(true), &query),
+            vec![(name.to_string(), vec!["Конец".to_string(), "Начало".to_string()])],
+            "{name}",
+        );
+    }
+
+    // The unattested English spelling stays listed, so a query that uses it is not told the
+    // field is missing. It is provisional, so it is not an occurrence for the ambiguity rule.
+    let english = "ВЫБРАТЬ Ресурс1SplittedBalanceDr ИЗ РегистрБухгалтерии.Бухгалтерия1.Остатки(&Период, , , ) КАК Т";
+    assert_eq!(unknown_fields_in(configuration(true), english), Vec::<String>::new());
+}
+
 /// Code shipped in a typical configuration selects a turnovers-register attribute from
 /// `Обороты`; whether the platform allows it is not settled, so the field must not be reported.
 #[test]

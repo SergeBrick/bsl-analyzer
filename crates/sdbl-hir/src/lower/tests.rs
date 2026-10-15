@@ -1726,6 +1726,74 @@ fn test_join_paren_field_resolution() {
     assert!(!resolved.is_empty(), "Fields inside parens should produce resolved field tokens");
 }
 
+/// A bare name in `УПОРЯДОЧИТЬ ПО` is not unresolved merely because the outputs frame is open.
+/// That frame carries a synthetic table so a result column can be named; it is not a source
+/// whose metadata would let the lowering judge a field. With no source metadata, the same
+/// name in `ГДЕ` stays a field name.
+#[test]
+fn order_by_bare_name_is_not_unresolved_when_no_source_has_metadata() {
+    let order_by = "ВЫБРАТЬ 1 КАК Х ИЗ Справочник.НетТакого КАК С УПОРЯДОЧИТЬ ПО Поле";
+    let ast = parser::parse_sdbl(order_by);
+    let package = lower_sdbl_to_hir(
+        &ast,
+        Some(std::sync::Arc::new(bsl_metadata::Configuration::new("Test"))),
+    );
+    let unresolved: Vec<_> = package
+        .source_map
+        .tokens_by_category(crate::source_map::TokenCategory::UnresolvedFieldName)
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    assert!(
+        !unresolved.contains(&"Поле"),
+        "ORDER BY must not mark a bare name unresolved when no source has metadata: {unresolved:?}"
+    );
+    let field_names: Vec<_> = package
+        .source_map
+        .tokens_by_category(crate::source_map::TokenCategory::FieldName)
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    assert!(
+        field_names.contains(&"Поле"),
+        "ORDER BY keeps the name as a field name when no source has metadata: {field_names:?}"
+    );
+
+    let totals = "ВЫБРАТЬ 1 КАК Х ИЗ Справочник.НетТакого КАК С ИТОГИ ПО Поле";
+    let ast = parser::parse_sdbl(totals);
+    let package = lower_sdbl_to_hir(
+        &ast,
+        Some(std::sync::Arc::new(bsl_metadata::Configuration::new("Test"))),
+    );
+    let unresolved: Vec<_> = package
+        .source_map
+        .tokens_by_category(crate::source_map::TokenCategory::UnresolvedFieldName)
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    assert!(
+        !unresolved.contains(&"Поле"),
+        "TOTALS BY must not mark a bare name unresolved when no source has metadata: {unresolved:?}"
+    );
+
+    let where_query = "ВЫБРАТЬ 1 КАК Х ИЗ Справочник.НетТакого КАК С ГДЕ Поле = 1";
+    let ast = parser::parse_sdbl(where_query);
+    let package = lower_sdbl_to_hir(
+        &ast,
+        Some(std::sync::Arc::new(bsl_metadata::Configuration::new("Test"))),
+    );
+    let field_names: Vec<_> = package
+        .source_map
+        .tokens_by_category(crate::source_map::TokenCategory::FieldName)
+        .iter()
+        .map(|token| token.text.as_str())
+        .collect();
+    assert!(
+        field_names.contains(&"Поле"),
+        "WHERE keeps the same name as a field name when the source has no metadata: {field_names:?}"
+    );
+}
+
 fn create_config_with_accumulation_register() -> bsl_metadata::Configuration {
     use bsl_metadata::{
         dimension::DimensionBuilder, register::RegisterResource, MdoType, Register,

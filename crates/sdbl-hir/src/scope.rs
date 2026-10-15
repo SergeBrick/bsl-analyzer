@@ -162,6 +162,25 @@ impl<'a> Scope<'a> {
         self.frames.iter().flat_map(|f| f.tables.values())
     }
 
+    /// Whether a real source has metadata. The select-list outputs frame is not a source: it
+    /// holds a synthetic table so `УПОРЯДОЧИТЬ ПО` and `ИТОГИ` can name a result column, and
+    /// counting that table would judge a bare name even when no source has a field set.
+    pub(crate) fn source_has_metadata(&self, alias: Option<&str>) -> bool {
+        let sources = self.frames.iter().filter(|frame| !frame.outputs);
+        match alias {
+            Some(alias) => {
+                let key = alias.fold_lower();
+                sources
+                    .rev()
+                    .find_map(|frame| frame.tables.get(&key))
+                    .is_some_and(|table| table.metadata.is_some())
+            }
+            None => sources
+                .flat_map(|frame| frame.tables.values())
+                .any(|table| table.metadata.is_some()),
+        }
+    }
+
     pub fn resolve_column_type(&self, table_alias: Option<&str>, column_name: &str) -> SdblType {
         if let Some(alias) = table_alias {
             if let Some(table) = self.find_table(alias) {

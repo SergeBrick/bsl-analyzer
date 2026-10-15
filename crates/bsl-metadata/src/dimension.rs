@@ -18,6 +18,13 @@ pub struct Dimension {
     #[serde(rename = "indexing", default)]
     indexing: String,
 
+    /// `Балансовый` of an accounting-register dimension; `None` where the XML carries no such
+    /// property (every other register kind). A query names a NON-balance dimension of a
+    /// correspondence register by its debit and credit sides (`<Измерение>Дт`, `<Измерение>Кт`), so this
+    /// flag decides which field names exist at all.
+    #[serde(rename = "balance", default)]
+    balance: Option<bool>,
+
     #[serde(default, skip)]
     type_str: String,
 
@@ -48,6 +55,14 @@ impl Dimension {
 
     pub fn indexing(&self) -> &str {
         &self.indexing
+    }
+
+    pub fn balance(&self) -> Option<bool> {
+        self.balance
+    }
+
+    pub fn set_balance(&mut self, balance: Option<bool>) {
+        self.balance = balance;
     }
 
     pub fn type_str(&self) -> &str {
@@ -86,6 +101,7 @@ pub struct DimensionBuilder {
     deny_incomplete_values: bool,
     master: bool,
     indexing: String,
+    balance: Option<bool>,
 }
 
 impl DimensionBuilder {
@@ -114,6 +130,11 @@ impl DimensionBuilder {
         self
     }
 
+    pub fn balance(mut self, balance: Option<bool>) -> Self {
+        self.balance = balance;
+        self
+    }
+
     pub fn build(self) -> Dimension {
         Dimension {
             uuid: self.uuid.unwrap_or_else(Uuid::new_v4),
@@ -121,6 +142,7 @@ impl DimensionBuilder {
             deny_incomplete_values: self.deny_incomplete_values,
             master: self.master,
             indexing: self.indexing,
+            balance: self.balance,
             type_str: String::new(),
             attr_type: None,
         }

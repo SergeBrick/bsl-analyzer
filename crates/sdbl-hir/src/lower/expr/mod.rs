@@ -158,15 +158,10 @@ impl LoweringContext<'_> {
             } else {
                 let field_exists =
                     self.scope.find_field_def(table_alias_str, column_name_str).is_some();
-                let can_validate_field = self.resolver.is_some()
-                    && match table_alias_str {
-                        Some(alias) => self
-                            .scope
-                            .find_table(alias)
-                            .map(|table| table.metadata.is_some())
-                            .unwrap_or(false),
-                        None => self.scope.all_tables().any(|table| table.metadata.is_some()),
-                    };
+                // The outputs frame is not a source. `all_tables` includes it, and its synthetic
+                // table would make a bare name look validatable when no source has metadata.
+                let can_validate_field =
+                    self.resolver.is_some() && self.scope.source_has_metadata(table_alias_str);
                 let category = if (ty != SdblType::Unknown && ty != SdblType::Error)
                     || field_exists
                     || !can_validate_field

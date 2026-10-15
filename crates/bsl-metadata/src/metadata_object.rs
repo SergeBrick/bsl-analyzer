@@ -469,6 +469,10 @@ pub struct MetadataObject {
     pub constant_type: Option<AttributeType>,
     #[serde(default)]
     pub register_records: Vec<(MdoType, Name)>,
+    /// `МаксКоличествоСубконто` of a chart of accounts; `None` for every other kind. The
+    /// accounting registers kept on the chart expose exactly this many `Субконто<N>` fields.
+    #[serde(default)]
+    pub max_ext_dimension_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<Uuid>,
     #[serde(default)]
@@ -837,6 +841,7 @@ impl MetadataObject {
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
             register_records: Vec::new(),
+            max_ext_dimension_count: None,
             uuid: None,
             object_belonging: crate::ObjectBelonging::Own,
             extended_configuration_object: None,
@@ -864,6 +869,7 @@ impl MetadataObject {
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
             register_records: Vec::new(),
+            max_ext_dimension_count: None,
             uuid: None,
             object_belonging: crate::ObjectBelonging::Own,
             extended_configuration_object: None,
@@ -878,6 +884,10 @@ impl MetadataObject {
 
     pub fn set_register_records(&mut self, records: Vec<(MdoType, Name)>) {
         self.register_records = records;
+    }
+
+    pub fn set_max_ext_dimension_count(&mut self, count: Option<u32>) {
+        self.max_ext_dimension_count = count;
     }
 
     /// Apply an extension overlay onto this object, replacing same-named members,
@@ -936,6 +946,9 @@ impl MetadataObject {
 
         if !overlay.register_records().is_empty() {
             self.set_register_records(overlay.register_records().to_vec());
+        }
+        if overlay.max_ext_dimension_count.is_some() {
+            self.max_ext_dimension_count = overlay.max_ext_dimension_count;
         }
 
         crate::common_attribute::merge_common_attribute_fields(
@@ -1283,6 +1296,20 @@ mod tests {
 
         assert_eq!(MdoType::from_plural("InvalidType"), None);
         assert_eq!(MdoType::from_plural(""), None);
+    }
+
+    #[test]
+    fn extension_overlay_takes_max_ext_dimension_count_when_specified() {
+        let mut base = MetadataObject::new(MdoType::ChartOfAccounts, "План1");
+        base.set_max_ext_dimension_count(Some(3));
+        let mut overlay = MetadataObject::new(MdoType::ChartOfAccounts, "План1");
+        overlay.set_max_ext_dimension_count(Some(5));
+        base.apply_extension_overlay(&overlay);
+        assert_eq!(base.max_ext_dimension_count, Some(5));
+
+        let silent = MetadataObject::new(MdoType::ChartOfAccounts, "План1");
+        base.apply_extension_overlay(&silent);
+        assert_eq!(base.max_ext_dimension_count, Some(5), "an omitted count stays with the base",);
     }
 
     #[test]

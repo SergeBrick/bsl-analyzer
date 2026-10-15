@@ -4914,7 +4914,6 @@ mod graph_supersession_contract {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn references_misses_immediately_when_preopened_handles_are_busy() {
-        let _walk_serial = crate::walk_probe::WALK_GATE.lock().await;
         assert_busy_graph_handler_returns_immediately(BusyGraphHandler::References).await;
     }
 

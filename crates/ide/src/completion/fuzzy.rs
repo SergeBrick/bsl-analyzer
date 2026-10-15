@@ -32,6 +32,10 @@ pub(super) struct MatchResult {
     /// Raw `nucleo` score, higher is a better match; used as an intra-tier
     /// tiebreak.
     pub score: u16,
+    /// The hit came only through the wrong-keyboard-layout alternative of the
+    /// typed text. The client filters the list again by the typed word, so such
+    /// an item needs [`layout_filter_text`] or the client drops it.
+    pub layout: bool,
 }
 
 /// A matcher bound to a single typed prefix, reused across all candidates of one
@@ -105,7 +109,7 @@ impl PrefixMatcher {
     /// text nor its wrong-layout alternative is a subsequence of the candidate.
     pub(super) fn score(&mut self, candidate: &str) -> Option<MatchResult> {
         if self.empty {
-            return Some(MatchResult { tier: MatchTier::Prefix, score: 0 });
+            return Some(MatchResult { tier: MatchTier::Prefix, score: 0, layout: false });
         }
 
         let hay_lower = candidate.fold_lower();
@@ -116,6 +120,7 @@ impl PrefixMatcher {
         if let Some((alt, _)) = &self.alt {
             if let Some(mut r) = fuzzy_score(&mut self.matcher, &hay_lower, alt, candidate) {
                 r.tier = MatchTier::Fuzzy;
+                r.layout = true;
                 return Some(r);
             }
         }
@@ -157,7 +162,7 @@ fn fuzzy_score(
     indices.sort_unstable();
 
     let tier = classify_tier(candidate, &indices);
-    Some(MatchResult { tier, score })
+    Some(MatchResult { tier, score, layout: false })
 }
 
 /// Lowercase keys of the QWERTY layout, row by row; the char at the same position
@@ -197,6 +202,44 @@ fn transpose_layout(s: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// Longest `filterText` the client matches in full: VS Code's `fuzzyScore` cuts
+/// both the word and the candidate to 128 UTF-16 units, so anything past that is
+/// invisible to it.
+const CLIENT_FILTER_MAX: usize = 128;
+
+/// `filterText` for an item admitted only through the wrong-layout alternative of
+/// the typed text: the item's own filter text (or label) followed by its words
+/// transposed into the other layout.
+///
+/// The client (VS Code) re-filters the list by the word at the cursor against
+/// `filterText` and requires the first typed char to land on a word start; the
+/// typed `pfg` never matches `Запрос`, but it is a prefix of the appended word
+/// `pfghjc`, which starts after a space. The original text stays first, so the
+/// client's highlight and score of a correct-layout match are unaffected, and the
+/// appended words score below a match at position 0.
+pub(super) fn layout_filter_text(label: &str, filter_text: Option<&str>) -> String {
+    let mut out = filter_text.unwrap_or(label).to_string();
+    let words =
+        label.split_whitespace().chain(filter_text.into_iter().flat_map(str::split_whitespace));
+    let mut seen: Vec<String> = Vec::new();
+    for word in words {
+        let Some(transposed) = transpose_layout(&word.fold_lower()) else {
+            continue;
+        };
+        if seen.contains(&transposed) {
+            continue;
+        }
+        let len = out.encode_utf16().count() + 1 + transposed.encode_utf16().count();
+        if len > CLIENT_FILTER_MAX {
+            continue;
+        }
+        out.push(' ');
+        out.push_str(&transposed);
+        seen.push(transposed);
+    }
+    out
+}
+
 /// Score a completion candidate by its label and any bilingual aliases carried in
 /// `filter_text` (platform/metadata items store `"<ru> <en>"`, possibly multi-word),
 /// keeping the best tier. The whole `filter_text` is scored first so a contiguous
@@ -229,9 +272,13 @@ fn fold_best(
         return best;
     };
     match best {
+        // On an equal tier a correct-layout hit beats a layout-corrected one, so
+        // an item that matches directly never gets a transposed filter text.
         Some(current)
             if current.tier < candidate.tier
-                || (current.tier == candidate.tier && current.score >= candidate.score) =>
+                || (current.tier == candidate.tier
+                    && (!current.layout, current.score)
+                        >= (!candidate.layout, candidate.score)) =>
         {
             Some(current)
         }
@@ -327,10 +374,11 @@ mod tests {
 
     #[test]
     fn wrong_layout_matches_but_is_demoted() {
-        // "nf," typed on a US layout is "таб" on ЙЦУКЕН -> ТаблицаЗначений.
-        let mut m = PrefixMatcher::new("nf,");
-        let r = m.score("ТаблицаЗначений").expect("wrong-layout prefix should still match");
+        // "pfg" typed on a US layout is "зап" on ЙЦУКЕН -> Запрос.
+        let mut m = PrefixMatcher::new("pfg");
+        let r = m.score("Запрос").expect("wrong-layout prefix should still match");
         assert_eq!(r.tier, MatchTier::Fuzzy, "layout-corrected hits never outrank real ones");
+        assert!(r.layout, "a hit through the transposed needle must be flagged");
         // Reverse direction: Cyrillic keys for a Latin identifier.
         assert!(PrefixMatcher::new("мфд").score("ValueTable").is_some()); // м-ф-д = v-a-l
     }
@@ -338,6 +386,38 @@ mod tests {
     #[test]
     fn correct_layout_is_not_demoted() {
         assert_eq!(tier("таб", "ТаблицаЗначений"), Some(MatchTier::Prefix));
+        assert!(!PrefixMatcher::new("таб").score("ТаблицаЗначений").unwrap().layout);
+    }
+
+    #[test]
+    fn word_stops_before_punctuation_keys() {
+        // б ю ж э х ъ sit on , . ; ' [ ] of the US layout: in the editor the word
+        // at the cursor ends there, so only the letters before it reach the
+        // server. `nf` (= "та") still finds the name; `nf,` is never sent.
+        let r = PrefixMatcher::new("nf").score("ТаблицаЗначений").expect("letters before , match");
+        assert!(r.layout);
+    }
+
+    #[test]
+    fn layout_filter_text_appends_transposed_words() {
+        assert_eq!(layout_filter_text("Запрос", None), "Запрос pfghjc");
+        assert_eq!(layout_filter_text("Запрос", Some("Запрос Query")), "Запрос Query pfghjc йгукн");
+        // Cyrillic keys for a Latin name: the appended word is Cyrillic.
+        assert_eq!(layout_filter_text("ValueTable", None), "ValueTable мфдгуефиду");
+    }
+
+    #[test]
+    fn layout_filter_text_stays_within_client_limit() {
+        // 41 + 1 + 41 chars: the transposed label still fits, the alias no longer.
+        let long = "ОченьДлинноеИмяПеременнойКотороеНеВлезает";
+        let alias = "VeryLongVariableNameThatDoesNotFitAnyMore";
+        let original = format!("{long} {alias}");
+        let text = layout_filter_text(long, Some(&original));
+        assert!(text.encode_utf16().count() <= CLIENT_FILTER_MAX, "{text}");
+        assert_eq!(text, format!("{original} {}", transpose_layout(&long.fold_lower()).unwrap()));
+        // Already past the limit: nothing to add that the client would see.
+        let huge = long.repeat(4);
+        assert_eq!(layout_filter_text(&huge, None), huge);
     }
 
     #[test]
@@ -353,8 +433,8 @@ mod tests {
 
     #[test]
     fn admits_wrong_layout() {
-        assert!(PrefixMatcher::new("nf,").admits("ТаблицаЗначений"));
-        assert!(PrefixMatcher::new("nf,").admits_contiguous("ТаблицаЗначений"));
+        assert!(PrefixMatcher::new("pfg").admits("Запрос"));
+        assert!(PrefixMatcher::new("pfg").admits_contiguous("Запрос"));
     }
 
     #[test]

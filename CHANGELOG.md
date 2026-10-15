@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 - mcp-server: состав проекта, заданный флагами, закреплён boot-тестом: `SharedState::workspace`
   на вложенных конфигурациях глубже досягаемости автопоиска строит проект через
   `project::at` — возврат на `project_model::Project::new` роняет тест (github#227).
+- debug: отказ сервера отладки (HTTP не 2xx) доходит до вызывающего с текстом `descr`,
+  а не читается как успех; `setBreakpoints`, отвергнутый 8.3.17 из-за
+  `breakOnCondition`, повторяется без него. Ошибка `eval` возвращает текст платформы
+  из `exceptionStr`. Предмет, остановленный до `attach`, находится через
+  `getDbgAllTargetStates` и продолжается (`continue`/`step`, параметр `target`);
+  `disconnect` продолжает остановленные предметы перед отключением (github#421).
+  `locals` и `expand` без ответа за 5 с — ошибка, а не пустой успех; имя файла
+  аренды отладчика не длиннее 255 байт.
 
 ## [0.3.2] - 2026-10-11
 

@@ -89,7 +89,7 @@ impl ResidentSession {
             // The clone is a local: it cannot outlive this closure, and an unwind
             // through it drops it just the same. A clone that escaped would park the
             // next `set_file_text_source` on salsa's `while *clones != 1`.
-            let analysis = ide::Analysis::from_database(resident.db().clone());
+            let analysis = resident.analysis();
             self.cancel.register(salsa::Database::cancellation_token(analysis.database()));
             // Attached for the WHOLE body: that is what keeps a cancel landing inside a
             // query alive for the next file-boundary checkpoint (`Analysis::attached`).
@@ -665,6 +665,133 @@ mod tests {
                 CallOutcome::Panicked
             ),
             "a panic must never be dressed up as a cancellation"
+        );
+    }
+
+    /// A disk edit between cloning the resident analysis and its first file-text query
+    /// is a real revision-mismatch panic. The call keeps that terminal outcome; after
+    /// it unwinds, the owner can publish the saved bytes and a fresh call reads them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disk_revision_drift_is_a_terminal_panic_then_fresh_read_recovers() {
+        use crate::diagnostics_state::test_support::module_path;
+        use crate::workspace_handle::WorkspaceRead;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = module_path(root, "Сервер");
+        let original_text = "&НаСервере\nФункция Считать() Экспорт\n Возврат 1;\nКонецФункции\n";
+        let saved_text = "&НаСервере\nФункция Считать() Экспорт\n Возврат \"два\";\nКонецФункции\n";
+        write_common_module(root, "Сервер", true, original_text);
+        write(root, "bsl-analyzer.toml", "[source]\nroot = \".\"\n");
+        let state = ready_state(root);
+        let before = state.workspace_snapshot().expect("ready owner snapshot");
+        let canonical_path = path.canonicalize().unwrap();
+        let file_id = before
+            .catalog
+            .iter()
+            .find(|file| file.path == canonical_path)
+            .expect("the saved module is an admitted disk member")
+            .file_id;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let original_reads = Arc::new(AtomicUsize::new(0));
+        let counted_reads = Arc::clone(&original_reads);
+        let mismatch_observed = Arc::new(AtomicBool::new(false));
+        let observed_by_request = Arc::clone(&mismatch_observed);
+        let request_state = state.clone();
+        let request = tokio::spawn(async move {
+            resident_call(
+                request_state,
+                tokio_util::sync::CancellationToken::new(),
+                move |session| {
+                    session.read(|_, analysis, _| {
+                        entered_tx.send(()).expect("test is waiting for the query gate");
+                        release_rx.recv().expect("test releases the query gate");
+                        counted_reads.fetch_add(1, AtomicOrdering::SeqCst);
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            analysis.file_text(file_id).to_string()
+                        })) {
+                            Ok(text) => text,
+                            Err(payload) => {
+                                let message = payload
+                                    .downcast_ref::<String>()
+                                    .map(String::as_str)
+                                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                                    .unwrap_or_default();
+                                observed_by_request.store(
+                                    message.contains("file_text revision mismatch"),
+                                    AtomicOrdering::SeqCst,
+                                );
+                                std::panic::resume_unwind(payload)
+                            }
+                        }
+                    })
+                },
+            )
+            .await
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("request cloned the resident analysis before the first text query");
+        std::fs::write(&path, saved_text).unwrap();
+        release_tx.send(()).expect("the blocked request still owns its query gate");
+        let outcome = tokio::time::timeout(Duration::from_secs(30), request)
+            .await
+            .expect("the revision-mismatch request must terminate")
+            .expect("resident call task joins");
+        assert!(
+            matches!(outcome, CallOutcome::Panicked),
+            "a genuine file_text revision mismatch remains a terminal panic, not an automatic retry"
+        );
+        assert!(
+            mismatch_observed.load(AtomicOrdering::SeqCst),
+            "the panic must come from the disk-backed file_text revision check"
+        );
+        assert_eq!(original_reads.load(AtomicOrdering::SeqCst), 1);
+
+        let refresh_state = state.clone();
+        let refresh_path = path.clone();
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || refresh_state.refresh_saved_path(&refresh_path)),
+        )
+        .await
+        .expect("owner refresh must not wait on a leaked analysis clone")
+        .expect("owner refresh task joins");
+        let refreshed = match refreshed {
+            WorkspaceRead::Ready(snapshot) => snapshot,
+            _ => panic!("stable saved path refresh must publish"),
+        };
+        assert_eq!(refreshed.generation, before.generation + 1);
+        assert_eq!(
+            refreshed.catalog.iter().find(|file| file.path == canonical_path).unwrap().file_id,
+            file_id,
+            "the owner refresh retains the captured file identity"
+        );
+
+        let next_state = state.clone();
+        let next = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                next_state.read(|resident, _| resident.analysis().file_text(file_id).to_string())
+            }),
+        )
+        .await
+        .expect("a fresh resident read must complete")
+        .expect("fresh read task joins");
+        match next {
+            ResidentOutcome::Ready(text, _) => assert_eq!(text, saved_text),
+            _ => panic!("the refreshed owner must serve the saved text"),
+        }
+        assert_eq!(state.workspace_generation().unwrap(), refreshed.generation);
+        assert_eq!(
+            original_reads.load(AtomicOrdering::SeqCst),
+            1,
+            "the failed request is not replayed"
         );
     }
 

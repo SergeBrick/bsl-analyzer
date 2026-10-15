@@ -250,9 +250,25 @@ impl ReferenceSearchState {
         )
     }
 
+    fn new_deferred(project_root: Option<&Path>) -> Self {
+        Self::new_with_reference_cache_and_deferral(
+            project_root,
+            SharedState::reference_search_db_path().as_deref(),
+            true,
+        )
+    }
+
     fn new_with_reference_cache(
         project_root: Option<&Path>,
         reference_cache: Option<&Path>,
+    ) -> Self {
+        Self::new_with_reference_cache_and_deferral(project_root, reference_cache, false)
+    }
+
+    fn new_with_reference_cache_and_deferral(
+        project_root: Option<&Path>,
+        reference_cache: Option<&Path>,
+        defer_credentials: bool,
     ) -> Self {
         let (project_config, mut lifecycle) = match project_root {
             Some(root) => match project_model::ProjectConfig::load(root) {
@@ -300,9 +316,16 @@ impl ReferenceSearchState {
                 }
             },
         );
-        let baseline = match &lifecycle {
-            ReferenceSearchLifecycle::Failed { .. } => DeferredBaselineRuntime::absent(),
-            _ => match BaselineRuntime::reference_bootstrap(project_config.as_ref())
+        let mut baseline_resolution = None;
+        let bootstrap = if matches!(lifecycle, ReferenceSearchLifecycle::Failed { .. }) {
+            None
+        } else {
+            Some(
+                if defer_credentials {
+                    BaselineRuntime::reference_bootstrap_deferred(project_config.as_ref())
+                } else {
+                    BaselineRuntime::reference_bootstrap(project_config.as_ref())
+                }
                 .with_token_layout_claim(
                     SharedState::embedding_config_with_prefixes(Some(&embedding_prefixes))
                         .ok()
@@ -312,9 +335,23 @@ impl ReferenceSearchState {
                                 .token_layout_claim()
                                 .map(str::to_owned)
                         }),
-                ) {
+                ),
+            )
+        };
+        let baseline = match bootstrap {
+            None => DeferredBaselineRuntime::absent(),
+            Some(bootstrap) => match bootstrap {
                 BaselineBootstrap::Immediate(runtime) => DeferredBaselineRuntime::ready(runtime),
                 BaselineBootstrap::Connect(plan) => DeferredBaselineRuntime::spawn(*plan),
+                BaselineBootstrap::ResolveCredentials(plan) if defer_credentials => {
+                    baseline_resolution = Some(*plan);
+                    DeferredBaselineRuntime::pending()
+                }
+                BaselineBootstrap::ResolveCredentials(plan) => {
+                    let baseline = DeferredBaselineRuntime::pending();
+                    baseline.start_resolution(*plan);
+                    baseline
+                }
             },
         };
         Self {
@@ -324,6 +361,7 @@ impl ReferenceSearchState {
                 &embedding_prefixes,
             ))),
             baseline,
+            baseline_resolution: Arc::new(Mutex::new(baseline_resolution)),
             embedding_prefixes,
             lifecycle: Arc::new(Mutex::new(lifecycle)),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -349,9 +387,17 @@ impl ReferenceSearchState {
         drop(lifecycle);
 
         let state = self.clone();
+        let baseline_resolution =
+            self.baseline_resolution.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         let spawn = std::thread::Builder::new().name("bsl-search-reference-init".to_owned()).spawn(
             move || {
                 let _verdict = LoadingVerdict(state.clone());
+                if state.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(plan) = baseline_resolution {
+                    state.baseline.start_resolution(plan);
+                }
                 while !state.baseline.wait_ready(baseline_wait) {
                     if state.stopped.load(Ordering::Acquire) {
                         return;
@@ -512,6 +558,7 @@ impl ReferenceSearchState {
         // any wait it is already in.
         self.stop.stop();
         self.baseline.shutdown();
+        self.baseline_resolution.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         if let Some(worker) =
             self.worker.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
         {
@@ -610,14 +657,19 @@ impl From<project_model::ProjectError> for WorkspaceInitError {
 
 impl SharedState {
     /// The workspace search mode implied by the baseline bootstrap: configured INTENT,
-    /// never connect success. EVERY postgres-configured outcome — a deferred connect
-    /// AND the immediate failures (unconfigured section, credential rejection) — stays
-    /// in Postgres mode. Mapping a failure to `SqliteLocal` would route `search_code`
+    /// never connect or credential-helper success. EVERY postgres-configured outcome — a
+    /// deferred credential plan/connect and immediate configuration failure — stays in
+    /// Postgres mode. Mapping a failure to `SqliteLocal` would route `search_code`
     /// into a silent full local reindex of the configuration, hiding exactly the
     /// failure the issue text reports; in Postgres mode the gates surface that issue.
     fn workspace_mode_for(bootstrap: &BaselineBootstrap) -> WorkspaceSearchMode {
         match bootstrap {
             BaselineBootstrap::Connect(plan)
+                if matches!(plan.corpus(), CorpusId::WorkspaceCode) =>
+            {
+                WorkspaceSearchMode::PostgresRemoteOverlay
+            }
+            BaselineBootstrap::ResolveCredentials(plan)
                 if matches!(plan.corpus(), CorpusId::WorkspaceCode) =>
             {
                 WorkspaceSearchMode::PostgresRemoteOverlay
@@ -659,6 +711,26 @@ impl SharedState {
         source_dir: PathBuf,
         cache: crate::cache::WorkspaceCacheLayout,
         frozen_prefixes: Option<super::types::EmbeddingPrefixes>,
+    ) -> Result<Self, WorkspaceInitError> {
+        Self::workspace_with_cache_and_prefixes_impl(source_dir, cache, frozen_prefixes, false)
+    }
+
+    /// Construct the common disk owner without starting graph/search consumers.
+    /// The first MCP workspace session activates those consumers through
+    /// [`SharedState::ensure_workspace_services`].
+    pub fn shared_workspace_with_cache_and_prefixes(
+        source_dir: PathBuf,
+        cache: crate::cache::WorkspaceCacheLayout,
+        frozen_prefixes: Option<super::types::EmbeddingPrefixes>,
+    ) -> Result<Self, WorkspaceInitError> {
+        Self::workspace_with_cache_and_prefixes_impl(source_dir, cache, frozen_prefixes, true)
+    }
+
+    fn workspace_with_cache_and_prefixes_impl(
+        source_dir: PathBuf,
+        cache: crate::cache::WorkspaceCacheLayout,
+        frozen_prefixes: Option<super::types::EmbeddingPrefixes>,
+        disk_only: bool,
     ) -> Result<Self, WorkspaceInitError> {
         let project = crate::project::at(&source_dir)?;
         cache.verify_project(&project).map_err(WorkspaceInitError::Cache)?;
@@ -754,26 +826,33 @@ impl SharedState {
         let semantic_runtime =
             Arc::new(Mutex::new(initial_semantic_runtime_status(&embedding_prefixes)));
         let overlay_warmup = Arc::new(Mutex::new(OverlayWarmupState::Pending));
-        // Only the cheap, local part of baseline resolution runs here (config, env,
-        // credential helper); the PG connect itself is deferred to a background thread
-        // so a slow or unreachable server never delays the daemon's socket. The search
-        // mode is therefore decided by configured INTENT (credentials resolved for a
-        // postgres workspace baseline), not by connect success: a PG outage keeps the
-        // workspace in Postgres mode with a visible issue instead of silently falling
-        // back to (re)building a local index of the whole configuration.
+        // Ordinary workspace boot resolves config, env, and the credential helper here;
+        // the shared disk-only path captures those inputs but defers helper execution to
+        // service activation. Both keep the PostgreSQL connect off the startup path. The
+        // search mode comes from configured INTENT, so credential or PG failures remain
+        // visible in Postgres mode instead of silently triggering a local full reindex.
         let token_layout_claim = Self::embedding_config_with_prefixes(Some(&embedding_prefixes))
             .ok()
             .flatten()
             .and_then(|config| {
                 bsl_search::Embedder::new(config.embedder).token_layout_claim().map(str::to_owned)
             });
-        let bootstrap = BaselineRuntime::workspace_bootstrap(Some(&project.root), &project.config)
-            .with_token_layout_claim(token_layout_claim);
+        let bootstrap = if disk_only {
+            BaselineRuntime::workspace_bootstrap_deferred(Some(&project.root), &project.config)
+        } else {
+            BaselineRuntime::workspace_bootstrap(Some(&project.root), &project.config)
+        }
+        .with_token_layout_claim(token_layout_claim);
         let workspace_search_mode = Self::workspace_mode_for(&bootstrap);
         let embedding_publish_retry_budget = Self::embedding_publish_retry_budget();
-        let baseline = match bootstrap {
-            BaselineBootstrap::Immediate(runtime) => DeferredBaselineRuntime::ready(runtime),
-            BaselineBootstrap::Connect(plan) => DeferredBaselineRuntime::spawn(*plan),
+        let (baseline, baseline_plan) = match bootstrap {
+            BaselineBootstrap::Immediate(runtime) => {
+                (DeferredBaselineRuntime::ready(runtime), None)
+            }
+            BaselineBootstrap::Connect(plan) => (DeferredBaselineRuntime::spawn(*plan), None),
+            BaselineBootstrap::ResolveCredentials(plan) => {
+                (DeferredBaselineRuntime::pending(), Some(*plan))
+            }
         };
 
         // The change hub owns the recursive workspace watcher and starts before any
@@ -831,51 +910,9 @@ impl SharedState {
             let hub = change_hub.clone();
             owners.wakes(move || hub.interrupt_waiters());
         }
-        SharedState::start_scope_guard(
-            change_hub.clone(),
-            source_dir.clone(),
-            cache.clone(),
-            owners.clone(),
-            scope_transport_stop.clone(),
-        );
-
-        // The overlay retry driver exists only where an Embed pass exists: Postgres mode
-        // with an embedder. It is created before the graph hook so a root transition can kick
-        // the SAME owner; no second warmup worker is introduced.
-        let overlay_retry = if !workspace_lease.coordination_failed()
-            && matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay)
-        {
-            match Self::embedding_config_with_prefixes(Some(&embedding_prefixes)) {
-                Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
-                    Arc::clone(&search_engine),
-                    owners.clone(),
-                    Arc::clone(&overlay_warmup),
-                    Arc::clone(&semantic_runtime),
-                    workspace_lease.clone(),
-                    embedding_publish_retry_budget,
-                )),
-                Ok(None) => {
-                    Self::set_overlay_warmup_state(
-                        &overlay_warmup,
-                        OverlayWarmupState::Skipped("no embedder configured".to_owned()),
-                    );
-                    None
-                }
-                Err(error) => {
-                    Self::set_semantic_runtime_status(
-                        &semantic_runtime,
-                        SemanticRuntimeStatus::from_search_error(&error),
-                    );
-                    Self::set_overlay_warmup_state(
-                        &overlay_warmup,
-                        OverlayWarmupState::from_search_error(&error),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // The retry owner is activated with graph/search on first MCP use. LSP-only
+        // attachment needs the disk snapshot but never starts embedding work.
+        let overlay_retry = Arc::new(Mutex::new(None));
 
         // ONE embed single-flight shared by the boot pass and the post-context/root refresh kick,
         // so overlapping passes collapse into one and the installed index is always built from
@@ -894,7 +931,7 @@ impl SharedState {
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
-            overlay_retry.clone(),
+            Arc::clone(&overlay_retry),
             Arc::clone(&root_drift_epoch),
             embedding_prefixes.clone(),
             workspace_lease.clone(),
@@ -919,7 +956,23 @@ impl SharedState {
         // reindex through the snapshot-source adapter.
         let diagnostics = DiagnosticsState::for_workspace(source_dir.clone())
             .with_excluded(source_exclusions.clone())
+            .with_project(project.clone())
+            .with_last_good_on_invalid(disk_only)
             .with_change_hub(change_hub.clone());
+        if disk_only {
+            let diagnostics = diagnostics.clone();
+            owners.set_invalid_project_handler(move || {
+                (diagnostics.freeze_invalid_project(), diagnostics.had_invalid_configuration())
+            });
+        }
+        SharedState::start_scope_guard(
+            change_hub.clone(),
+            source_dir.clone(),
+            cache.clone(),
+            owners.clone(),
+            scope_transport_stop.clone(),
+            disk_only.then(|| diagnostics.clone()),
+        );
         let snapshot_source: Arc<dyn bsl_search::ModuleSnapshotSource> = Arc::new(
             crate::diagnostics_state::ResidentModuleSnapshotSource::new(diagnostics.clone()),
         );
@@ -940,42 +993,111 @@ impl SharedState {
             owners.wakes(move || backlog.stop());
         }
         let search_consumer = Arc::new(Mutex::new(super::ConsumerPhase::Pending));
-        // Started before the thread that builds the graph exists, so the watcher's cursor
-        // predates the first pre-scan and no change can fall between the two.
-        crate::graph::watcher::start(
-            &graph,
-            &change_hub,
-            Some((source_dir.clone(), Arc::clone(&standalone_notice_slot))),
-            owners.clone(),
-        );
-        Self::spawn_workspace_search_init(
-            Arc::clone(&search_engine),
-            Arc::clone(&workspace_search_initializing),
-            Arc::clone(&index_progress),
-            Arc::clone(&semantic_runtime),
-            source_dir.clone(),
-            change_hub.clone(),
-            sink_lease,
-            baseline.clone(),
-            workspace_search_mode.clone(),
-            graph.clone(),
-            Arc::clone(&embed_flight),
-            Arc::clone(&snapshot_source),
-            workspace_lease.clone(),
-            overlay_retry.clone(),
-            Arc::clone(&root_drift_epoch),
-            embedding_publish_retry_budget,
-            owners.clone(),
-            overlay_backlog.clone(),
-            Arc::clone(&search_consumer),
-            embedding_prefixes.clone(),
-        );
+        // The common disk owner can serve LSP before MCP has asked for persistent search.
+        // Keep the existing graph/search startup as one shared, one-shot activation.
+        let start_workspace_services: super::WorkspaceServicesStart = {
+            let graph = graph.clone();
+            let change_hub = change_hub.clone();
+            let source_dir = source_dir.clone();
+            let standalone_notice_slot = Arc::clone(&standalone_notice_slot);
+            let owners = owners.clone();
+            let search_engine = Arc::clone(&search_engine);
+            let workspace_search_initializing = Arc::clone(&workspace_search_initializing);
+            let index_progress = Arc::clone(&index_progress);
+            let semantic_runtime = Arc::clone(&semantic_runtime);
+            let baseline = baseline.clone();
+            let workspace_search_mode = workspace_search_mode.clone();
+            let embed_flight = Arc::clone(&embed_flight);
+            let snapshot_source = Arc::clone(&snapshot_source);
+            let workspace_lease = workspace_lease.clone();
+            let overlay_retry = overlay_retry.clone();
+            let embedding_prefixes = embedding_prefixes.clone();
+            let overlay_warmup = Arc::clone(&overlay_warmup);
+            let root_drift_epoch = Arc::clone(&root_drift_epoch);
+            let overlay_backlog = overlay_backlog.clone();
+            let search_consumer = Arc::clone(&search_consumer);
+            Box::new(move || {
+                if let Some(plan) = baseline_plan {
+                    baseline.start_resolution(plan);
+                }
+                if !workspace_lease.coordination_failed()
+                    && matches!(workspace_search_mode, WorkspaceSearchMode::PostgresRemoteOverlay)
+                {
+                    let retry =
+                        match Self::embedding_config_with_prefixes(Some(&embedding_prefixes)) {
+                            Ok(Some(_)) => Some(super::overlay_retry::OverlayRetry::spawn(
+                                Arc::clone(&search_engine),
+                                owners.clone(),
+                                Arc::clone(&overlay_warmup),
+                                Arc::clone(&semantic_runtime),
+                                workspace_lease.clone(),
+                                embedding_publish_retry_budget,
+                            )),
+                            Ok(None) => {
+                                Self::set_overlay_warmup_state(
+                                    &overlay_warmup,
+                                    OverlayWarmupState::Skipped(
+                                        "no embedder configured".to_owned(),
+                                    ),
+                                );
+                                None
+                            }
+                            Err(error) => {
+                                Self::set_semantic_runtime_status(
+                                    &semantic_runtime,
+                                    SemanticRuntimeStatus::from_search_error(&error),
+                                );
+                                Self::set_overlay_warmup_state(
+                                    &overlay_warmup,
+                                    OverlayWarmupState::from_search_error(&error),
+                                );
+                                None
+                            }
+                        };
+                    *overlay_retry.lock().unwrap_or_else(|poison| poison.into_inner()) = retry;
+                }
+                #[cfg(test)]
+                crate::graph::test_support::hold_the_first_build(&graph);
+                crate::graph::watcher::start(
+                    &graph,
+                    &change_hub,
+                    Some((source_dir.clone(), standalone_notice_slot)),
+                    owners.clone(),
+                );
+                Self::spawn_workspace_search_init(
+                    search_engine,
+                    workspace_search_initializing,
+                    index_progress,
+                    semantic_runtime,
+                    source_dir,
+                    change_hub,
+                    sink_lease,
+                    baseline,
+                    workspace_search_mode,
+                    graph,
+                    embed_flight,
+                    snapshot_source,
+                    workspace_lease,
+                    overlay_retry.lock().unwrap_or_else(|poison| poison.into_inner()).clone(),
+                    root_drift_epoch,
+                    embedding_publish_retry_budget,
+                    owners,
+                    overlay_backlog,
+                    search_consumer,
+                    embedding_prefixes,
+                );
+            })
+        };
 
-        let reference_search = ReferenceSearchState::new(Some(&source_dir));
+        let reference_search = if disk_only {
+            ReferenceSearchState::new_deferred(Some(&source_dir))
+        } else {
+            ReferenceSearchState::new(Some(&source_dir))
+        };
         // The complete workspace snapshot has passed its validation and owner setup;
         // emit the aggregate advisory once from this accepted snapshot.
         project.warn_about_legacy_extension_scope();
-        Ok(Self {
+        let state = Self {
             workspace_root: Some(source_dir),
             source_root,
             standalone_notice: standalone_notice_slot,
@@ -1001,7 +1123,12 @@ impl SharedState {
             scope_transport_stop,
             overlay_backlog,
             search_consumer,
-        })
+            workspace_services: Arc::new(Mutex::new(Some(start_workspace_services))),
+        };
+        if !disk_only {
+            state.ensure_workspace_services();
+        }
+        Ok(state)
     }
 
     /// Retire this immutable workspace scope on a project-declaration event. Ordinary source
@@ -1013,11 +1140,11 @@ impl SharedState {
         cache: crate::cache::WorkspaceCacheLayout,
         owners: super::OwnerStop,
         transport_stop: tokio_util::sync::CancellationToken,
+        disk_updates: Option<DiagnosticsState>,
     ) {
         let thread_owners = owners.clone();
-        let spawn = std::thread::Builder::new()
-            .name("workspace-cache-scope".to_owned())
-            .spawn(move || {
+        let spawn =
+            std::thread::Builder::new().name("workspace-cache-scope".to_owned()).spawn(move || {
                 let _live = thread_owners.enter();
                 let cursor = hub.subscribe();
                 loop {
@@ -1044,11 +1171,28 @@ impl SharedState {
                             .and_then(|project| {
                                 cache.verify_project(&project).map_err(|error| error.to_string())
                             });
-                        if let Err(error) = still_same_scope {
-                            tracing::error!(%error, "workspace cache scope changed; stopping this backend");
+                        if still_same_scope.is_err() {
+                            tracing::warn!("workspace project inputs could not be accepted");
                             thread_owners.stop_for_scope_change();
-                            break;
+                            if thread_owners.is_stopped() {
+                                break;
+                            }
+                        } else if thread_owners.holds_invalid_configuration()
+                            || !thread_owners.backend_identity_matches()
+                        {
+                            // The predicate may compare private configuration values. Keep
+                            // both its inputs and any failure details out of logs.
+                            tracing::warn!(
+                                "workspace backend identity changed; stopping this backend"
+                            );
+                            thread_owners.stop_for_scope_change();
+                            if thread_owners.is_stopped() {
+                                break;
+                            }
                         }
+                    }
+                    if let Some(diagnostics) = &disk_updates {
+                        diagnostics.poll_pending_drift();
                     }
                     hub.wait_for_change_or(
                         generation,
@@ -1435,12 +1579,13 @@ impl SharedState {
             diagnostics: DiagnosticsState::disabled(),
             change_hub: None,
             workspace_lease: crate::workspace_lease::WorkspaceLease::unmanaged(),
-            overlay_retry: None,
+            overlay_retry: Arc::new(Mutex::new(None)),
             tasks: rmcp::task_manager::TaskManager::new(),
             owners: super::OwnerStop::default(),
             scope_transport_stop: tokio_util::sync::CancellationToken::new(),
             overlay_backlog: Default::default(),
             search_consumer: Arc::new(Mutex::new(super::ConsumerPhase::Stopped)),
+            workspace_services: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1466,12 +1611,13 @@ impl SharedState {
             diagnostics: DiagnosticsState::disabled(),
             change_hub: None,
             workspace_lease: crate::workspace_lease::WorkspaceLease::unmanaged(),
-            overlay_retry: None,
+            overlay_retry: Arc::new(Mutex::new(None)),
             tasks: rmcp::task_manager::TaskManager::new(),
             owners: super::OwnerStop::default(),
             scope_transport_stop: tokio_util::sync::CancellationToken::new(),
             overlay_backlog: Default::default(),
             search_consumer: Arc::new(Mutex::new(super::ConsumerPhase::Stopped)),
+            workspace_services: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -5061,6 +5207,7 @@ mod tests {
             cache,
             owners.clone(),
             transport_stop.clone(),
+            None,
         );
 
         let before = hub.generation();
@@ -5151,6 +5298,7 @@ mod tests {
             old_cache.clone(),
             owners.clone(),
             transport_stop.clone(),
+            None,
         );
         assert!(crate::change_hub::test_support::eventually(|| { hub.active_cursor_count() == 1 }));
 
@@ -5191,6 +5339,7 @@ mod tests {
             new_cache.clone(),
             reverse_owners.clone(),
             reverse_stop.clone(),
+            None,
         );
         assert!(crate::change_hub::test_support::eventually(|| {
             reverse_hub.active_cursor_count() == 1
@@ -5229,6 +5378,7 @@ mod tests {
             legacy_cache.clone(),
             explicit_owners.clone(),
             explicit_stop.clone(),
+            None,
         );
         assert!(crate::change_hub::test_support::eventually(|| {
             explicit_hub.active_cursor_count() == 1
@@ -5264,6 +5414,7 @@ mod tests {
             info_base_cache.clone(),
             data_separation_owners.clone(),
             data_separation_stop.clone(),
+            None,
         );
         assert!(crate::change_hub::test_support::eventually(|| {
             data_separation_hub.active_cursor_count() == 1
@@ -5385,6 +5536,218 @@ mod tests {
         ));
         assert!(state.engine.lock().unwrap().is_none());
         state.shutdown();
+    }
+
+    #[test]
+    fn shared_workspace_defers_workspace_and_reference_credentials_until_activation() {
+        use std::io::ErrorKind;
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let _env_lock = env_lock();
+        let _baseline = EnvVarGuard::unset("BSL_SEARCH_BASELINE");
+        let _reference = EnvVarGuard::unset("BSL_SEARCH_REFERENCE");
+        let _baseline_schema = EnvVarGuard::unset("BSL_SEARCH_BASELINE_PG_SCHEMA");
+        let _reference_schema = EnvVarGuard::unset("BSL_SEARCH_REFERENCE_PG_SCHEMA");
+        let _embedding_url = EnvVarGuard::unset("EMBEDDING_URL");
+        let _embedding_model = EnvVarGuard::unset("EMBEDDING_MODEL");
+        let _test_embedding = EnvVarGuard::unset("BSL_TEST_EMBEDDING");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let workspace = tempdir().unwrap();
+        let cache_parent = tempdir().unwrap();
+        let source = workspace.path().join("src/cf");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let helper_response = serde_json::json!({
+            "protocol": "bsl-analyzer.postgres-helper.v1",
+            "ok": true,
+            "url": format!("postgres://test:test@{address}/synthetic?connect_timeout=1"),
+            "lease_id": "test/lease",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "renewable": false,
+        })
+        .to_string();
+        let refresh_rejected = serde_json::json!({
+            "protocol": "bsl-analyzer.postgres-helper.v1",
+            "ok": false,
+            "error": {
+                "code": "synthetic_refresh_disabled",
+                "message": "synthetic test does not retry credentials",
+                "retryable": false,
+            },
+        })
+        .to_string();
+        let helper_counter = cache_parent.path().join("credential-helper-calls");
+        let (helper_program, helper_args) = if cfg!(windows) {
+            let script = workspace.path().join("synthetic-credential-helper.ps1");
+            let valid_response = workspace.path().join("valid-credential-response.json");
+            let rejected_response = workspace.path().join("rejected-credential-response.json");
+            fs::write(
+                &script,
+                "$null = [Console]::In.ReadToEnd()\n\
+                 $countPath = $args[0]\n\
+                 $validPath = $args[1]\n\
+                 $rejectedPath = $args[2]\n\
+                 $count = 0\n\
+                 if (Test-Path -LiteralPath $countPath) { $count = [int][IO.File]::ReadAllText($countPath) }\n\
+                 [IO.File]::WriteAllText($countPath, [string]($count + 1))\n\
+                 if ($count -lt 1) { [Console]::Out.Write([IO.File]::ReadAllText($validPath)) } else { [Console]::Out.Write([IO.File]::ReadAllText($rejectedPath)) }\n",
+            )
+            .unwrap();
+            fs::write(&valid_response, &helper_response).unwrap();
+            fs::write(&rejected_response, &refresh_rejected).unwrap();
+            (
+                "powershell.exe".to_owned(),
+                vec![
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-ExecutionPolicy".to_owned(),
+                    "Bypass".to_owned(),
+                    "-File".to_owned(),
+                    script.to_string_lossy().into_owned(),
+                    helper_counter.to_string_lossy().into_owned(),
+                    valid_response.to_string_lossy().into_owned(),
+                    rejected_response.to_string_lossy().into_owned(),
+                ],
+            )
+        } else {
+            let helper_script = "import pathlib,sys; sys.stdin.readline(); p=pathlib.Path(sys.argv[1]); n=int(p.read_text()) if p.exists() else 0; p.write_text(str(n+1)); print(sys.argv[2] if n < 1 else sys.argv[3])";
+            (
+                "python3".to_owned(),
+                vec![
+                    "-c".to_owned(),
+                    helper_script.to_owned(),
+                    helper_counter.to_string_lossy().into_owned(),
+                    helper_response.clone(),
+                    refresh_rejected.clone(),
+                ],
+            )
+        };
+        fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            format!(
+                "[source]\nroot = \"src/cf\"\n\
+                 [search.baseline]\nbackend = \"postgres\"\n\
+                 [search.baseline.postgres]\nhost = \"127.0.0.1\"\nport = {}\ndbname = \"synthetic\"\nschema = \"bsl_search\"\nvault_role_base = \"test/only\"\n\
+                 [search.baseline.postgres.credential_helper]\nprogram = {:?}\nargs = {:?}\n\
+                 [search.baseline.workspace_code]\nbranch = \"main\"\n\
+                 [search.baseline.workspace_code.policy]\npublish_branches = [\"main\"]\n",
+                address.port(),
+                helper_program,
+                helper_args
+            ),
+        )
+        .unwrap();
+
+        let project = crate::project::at(workspace.path()).expect("synthetic project parses");
+        let cache = crate::cache::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            workspace.path(),
+            None,
+        )
+        .expect("disposable explicit cache resolves");
+        let state = SharedState::shared_workspace_with_cache_and_prefixes(
+            workspace.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("shared disk-only workspace starts");
+
+        let baseline_pending = state.baseline.view().pending;
+        let reference_baseline_pending = state.reference_search.baseline.view().pending;
+        let helper_calls_before_activation = fs::read_to_string(&helper_counter)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let connected_before_activation = match listener.accept() {
+            Ok((stream, _)) => {
+                drop(stream);
+                true
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => false,
+            Err(_) => true,
+        };
+
+        state.ensure_workspace_services();
+        // r2d2::Pool::get retries failed connection creation for the adapter's configured 5s
+        // timeout. The synthetic helper rejects the subsequent credential refresh so this
+        // fixture has one bounded pool deadline, then a published error outcome.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut accepted = 0;
+        let mut listener_error = None;
+        while Instant::now() < deadline && state.baseline.view().pending {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    accepted += 1;
+                    if let Err(error) =
+                        crate::baseline::reject_postgres_startup_for_test(&mut stream)
+                    {
+                        listener_error = Some(error.to_string());
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                }
+                Err(error) => {
+                    listener_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+
+        let baseline_ready = !state.baseline.view().pending;
+        let reference_pending_after_workspace = state.reference_search.baseline.view().pending;
+        let helper_calls_after_workspace = fs::read_to_string(&helper_counter)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        state.reference_search.ensure_loading();
+        let reference_ready = state.reference_search.baseline.wait_ready(Duration::from_secs(5));
+        let reference_baseline = state.reference_search.baseline.view();
+        state.shutdown();
+        assert!(baseline_pending, "workspace baseline stays pending");
+        assert!(
+            reference_baseline_pending,
+            "reference baseline stays pending until reference activation"
+        );
+        assert_eq!(
+            helper_calls_before_activation, 0,
+            "constructing a shared LSP disk owner must not execute configured credential helpers"
+        );
+        assert!(
+            !connected_before_activation,
+            "constructing the shared disk owner must not connect to PostgreSQL"
+        );
+        assert!(listener_error.is_none(), "local PostgreSQL listener failed: {listener_error:?}");
+        assert!(accepted > 0, "service activation must initiate the local PostgreSQL connect");
+        assert!(baseline_ready, "the local PostgreSQL refusal must publish a baseline outcome");
+        let helper_calls_after_activation = fs::read_to_string(&helper_counter)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        assert!(
+            helper_calls_after_workspace > helper_calls_before_activation,
+            "workspace service activation resolves its configured credentials"
+        );
+        assert!(
+            reference_pending_after_workspace,
+            "workspace activation does not eagerly activate the reference baseline"
+        );
+        assert!(reference_ready, "reference activation publishes the credential failure");
+        assert!(
+            helper_calls_after_activation > helper_calls_after_workspace,
+            "reference service activation runs its configured credential helper"
+        );
+        assert!(reference_baseline.external.is_none());
+        let configured = reference_baseline.configured.expect("configured reference outcome");
+        assert_eq!(configured.backend, "postgres");
+        assert!(configured.issue.is_some(), "credential failure remains a PostgreSQL failure");
     }
     #[test]
     fn extension_only_workspace_does_not_expose_workspace_as_configuration_root() {

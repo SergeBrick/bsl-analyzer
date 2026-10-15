@@ -211,7 +211,10 @@ fn build_batch_plan(state: &mut GlobalState) -> Option<WorkspaceBatchPlan> {
         .map(|p| p.extension_paths().iter().map(|(_, path)| path.clone()).collect())
         .unwrap_or_default();
 
-    let file_paths = FrozenFilePaths::freeze(&state.vfs.read());
+    let file_paths = {
+        let analysis = state.analysis_host.analysis();
+        FrozenFilePaths::freeze_database(analysis.database())
+    };
 
     // In-scope closed files only: open buffers are owned by the interactive stream.
     // Sorted for a stable, log-friendly sweep order.
@@ -319,11 +322,11 @@ fn dispatch_next_chunk(state: &mut GlobalState) {
         )
     };
 
-    let db = state.analysis_host.raw_database().clone();
+    let analysis = state.analysis_host.analysis();
     #[cfg(test)]
-    let cancellation_baseline = db.salsa_event_global().map_or(0, |events| events.set_cancellation);
-    state.workspace_batch_token = Some(db.cancellation_token());
-    let analysis = ide::Analysis::from_database(db);
+    let cancellation_baseline =
+        analysis.database().salsa_event_global().map_or(0, |events| events.set_cancellation);
+    state.workspace_batch_token = Some(analysis.database().cancellation_token());
 
     state.workspace_batch_in_flight = true;
 
@@ -481,4 +484,249 @@ fn compute_chunk(
             Some(WorkspaceBatchItem { uri, result_id, diagnostics: lsp })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod shared_owner_tests {
+    use super::*;
+    use crate::global_state::GlobalState;
+    use crate::lsp::to_proto::{ClientTags, CodeDescriptions};
+    use ide::Analysis;
+    use lsp_types::NumberOrString;
+    use mcp_server::{SharedState, WorkspaceHandle, WorkspaceRead};
+
+    fn wait_for_owner_analysis(owner: &WorkspaceHandle) -> Analysis {
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match owner.request_analysis() {
+                WorkspaceRead::Ready(analysis) => return analysis,
+                WorkspaceRead::Loading | WorkspaceRead::Busy => {
+                    assert!(Instant::now() < deadline, "shared owner did not become ready");
+                    std::thread::yield_now();
+                }
+                WorkspaceRead::RejectedScope(reason) | WorkspaceRead::Failed(reason) => {
+                    panic!("shared owner failed to load: {reason}");
+                }
+                WorkspaceRead::Disabled => panic!("shared owner is disabled"),
+            }
+        }
+    }
+
+    #[test]
+    fn shared_batch_reports_closed_disk_file_from_owner_without_session_vfs_copy() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(
+            root.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\n\n[features]\nworkspaceDiagnostics = \"all\"\n",
+        )
+        .expect("write project config");
+        let closed_file = root.path().join("Closed.bsl");
+        std::fs::write(
+            &closed_file,
+            "Процедура Ошибка() Экспорт\nЕсли НЕ Тогда\nКонецЕсли;\nКонецПроцедуры\n",
+        )
+        .expect("write closed source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        drop(wait_for_owner_analysis(&owner));
+        let project = match owner.project() {
+            WorkspaceRead::Ready(project) => project,
+            WorkspaceRead::RejectedScope(reason) | WorkspaceRead::Failed(reason) => {
+                panic!("workspace project failed to load: {reason}");
+            }
+            WorkspaceRead::Loading | WorkspaceRead::Busy | WorkspaceRead::Disabled => {
+                panic!("workspace project should be available during owner loading");
+            }
+        };
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        state.vfs_done = true;
+        state.workspace_root = Some(root.path().to_path_buf());
+        state.project = Some(project);
+        state.update_diagnostics_config();
+        assert!(
+            FrozenFilePaths::freeze(&state.vfs.read()).is_empty(),
+            "the session VFS deliberately contains no closed disk files"
+        );
+
+        let plan = build_batch_plan(&mut state).expect("enabled batch includes the owner file");
+        let expected_uri = lsp_types::Url::from_file_path(&closed_file).unwrap();
+        assert_eq!(plan.file_ids.len(), 1);
+        let file_id = plan.file_ids[0];
+        assert_eq!(plan.file_paths.url_for_file_id(file_id).unwrap(), expected_uri);
+
+        let analysis = state.analysis_host.analysis();
+        let owner_token = analysis.database().cancellation_token();
+        state.workspace_batch_token = Some(owner_token.clone());
+        let items = compute_chunk(
+            &analysis,
+            &[file_id],
+            &plan.config,
+            (&plan.diagnostics_baseline, plan.workspace_root.as_deref()),
+            &plan.file_paths,
+            (
+                plan.position_encoding,
+                CodeDescriptions::from_client_support(plan.supports_code_description),
+                ClientTags::NONE,
+            ),
+            None,
+        );
+        assert_eq!(items.len(), 1, "the owner-backed batch produced the closed file result");
+        assert_eq!(items[0].uri, expected_uri);
+        assert!(
+            items[0].diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("ParseError".to_owned()))
+            }),
+            "closed source should report its parser diagnostic: {:?}",
+            items[0].diagnostics
+        );
+        drop(analysis);
+        assert!(
+            !owner_token.is_cancelled(),
+            "dropping the request Analysis must not cancel the owner token"
+        );
+
+        let next_analysis = wait_for_owner_analysis(&owner);
+        assert_eq!(
+            FrozenFilePaths::freeze_database(next_analysis.database())
+                .file_id_for_url(&expected_uri)
+                .unwrap(),
+            file_id,
+            "the owner serves the same accepted file after the request snapshot is dropped"
+        );
+        drop(next_analysis);
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_admission_open_uri_case_alias_resolves_after_external_file_deletion() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(
+            root.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\n[platform_help]\nsource = \"bundled\"\n",
+        )
+        .expect("write project config");
+        let path = root.path().join("Alias.bsl");
+        let text = "Процедура ОткрытыйДокумент()\nКонецПроцедуры\n";
+        std::fs::write(&path, text).expect("write open source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        drop(wait_for_owner_analysis(&owner));
+        let project = match owner.project() {
+            WorkspaceRead::Ready(project) => project,
+            WorkspaceRead::RejectedScope(reason) | WorkspaceRead::Failed(reason) => {
+                panic!("workspace project failed to load: {reason}");
+            }
+            WorkspaceRead::Loading | WorkspaceRead::Busy | WorkspaceRead::Disabled => {
+                panic!("workspace project should be available during owner loading");
+            }
+        };
+
+        let original_component = root.path().file_name().unwrap().to_string_lossy();
+        let alias_component = original_component
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase()
+                } else if ch.is_ascii_uppercase() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>();
+        assert_ne!(original_component, alias_component, "fixture path has a case alias");
+        let alias_path = root.path().with_file_name(alias_component).join("aLIAS.BSL");
+        let alias_uri = lsp_types::Url::from_file_path(alias_path).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        state.vfs_done = true;
+        state.workspace_root = Some(root.path().to_path_buf());
+        state.project = Some(project);
+        crate::handlers::notification::handle_did_open(
+            &mut state,
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: alias_uri.clone(),
+                    language_id: "bsl".to_owned(),
+                    version: 1,
+                    text: text.to_owned(),
+                },
+            },
+        )
+        .expect("open the case-aliased URI through the shared VFS");
+        let file_id = crate::lsp::file_id(&state, &alias_uri).expect("resolve the opened URI");
+
+        std::fs::remove_file(&path).expect("delete the disk file while its overlay is open");
+        assert_eq!(
+            crate::lsp::file_id(&state, &alias_uri).unwrap(),
+            file_id,
+            "the exact open URI binding survives parent and filename case changes after deletion"
+        );
+        assert_eq!(state.vfs_file_for_url(&alias_uri).unwrap(), file_id);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.file_id_for_url(&alias_uri).unwrap(), file_id);
+        state.open_files.remove(&file_id);
+        assert!(
+            state.snapshot().file_id_for_url(&alias_uri).is_err(),
+            "an unadmitted buffer must not answer through its retained URI binding"
+        );
+        state.open_files.insert(file_id);
+        let analysis = state.analysis_host.view().expect("open editor view").analysis();
+        assert_eq!(&*analysis.file_text(file_id), text, "the open overlay remains authoritative");
+        drop(analysis);
+
+        crate::handlers::notification::handle_did_close(
+            &mut state,
+            lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: alias_uri.clone() },
+            },
+        )
+        .expect("close the alias URI");
+        assert!(!state.mem_docs.contains(&alias_uri));
+        assert!(!state.open_file_uri_ids.contains_key(&alias_uri));
+        assert!(state.analysis_host.view().is_none(), "closed overlay is released");
+        assert!(
+            state.snapshot().file_id_for_url(&alias_uri).is_err(),
+            "the closed URI no longer has an active alias binding"
+        );
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
 }

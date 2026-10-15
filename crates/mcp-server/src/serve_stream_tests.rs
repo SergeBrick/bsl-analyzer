@@ -1,6 +1,11 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::routing::post;
+use axum::{Json, Router};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
     ClientRequest, PingRequest,
@@ -11,7 +16,10 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{serve_stream_with_shutdown, McpProfile, McpServer, SharedState, ToolGate};
+use crate::{
+    serve_stream_with_shutdown, McpProfile, McpServer, OnecConnection, SessionConfig, SharedState,
+    ToolGate,
+};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -71,6 +79,42 @@ async fn session_finished(task: JoinHandle<anyhow::Result<()>>) {
         .expect("session closes cleanly");
 }
 
+#[derive(Clone)]
+struct MockNativeContext {
+    label: &'static str,
+    requests: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>>,
+}
+
+struct MockNativeService {
+    url: String,
+    requests: Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>>,
+    task: JoinHandle<()>,
+}
+
+async fn mock_event_log(
+    State(context): State<MockNativeContext>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    context.requests.lock().unwrap().push((headers, request));
+    Json(serde_json::json!({
+        "columns": ["context"],
+        "rows": [[context.label]],
+        "total": 1,
+        "truncated": false
+    }))
+}
+
+async fn mock_native_service(label: &'static str) -> MockNativeService {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = MockNativeContext { label, requests: Arc::clone(&requests) };
+    let app = Router::new().route("/event-log", post(mock_event_log)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    MockNativeService { url, requests, task }
+}
+
 /// One disconnected client must not cancel its siblings; broker shutdown must close them.
 #[tokio::test]
 async fn stream_shutdown_closes_transport_without_cancelling_sibling_sessions() {
@@ -89,6 +133,99 @@ async fn stream_shutdown_closes_transport_without_cancelling_sibling_sessions() 
         .await
         .expect("closed transport answers without hanging")
         .expect_err("no request is served after session shutdown completes");
+}
+
+/// Session routers may share one backend while keeping launch tools and native clients local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_backend_sessions_keep_tool_gates_and_native_dispatch_local() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("Configuration.xml"), "<Configuration/>").unwrap();
+    let cache = crate::WorkspaceCacheLayout::from_root(workspace.path().join("cache"));
+    let state = SharedState::workspace_with_cache(workspace.path().to_path_buf(), cache)
+        .expect("valid workspace owner");
+    let backend = McpServer::new(McpProfile::Workspace, state);
+    let native_a = mock_native_service("native-a").await;
+    let native_b = mock_native_service("native-b").await;
+
+    let mut config_a = SessionConfig::default();
+    config_a.enable_tool("references");
+    config_a.add_onec_connection(
+        "current".to_owned(),
+        OnecConnection::new(onec_client::Client::new(&native_a.url, "", ""), false),
+    );
+    let mut config_b = SessionConfig::default();
+    config_b.add_onec_connection(
+        "current".to_owned(),
+        OnecConnection::new(onec_client::Client::new(&native_b.url, "", ""), false),
+    );
+    let first_server = backend.for_session(config_a);
+    let second_server = backend.for_session(config_b);
+
+    assert!(
+        Arc::ptr_eq(
+            first_server.shared_state().search_engine(),
+            second_server.shared_state().search_engine(),
+        ),
+        "both session routers retain the shared workspace backend"
+    );
+
+    let shutdown = CancellationToken::new();
+    let (first, first_task) = initialized_server_session(first_server, &shutdown).await;
+    let (second, second_task) = initialized_server_session(second_server, &shutdown).await;
+    let first_names = first.list_all_tools().await.expect("first tools/list");
+    let second_names = second.list_all_tools().await.expect("second tools/list");
+    assert!(first_names.iter().any(|tool| tool.name == "references"));
+    assert!(!second_names.iter().any(|tool| tool.name == "references"));
+
+    let visible_call = first
+        .call_tool(
+            CallToolRequestParams::new("references")
+                .with_arguments(serde_json::json!({}).as_object().unwrap().clone()),
+        )
+        .await
+        .expect_err("the visible route validates its missing reference anchor");
+    let gated = second
+        .call_tool(
+            CallToolRequestParams::new("references")
+                .with_arguments(serde_json::json!({}).as_object().unwrap().clone()),
+        )
+        .await
+        .expect_err("a session without the opt-in cannot dispatch references");
+    let unknown = second
+        .call_tool(
+            CallToolRequestParams::new("not_a_tool")
+                .with_arguments(serde_json::json!({}).as_object().unwrap().clone()),
+        )
+        .await
+        .expect_err("the control tool is unknown");
+    assert_ne!(format!("{visible_call}"), format!("{unknown}"));
+    assert_eq!(format!("{gated}"), format!("{unknown}"));
+
+    for (client, label) in [(&first, "native-a"), (&second, "native-b")] {
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("event_log").with_arguments(
+                    serde_json::json!({"connection": "current", "limit": 1})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .expect("session-local native dispatch succeeds");
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains(label), "router reached its own native context: {encoded}");
+    }
+    assert_eq!(native_a.requests.lock().unwrap().len(), 1);
+    assert_eq!(native_b.requests.lock().unwrap().len(), 1);
+
+    first.cancel().await.expect("first client disconnects");
+    second.cancel().await.expect("second client disconnects");
+    session_finished(first_task).await;
+    session_finished(second_task).await;
+    backend.shutdown();
+    native_a.task.abort();
+    native_b.task.abort();
 }
 
 /// A silent connection must release its socket even if it never initializes MCP.

@@ -9,7 +9,7 @@ mod sync;
 pub(crate) mod test_support;
 mod types;
 
-use crate::baseline::DeferredBaselineRuntime;
+use crate::baseline::{BaselineCredentialPlan, DeferredBaselineRuntime};
 use crate::change_hub::WorkspaceChangeHub;
 use crate::diagnostics_state::DiagnosticsState;
 use crate::graph::GraphState;
@@ -19,6 +19,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+type InvalidProjectHandler = Arc<dyn Fn() -> (bool, bool) + Send + Sync>;
+type WorkspaceServicesStart = Box<dyn FnOnce() + Send>;
 
 pub(crate) use types::{
     shared_engine, OverlayWarmupState, SemanticRuntimeStatus, SharedSearchEngine,
@@ -40,6 +43,9 @@ pub(crate) struct ReferenceSearchState {
     progress: Arc<IndexProgress>,
     semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
     baseline: DeferredBaselineRuntime,
+    /// Credentials are resolved only when this reference search is activated. Shared
+    /// workspace construction leaves this plan untouched for LSP-only sessions.
+    baseline_resolution: Arc<Mutex<Option<BaselineCredentialPlan>>>,
     embedding_prefixes: types::EmbeddingPrefixes,
     lifecycle: Arc<Mutex<ReferenceSearchLifecycle>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
@@ -129,6 +135,12 @@ struct OwnerStopInner {
     /// supersession. Keep its transport cancellation separate so a normal owner stop still
     /// observes the daemon's existing drain ordering.
     scope_transport_stop: Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// Optional check that this backend still represents the identity captured by its
+    /// launcher. The existing scope guard invokes it only after project inputs change.
+    backend_identity_check: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    // The handler returns (invalid now, an accepted resident was frozen).
+    invalid_project_handler: Mutex<Option<InvalidProjectHandler>>,
+    backend_retired: tokio_util::sync::CancellationToken,
 }
 
 /// Taken by whoever spawns an owner, before the thread starts, and moved into it: an owner
@@ -152,6 +164,28 @@ impl crate::tools::search::OwnerWait for OwnerStop {
 }
 
 impl OwnerStop {
+    pub(crate) fn set_invalid_project_handler(
+        &self,
+        handler: impl Fn() -> (bool, bool) + Send + Sync + 'static,
+    ) {
+        *self.0.invalid_project_handler.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            Some(Arc::new(handler));
+    }
+
+    pub(crate) fn holds_invalid_configuration(&self) -> bool {
+        let handler = self
+            .0
+            .invalid_project_handler
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        handler.is_some_and(|handler| handler().1)
+    }
+
+    pub(crate) fn backend_retired(&self) -> tokio_util::sync::CancellationToken {
+        self.0.backend_retired.clone()
+    }
+
     pub(crate) fn set_scope_transport_stop(
         &self,
         transport_stop: tokio_util::sync::CancellationToken,
@@ -160,9 +194,43 @@ impl OwnerStop {
             Some(transport_stop);
     }
 
+    /// Install the identity predicate and check it immediately, closing the race between
+    /// initial bootstrap validation and the caller exposing this backend to a session.
+    pub(crate) fn set_backend_identity_check(
+        &self,
+        check: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> bool {
+        *self.0.backend_identity_check.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            Some(Arc::clone(&check));
+        let matches = check();
+        if !matches {
+            self.stop_for_scope_change();
+        }
+        matches
+    }
+
+    /// Check the installed backend identity without holding the callback slot lock while
+    /// calling user-provided code.
+    pub(crate) fn backend_identity_matches(&self) -> bool {
+        let check = self
+            .0
+            .backend_identity_check
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        check.is_none_or(|check| check())
+    }
+
     /// Scope mismatch is terminal: cancel its transport before stopping owners. Ordinary
     /// `stop()` deliberately leaves the transport alone for supersession/drain callers.
     pub(crate) fn stop_for_scope_change(&self) {
+        let handler = self
+            .0
+            .invalid_project_handler
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let hold_last_good = handler.is_some_and(|handler| handler().0);
         {
             let transport_stop =
                 self.0.scope_transport_stop.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -174,6 +242,10 @@ impl OwnerStop {
                 _ => {}
             }
         }
+        if hold_last_good {
+            return;
+        }
+        self.0.backend_retired.cancel();
         self.stop();
     }
 
@@ -375,7 +447,7 @@ pub struct SharedState {
     workspace_lease: crate::workspace_lease::WorkspaceLease,
     /// The overlay retry driver — the one owner of every Embed pass (startup included).
     /// `None` outside PostgresRemoteOverlay-with-embedder, where no such pass exists.
-    overlay_retry: Option<Arc<overlay_retry::OverlayRetry>>,
+    overlay_retry: Arc<Mutex<Option<Arc<overlay_retry::OverlayRetry>>>>,
     /// Registry of the tasks opened by the `io.modelcontextprotocol/tasks` extension.
     ///
     /// It lives on the daemon process, not on the session: a task handle that a client
@@ -394,6 +466,51 @@ pub struct SharedState {
     overlay_backlog: overlay_backlog::OverlayBacklog,
     /// Where the workspace search consumer is (see [`ConsumerPhase`]).
     search_consumer: Arc<Mutex<ConsumerPhase>>,
+    /// The one-shot graph/search activation for a disk-only LSP-first backend.
+    workspace_services: Arc<Mutex<Option<WorkspaceServicesStart>>>,
+}
+
+/// Native execution context attached to one MCP connection. It deliberately has no
+/// `Debug` or serialization implementation: credentials stay in memory and never enter
+/// a workspace identity or broker launch envelope.
+pub struct SessionConfig {
+    enabled_tools: Vec<String>,
+    onec_client: Option<OnecClient>,
+    onec_connections: BTreeMap<String, OnecConnection>,
+    debug_session: Arc<Mutex<Option<bsl_debug::session::DebugSession>>>,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            enabled_tools: Vec::new(),
+            onec_client: None,
+            onec_connections: BTreeMap::new(),
+            debug_session: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl SessionConfig {
+    pub fn enable_tool(&mut self, name: impl Into<String>) {
+        self.enabled_tools.push(name.into());
+    }
+
+    pub(crate) fn enabled_tools(&self) -> &[String] {
+        &self.enabled_tools
+    }
+
+    pub fn set_onec_client(&mut self, client: OnecClient) {
+        self.onec_client = Some(client);
+    }
+
+    pub fn add_onec_connection(&mut self, name: String, connection: OnecConnection) {
+        self.onec_connections.insert(name, connection);
+    }
+
+    pub fn debug_session(&self) -> &Arc<Mutex<Option<bsl_debug::session::DebugSession>>> {
+        &self.debug_session
+    }
 }
 
 #[derive(Clone)]
@@ -436,6 +553,35 @@ fn consumer_drift_watch(
 }
 
 impl SharedState {
+    /// Tie this backend to the identity captured by its launcher. Returns false and
+    /// retires the backend immediately if the identity has already changed.
+    pub fn set_backend_identity_check(
+        &self,
+        check: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> bool {
+        self.owners.set_backend_identity_check(Arc::new(check))
+    }
+
+    /// Start graph/search consumers when an MCP workspace session first attaches.
+    /// LSP-only users keep the disk owner and shared change hub without indexing.
+    pub fn ensure_workspace_services(&self) {
+        if let Some(start) =
+            self.workspace_services.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+        {
+            start();
+        }
+    }
+
+    /// Clone the shared disk/index owner while replacing every native handle with this
+    /// connection's context.
+    pub(crate) fn for_session(&self, config: SessionConfig) -> Self {
+        let mut state = self.clone();
+        state.onec_client = config.onec_client;
+        state.onec_connections = config.onec_connections;
+        state.debug_session = config.debug_session;
+        state
+    }
+
     pub(super) fn search_fence_outcome<T>(
         outcome: crate::workspace_lease::LeaseOperationOutcome<T, bsl_search::SearchError>,
     ) -> bsl_search::FenceOutcome<Result<T, bsl_search::SearchError>> {
@@ -726,7 +872,12 @@ impl SharedState {
         } else if runtime_failed {
             Target::new(Kind::Semantic, State::Failed, Some(Reason::NativeFailure))
         } else if self.embed_flight.is_in_flight()
-            || self.overlay_retry.as_ref().is_some_and(|retry| retry.pass_active())
+            || self
+                .overlay_retry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .is_some_and(|retry| retry.pass_active())
         {
             Target::new(Kind::Semantic, State::Running, None)
         } else if remote && warmup.is_none() {
@@ -911,7 +1062,12 @@ impl SharedState {
             || self.reference_search.loading()
             || self.index_progress.is_active()
             || self.embed_flight.is_in_flight()
-            || self.overlay_retry.as_ref().is_some_and(|retry| retry.pass_active())
+            || self
+                .overlay_retry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .is_some_and(|retry| retry.pass_active())
             || self.overlay_backlog.is_active()
     }
 
@@ -947,6 +1103,13 @@ impl SharedState {
 
     pub(crate) fn diagnostics(&self) -> &DiagnosticsState {
         &self.diagnostics
+    }
+
+    /// Attach an in-process client to this workspace's disk owner. The handle starts
+    /// the lazy owner and prevents its idle sweeper from evicting it until the last
+    /// attached view is dropped.
+    pub fn workspace_handle(&self) -> crate::WorkspaceHandle {
+        crate::WorkspaceHandle::new(self.diagnostics.clone())
     }
 
     pub(crate) fn tasks(&self) -> &rmcp::task_manager::TaskManager {
@@ -1084,7 +1247,9 @@ impl SharedState {
     pub(crate) fn request_overlay_refresh(&self) {
         // A wake, not a fact: the owner may not step around its backoff on this.
         self.overlay_backlog.wake();
-        if let Some(retry) = &self.overlay_retry {
+        if let Some(retry) =
+            self.overlay_retry.lock().unwrap_or_else(|poison| poison.into_inner()).as_ref()
+        {
             // Coalesce, not kick: a search has observed no new fact about the workspace, so it
             // may wake the driver but must not reset its backoff or revive an obligation that
             // already ran out of budget.
@@ -1182,13 +1347,54 @@ impl SharedState {
     pub(crate) fn scope_transport_stop(&self) -> tokio_util::sync::CancellationToken {
         self.scope_transport_stop.clone()
     }
+
+    /// Actual validated-scope retirement. Invalid project inputs close MCP while
+    /// existing LSP views keep serving their last accepted disk snapshot.
+    pub fn backend_retired(&self) -> tokio_util::sync::CancellationToken {
+        self.owners.backend_retired()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SharedSearchEngine, SharedState, WorkspaceSearchApply};
+    use super::{OwnerStop, SharedSearchEngine, SharedState, WorkspaceSearchApply};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn backend_identity_mismatch_retires_owner_and_transport_immediately() {
+        let owners = OwnerStop::default();
+        let transport = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport.clone());
+
+        assert!(!owners.set_backend_identity_check(Arc::new(|| false)));
+        assert!(owners.is_stopped());
+        assert!(transport.is_cancelled());
+        assert!(owners.backend_retired().is_cancelled());
+    }
+
+    #[test]
+    fn invalid_project_closes_mcp_before_retiring_last_good_backend() {
+        let owners = OwnerStop::default();
+        let transport = tokio_util::sync::CancellationToken::new();
+        owners.set_scope_transport_stop(transport.clone());
+        let invalid = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let current = Arc::clone(&invalid);
+        owners.set_invalid_project_handler(move || {
+            (current.load(std::sync::atomic::Ordering::SeqCst), true)
+        });
+
+        owners.stop_for_scope_change();
+        assert!(transport.is_cancelled());
+        assert!(!owners.backend_retired().is_cancelled());
+        assert!(!owners.is_stopped());
+        assert!(owners.holds_invalid_configuration());
+
+        invalid.store(false, std::sync::atomic::Ordering::SeqCst);
+        owners.stop_for_scope_change();
+        assert!(owners.backend_retired().is_cancelled());
+        assert!(owners.is_stopped());
+    }
 
     #[test]
     fn workspace_cache_scope_change_logs_restart_once() {

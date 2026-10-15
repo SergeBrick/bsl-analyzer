@@ -649,7 +649,7 @@ impl Configuration {
             .and_then(|&idx| self.event_subscriptions.get(idx))
     }
 
-    pub(crate) fn add_event_subscription(&mut self, subscription: EventSubscription) {
+    pub fn add_event_subscription(&mut self, subscription: EventSubscription) {
         let idx = self.event_subscriptions.len();
         self.name_to_event_subscription.insert(NormName::intern(subscription.name()), idx);
         self.event_subscriptions.push(subscription);
@@ -659,7 +659,7 @@ impl Configuration {
         &self.subsystems
     }
 
-    pub(crate) fn add_subsystem(&mut self, subsystem: crate::subsystem::Subsystem) {
+    pub fn add_subsystem(&mut self, subsystem: crate::subsystem::Subsystem) {
         self.subsystems.push(subsystem);
     }
 
@@ -689,7 +689,7 @@ impl Configuration {
             .and_then(|&idx| self.scheduled_jobs.get(idx))
     }
 
-    pub(crate) fn add_scheduled_job(&mut self, job: ScheduledJob) {
+    pub fn add_scheduled_job(&mut self, job: ScheduledJob) {
         let idx = self.scheduled_jobs.len();
         self.name_to_scheduled_job.insert(NormName::intern(job.name()), idx);
         self.scheduled_jobs.push(job);
@@ -719,7 +719,7 @@ impl Configuration {
             .and_then(|&idx| self.http_services.get(idx))
     }
 
-    pub(crate) fn add_http_service(&mut self, http_service: HTTPService) {
+    pub fn add_http_service(&mut self, http_service: HTTPService) {
         let idx = self.http_services.len();
         self.name_to_http_service.insert(NormName::intern(http_service.name()), idx);
         self.http_services.push(http_service);
@@ -735,7 +735,7 @@ impl Configuration {
             .and_then(|&idx| self.web_services.get(idx))
     }
 
-    pub(crate) fn add_web_service(&mut self, web_service: WebService) {
+    pub fn add_web_service(&mut self, web_service: WebService) {
         let idx = self.web_services.len();
         self.name_to_web_service.insert(NormName::intern(web_service.name()), idx);
         self.web_services.push(web_service);
@@ -754,7 +754,7 @@ impl Configuration {
             .and_then(|&idx| self.integration_services.get(idx))
     }
 
-    pub(crate) fn add_integration_service(
+    pub fn add_integration_service(
         &mut self,
         integration_service: crate::integration_service::IntegrationService,
     ) {

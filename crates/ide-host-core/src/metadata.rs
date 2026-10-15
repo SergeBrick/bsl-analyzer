@@ -910,6 +910,60 @@ mod tests {
     }
 
     #[test]
+    fn editor_view_builds_configuration_from_owner_inputs_and_refreshes_xml() {
+        use crate::workspace::{EditorView, WorkspaceSnapshot};
+        use bsl_metadata::{AttributeType, MdoType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let catalog_path = root.join("Catalogs/Товары.xml");
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &catalog_path,
+            catalog_xml("Товары", "00000000-0000-0000-0000-000000000072"),
+        )
+        .unwrap();
+
+        let mut host = AnalysisHost::default();
+        host.raw_database_mut().set_all_config_paths(vec![(None, root.clone())], None);
+        let owner_vfs = TestVfs(RefCell::new(Vfs::new()));
+        host.bootstrap_metadata_substrate(&owner_vfs);
+        let snapshot = WorkspaceSnapshot::capture(host.raw_database(), 1);
+        let listing = snapshot.metadata.iter().find(|(path, _)| path == &root).unwrap();
+        let catalog_id =
+            listing.1.entries.iter().find(|entry| entry.name == "Товары").unwrap().main;
+
+        let mut view = EditorView::new(snapshot.clone());
+        // Turn the accepted file revisions into in-memory source inputs before
+        // hiding the directory tree. The view may parse them, but cannot discover
+        // additional metadata by looking at the original paths.
+        for file in snapshot.files.iter().filter(|file| file.root_id == METADATA_SOURCE_ROOT) {
+            let text = std::fs::read_to_string(&file.path).unwrap();
+            SourceDatabase::set_file_text(view.database_mut(), file.file_id, &text);
+        }
+
+        let moved_catalogs = root.join("Catalogs.hidden");
+        std::fs::rename(root.join("Catalogs"), &moved_catalogs).unwrap();
+        let configuration = view.database().configuration_for_root(&root);
+        assert_eq!(configuration.name(), "Configuration");
+        let object = configuration.find_metadata_object(MdoType::Catalog, "Товары").unwrap();
+        assert!(object.attributes.iter().any(|attribute| {
+            attribute.name == "Код"
+                && attribute.attr_type == AttributeType::String { length: Some(9) }
+        }));
+
+        let refreshed_xml = catalog_xml("Товары", "00000000-0000-0000-0000-000000000072")
+            .replace("<CodeLength>9</CodeLength>", "<CodeLength>5</CodeLength>");
+        SourceDatabase::set_file_text(view.database_mut(), catalog_id, &refreshed_xml);
+        let refreshed = view.database().configuration_for_root(&root);
+        let object = refreshed.find_metadata_object(MdoType::Catalog, "Товары").unwrap();
+        assert!(object.attributes.iter().any(|attribute| {
+            attribute.name == "Код"
+                && attribute.attr_type == AttributeType::String { length: Some(5) }
+        }));
+    }
+
+    #[test]
     fn bootstrap_and_refresh_never_register_metadata_inside_source_exclusions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();

@@ -20,13 +20,12 @@
 //! A panic with no database attached to its thread cannot be replayed: nobody
 //! can block on a thread that is not executing a query. Those are not stamped.
 
+use std::any::Any;
 use std::sync::Mutex;
 
+use ide::RootDatabaseImpl;
 use salsa::plumbing::{current_revision, with_attached_database};
 use salsa::Revision;
-
-/// Newest revision a real panic was seen in.
-static LAST_PANIC: Mutex<Option<Revision>> = Mutex::new(None);
 
 static INSTALLED: std::sync::Once = std::sync::Once::new();
 
@@ -41,90 +40,86 @@ pub fn install() {
             // Salsa attaches the database to a thread for the duration of a
             // tracked-fn body, which is exactly the window where a panic can
             // poison a memo or strand a waiter.
-            if let Some(revision) = with_attached_database(current_revision) {
-                let mut last = lock();
-                if last.is_none_or(|seen| seen < revision) {
-                    *last = Some(revision);
-                }
-            }
+            with_attached_database(|attached| {
+                // `Database` inherits `ZalsaDatabase: Any`, so this checked
+                // downcast identifies our concrete storage without pointer ids
+                // or unsafe Salsa view conversion.
+                let Some(db) = (attached as &dyn Any).downcast_ref::<RootDatabaseImpl>() else {
+                    return;
+                };
+                db.record_query_panic(current_revision(attached));
+            });
             previous(info);
         }));
     });
 }
 
-/// Could a real panic reach a reader running in `revision`?
+/// Could a real panic from this storage reach a reader running in `revision`?
 ///
-/// True for a panic of that same revision — the poisoned-memo replay and the
-/// stranded-waiter case alike — and for anything newer, which is over-reporting
-/// by design: reporting a panic that was not this request's is the safe error,
-/// hiding one is not.
-pub fn panicked_in(revision: Revision) -> bool {
-    lock().is_some_and(|seen| seen >= revision)
+/// True for the same revision — poisoned-memo replay and stranded waiters alike
+/// — and for anything newer, which is conservative by design.
+pub fn panicked_in(db: &RootDatabaseImpl, revision: Revision) -> bool {
+    db.query_panicked_in(revision)
 }
 
-fn lock() -> std::sync::MutexGuard<'static, Option<Revision>> {
-    // The guarded data is a plain `Option<Revision>`; a poisoned lock carries no
-    // broken invariant, so recovering is the whole handling.
-    LAST_PANIC.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Forget every stamp. Tests share the process — and every fresh database
-/// starts at the same revision — so a peer's stamp would otherwise answer for
-/// this test's database.
+/// Clear one storage's stamp before an isolated test.
 #[doc(hidden)]
-pub fn reset_for_test() {
-    *lock() = None;
+pub fn reset_for_test(db: &RootDatabaseImpl) {
+    db.reset_query_panic_for_test();
 }
 
 /// Serialises tests that panic on purpose against tests that assert no panic was
-/// seen. The stamp is process-wide, so a panicking peer running in parallel
-/// would otherwise flip a verdict that has nothing to do with it.
+/// seen while exercising the process-wide panic hook.
 #[doc(hidden)]
 pub fn panic_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ide::RootDatabaseImpl;
     use salsa::Database as _;
 
     #[test]
     fn a_cancellation_is_not_a_panic() {
         let _guard = panic_test_guard();
         install();
-        reset_for_test();
         let db = RootDatabaseImpl::default();
+        reset_for_test(&db);
         let revision = current_revision(&db);
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             db.attach(|_| std::panic::resume_unwind(Box::new(salsa::Cancelled::PendingWrite)))
         }));
 
-        assert!(!panicked_in(revision), "a cancellation unwinds past the hook");
+        assert!(!panicked_in(&db, revision), "a cancellation unwinds past the hook");
     }
 
     #[test]
-    fn a_panic_inside_a_query_is_stamped_with_its_revision() {
+    fn a_panic_stamp_is_shared_by_clones_but_not_equal_revision_storages() {
         let _guard = panic_test_guard();
         install();
-        reset_for_test();
         let db = RootDatabaseImpl::default();
+        let clone = db.clone();
+        let independent = RootDatabaseImpl::default();
         let revision = current_revision(&db);
+        assert_eq!(revision, current_revision(&independent));
+        reset_for_test(&db);
+        reset_for_test(&independent);
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             db.attach(|_| panic!("a query panicking"))
         }));
 
-        assert!(panicked_in(revision), "a real panic inside a query must be visible");
+        assert!(panicked_in(&clone, revision), "clones share one Salsa storage");
+        assert!(!panicked_in(&independent, revision), "independent storages stay isolated");
     }
 
-    /// The assumption the whole design rests on, asserted rather than believed:
-    /// evicting the LRU takes `&mut` on the database but is not a revision
-    /// boundary, while an input write is. Anything that counts `&mut` accesses
-    /// instead of asking salsa drifts apart from the poison exactly here.
     #[test]
     fn an_lru_eviction_is_not_a_revision_boundary_but_a_write_is() {
         let mut db = RootDatabaseImpl::default();
@@ -141,18 +136,40 @@ mod tests {
     fn a_panic_with_no_database_attached_is_not_stamped() {
         let _guard = panic_test_guard();
         install();
-        reset_for_test();
-        // A fresh database is at the same revision as the panic below, so a
-        // stamp would be indistinguishable from the case above — which is the
-        // point: nothing may be stamped when nobody could have blocked on it.
         let db = RootDatabaseImpl::default();
+        reset_for_test(&db);
         let revision = current_revision(&db);
 
         let _ = std::panic::catch_unwind(|| panic!("a panic outside any query"));
 
         assert!(
-            !panicked_in(revision),
+            !panicked_in(&db, revision),
             "a thread not executing a query cannot strand a waiter or poison a memo"
         );
+    }
+
+    #[salsa::db]
+    #[derive(Default)]
+    struct OtherDatabase {
+        storage: salsa::Storage<Self>,
+    }
+
+    #[salsa::db]
+    impl salsa::Database for OtherDatabase {}
+
+    #[test]
+    fn a_non_root_salsa_database_is_ignored_by_the_hook() {
+        let _guard = panic_test_guard();
+        install();
+        let root = RootDatabaseImpl::default();
+        let revision = current_revision(&root);
+        reset_for_test(&root);
+        let other = OtherDatabase::default();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            other.attach(|_| panic!("a panic in another Salsa database type"))
+        }));
+
+        assert!(!panicked_in(&root, revision));
     }
 }

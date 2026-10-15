@@ -396,7 +396,6 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
     g1_with_tracing(|| {
         let _panic_guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
         let (_dir, mut state, client_receiver, changed, caller_uri, control) =
             live_definition_fixture();
         let db = state.analysis_host.raw_database().clone();
@@ -578,7 +577,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
             "the production retry does not reuse the test gate"
         );
         assert!(
-            !crate::panic_watch::panicked_in(old_revision),
+            !crate::panic_watch::panicked_in(state.analysis_host.raw_database(), old_revision),
             "Salsa cancellation does not stamp the panic watch"
         );
         let new_revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
@@ -601,7 +600,6 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
         );
         remove_gate(&gate);
         g1_wait_for_task_pool_quiescence(&mut state, &task_receiver);
-        crate::panic_watch::reset_for_test();
     });
 }
 
@@ -610,7 +608,6 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
     g1_with_tracing(|| {
         let _panic_guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
         let (_dir, mut state, client_receiver, _changed, caller_uri, _control) =
             live_definition_fixture();
         let db = state.analysis_host.raw_database().clone();
@@ -677,8 +674,7 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
         assert_eq!(key.attempt, 1);
         assert!(matches!(
             &outcome,
-            crate::global_state::LatencyAttemptOutcome::Cancelled {
-                kind: salsa::Cancelled::PropagatedPanic,
+            crate::global_state::LatencyAttemptOutcome::Panicked {
                 revision,
             } if *revision == attempt_revision
         ));
@@ -698,7 +694,10 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
         );
         assert!(gate.waiter_observed_propagated.load(Ordering::Acquire));
         assert_eq!(gate.calls.load(Ordering::Acquire), 1, "a real panic does not retry");
-        assert!(crate::panic_watch::panicked_in(attempt_revision));
+        assert!(crate::panic_watch::panicked_in(
+            state.analysis_host.raw_database(),
+            attempt_revision
+        ));
         assert_eq!(
             salsa::plumbing::current_revision(state.analysis_host.raw_database()),
             attempt_revision,
@@ -714,7 +713,6 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
         );
         remove_gate(&gate);
         g1_wait_for_task_pool_quiescence(&mut state, &task_receiver);
-        crate::panic_watch::reset_for_test();
     });
 }
 
@@ -722,7 +720,6 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
 fn g1_propagated_without_new_revision_is_refused_controller_control() {
     g1_with_tracing(|| {
         let _panic_guard = crate::panic_watch::panic_test_guard();
-        crate::panic_watch::reset_for_test();
         let (_dir, mut state, client_receiver, _changed, caller_uri, _control) =
             live_definition_fixture();
         let task_receiver = state.task_pool.receiver.clone();

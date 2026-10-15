@@ -1,2 +1,5 @@
 [source]
 root = "."
+
+[platform_help]
+source = "bundled"

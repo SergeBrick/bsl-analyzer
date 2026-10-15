@@ -60,11 +60,21 @@ pub fn comment_token_is_string_text(token: &SyntaxToken) -> bool {
         )
 }
 
+/// A `//` line of a multiline literal sits a few tokens from the string boundary.
+/// Past that, the walk is a comment run: scanning it again from every line is
+/// quadratic, and such a run is not string text.
+const NEIGHBOR_WALK_LIMIT: u32 = 32;
+
 fn non_trivia_kind(token: &SyntaxToken, forward: bool) -> Option<SyntaxKind> {
     let mut cursor = if forward { token.next_token() } else { token.prev_token() };
+    let mut steps = 0u32;
     while let Some(current) = cursor {
         if !current.kind().is_trivia() {
             return Some(current.kind());
+        }
+        steps += 1;
+        if steps >= NEIGHBOR_WALK_LIMIT {
+            return None;
         }
         cursor = if forward { current.next_token() } else { current.prev_token() };
     }

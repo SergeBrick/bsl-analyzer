@@ -355,6 +355,20 @@ fn an_undecidable_region_does_not_erase_the_directive_environment() {
 }
 
 #[test]
+fn illegal_character_in_a_parameter_doc_separator_is_manual() {
+    // The analyzer reads `Имя - Тип` under `Параметры:`. A non-breaking space
+    // hides that split; a safe fix would invent the type unattended.
+    let source = "// Параметры:\n//   Имя\u{00A0}-\u{00A0}Строка\nФункция Тест(Имя) Экспорт\n    Возврат Имя;\nКонецФункции\n";
+    let diagnostics = module_diagnostics(source, Project::default());
+    let fixes = fixes_of(source, &diagnostics, DiagnosticCode::InvalidCharacterInFile);
+    assert!(
+        fixes.contains("Заменить недопустимые символы (меняет текст программы) [fix_all=false]"),
+        "got: {fixes}"
+    );
+    assert!(fixes.contains("//   Имя - Строка"), "got: {fixes}");
+}
+
+#[test]
 fn illegal_character_in_a_string_is_a_manual_fix() {
     // A non-breaking space inside a literal may be exactly what the code looks for.
     let source = "Процедура Тест(Текст)\n    Текст = СтрЗаменить(Текст, \"\u{00A0}\", \"\");\nКонецПроцедуры\n";

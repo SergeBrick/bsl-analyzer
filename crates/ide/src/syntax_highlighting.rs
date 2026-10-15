@@ -23,6 +23,7 @@ pub enum HlTag {
     Comment,
     Preprocessor,
     Annotation,
+    CompilerDirective,
     Property,
     Operator,
     UnresolvedReference,
@@ -47,6 +48,7 @@ impl HlTag {
             HlTag::Comment => "comment",
             HlTag::Preprocessor => "macro",
             HlTag::Annotation => "decorator",
+            HlTag::CompilerDirective => "modifier",
             HlTag::Property => "property",
             HlTag::Operator => "operator",
             HlTag::UnresolvedReference => "unresolvedReference",
@@ -291,6 +293,7 @@ fn highlight_token<DB: RootDatabase>(
         }
     }
 
+    let mut modifiers = HlMod::new();
     let tag = if kind.is_boolean_literal() {
         HlTag::BooleanLiteral
     } else if kind.is_string_literal() {
@@ -298,11 +301,22 @@ fn highlight_token<DB: RootDatabase>(
     } else if kind.is_number_literal() {
         HlTag::NumberLiteral
     } else if kind.is_keyword() {
+        // Declaration keywords stay `keyword` for clients that ignore
+        // modifiers; the standard `declaration` modifier lets a theme colour
+        // them apart from control-flow keywords. After `.` the keyword is a
+        // member name (`Б.Функция`), not a declaration.
+        let is_member_name =
+            token.parent().is_some_and(|parent| parent.kind() == SyntaxKind::FIELD_EXPR);
+        if kind.is_declaration_keyword() && !is_member_name {
+            modifiers = modifiers.with(HlMod::DECLARATION);
+        }
         HlTag::Keyword
     } else if kind == SyntaxKind::COMMENT {
         HlTag::Comment
     } else if kind.is_preprocessor() {
         HlTag::Preprocessor
+    } else if kind.is_compilation_directive() {
+        HlTag::CompilerDirective
     } else if kind.is_annotation() {
         HlTag::Annotation
     } else if kind.is_operator() {
@@ -311,7 +325,7 @@ fn highlight_token<DB: RootDatabase>(
         return None;
     };
 
-    Some(HlRange { range, tag, modifiers: HlMod::new() })
+    Some(HlRange { range, tag, modifiers })
 }
 
 /// The name in a region directive (`#Область БыстрыйЗапуск`) is the label of a

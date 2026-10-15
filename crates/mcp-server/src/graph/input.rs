@@ -238,12 +238,12 @@ pub(crate) struct BatchLoad {
 /// target is addressable by path through the module index) but loads text only for
 /// `batch_files` — the only modules this database lowers.
 ///
-/// `file_source_root` is set ONLY for `batch_files`: the per-file source-root input
-/// is read solely for the file being lowered (resolver / infer / `get_file_path`),
-/// and the build never lowers a non-batch file. Cross-batch call targets resolve
-/// through the path-keyed module index built from the shared source root, which
-/// never consults `file_source_root`. Setting it for all files would re-pay a
-/// whole-config-sized loop on every batch database for no resolution benefit.
+/// `file_source_root` is set ONLY for `batch_files`: text is loaded only for this
+/// slice, and semantic lowering starts from these files. Cross-batch targets use
+/// the path-keyed module index in the shared source root; metadata path lookup may
+/// also resolve an exact FileId from that root without registering its text or
+/// revision. Registering every file here would re-pay a whole-config-sized loop
+/// for every batch database.
 pub(crate) fn db_for_files(
     source_root: &SourceRoot,
     batch_files: &[(FileId, PathBuf)],

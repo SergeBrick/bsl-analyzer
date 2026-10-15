@@ -1009,6 +1009,114 @@ mod vfs_race_tests {
     }
 
     #[test]
+    fn reloading_with_base_root_keeps_project_input_in_vfs_without_stale_root_registration() {
+        use base_db::{SourceDatabase, SourceRootId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingLoader(Arc<AtomicUsize>);
+        impl loader::Handle for CountingLoader {
+            fn spawn(_sender: loader::Sender) -> Self
+            where
+                Self: Sized,
+            {
+                unreachable!("injected loader")
+            }
+            fn set_config(&mut self, _config: loader::Config) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn invalidate(&mut self, _path: paths::AbsPathBuf) {}
+            fn load_sync(&mut self, _path: &paths::AbsPath) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.join("base");
+        std::fs::create_dir_all(base.join("generated")).unwrap();
+        std::fs::write(base.join("Configuration.xml"), "<Configuration/>").unwrap();
+        let initial_config = "[source]\nroot = \"base\"\n";
+        let changed_config = "[source]\nroot = \"base\"\nexclude = [\"base/generated\"]\n";
+        let config_path = root.join("bsl-analyzer.toml");
+        std::fs::write(&config_path, initial_config).unwrap();
+        let allowed_path = base.join("Allowed.bsl");
+        let hidden_path = base.join("generated/Hidden.bsl");
+        std::fs::write(&allowed_path, "allowed").unwrap();
+        std::fs::write(&hidden_path, "hidden").unwrap();
+
+        let loader_config_count = Arc::new(AtomicUsize::new(0));
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let (_loader_tx, loader_receiver) = crossbeam_channel::bounded(4);
+        let mut state = GlobalState::with_loader(
+            sender,
+            Box::new(CountingLoader(Arc::clone(&loader_config_count))),
+            loader_receiver,
+        );
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+
+        let config_vfs_path = vfs::VfsPath::new(config_path.clone());
+        let allowed_vfs_path = vfs::VfsPath::new(allowed_path.clone());
+        let hidden_vfs_path = vfs::VfsPath::new(hidden_path.clone());
+        let (config_id, allowed_id, hidden_id) = {
+            let mut vfs = state.vfs.write();
+            vfs.set_file_contents(config_vfs_path.clone(), Some(Arc::from(initial_config)));
+            vfs.set_file_contents(allowed_vfs_path.clone(), Some(Arc::from("allowed")));
+            vfs.set_file_contents(hidden_vfs_path.clone(), Some(Arc::from("hidden")));
+            (
+                vfs.file_id(&config_vfs_path).unwrap(),
+                vfs.file_id(&allowed_vfs_path).unwrap(),
+                vfs.file_id(&hidden_vfs_path).unwrap(),
+            )
+        };
+        state.process_changes(true);
+        state.init_source_root();
+        state.vfs_done = true;
+        state.analysis_host.raw_database_mut().set_workspace_load_complete(true);
+
+        std::fs::write(&config_path, changed_config).unwrap();
+        assert!(state
+            .vfs
+            .write()
+            .set_file_contents(config_vfs_path.clone(), Some(Arc::from(changed_config))));
+        let outcome = state.process_changes(false);
+
+        assert!(outcome.config_file_changed, "the delivered config edit must reload the project");
+        assert_eq!(
+            loader_config_count.load(Ordering::SeqCst),
+            2,
+            "one initial load and one reload"
+        );
+        {
+            let mut vfs = state.vfs.write();
+            assert!(vfs.exists(config_id), "the watched project input was tombstoned");
+            assert!(
+                !vfs.set_file_contents(config_vfs_path.clone(), Some(Arc::from(changed_config))),
+                "the project input VFS contents differ from the saved config"
+            );
+            assert!(vfs.exists(allowed_id), "the included BSL source was evicted");
+            assert!(!vfs.exists(hidden_id), "the newly excluded BSL source stayed in VFS");
+            assert_eq!(vfs.pending_change_bytes(), (0, 0), "reload left a spurious VFS change");
+        }
+        let db = state.analysis_host.raw_database();
+        let root0 = db.source_root_input(SourceRootId(0)).root(db);
+        assert!(
+            root0.file_set().file_for_path(&config_vfs_path).is_none(),
+            "the non-source project input remained registered in SourceRoot(0)"
+        );
+        assert!(
+            root0.file_set().file_for_path(&allowed_vfs_path).is_some(),
+            "the included BSL source was removed from SourceRoot(0)"
+        );
+        assert!(
+            root0.file_set().file_for_path(&hidden_vfs_path).is_none(),
+            "the excluded BSL source remained in SourceRoot(0)"
+        );
+        assert_eq!(&*db.file_text(hidden_id), "", "excluded BSL text was not tombstoned");
+    }
+
+    #[test]
     fn set_workspace_root_closes_load_gate_only_for_initial_load() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new(sender);
@@ -1126,6 +1234,11 @@ mod vfs_race_tests {
         assert!(
             root0.file_set().file_for_path(&vfs::VfsPath::new(hidden_bsl)).is_none(),
             "excluded BSL remained in FileSet"
+        );
+        assert_eq!(
+            &*db.file_text(hidden_bsl_id),
+            "",
+            "excluded BSL was removed from FileSet without a deleted-text input"
         );
         assert!(
             root0.file_set().file_for_path(&vfs::VfsPath::new(allowed_bsl)).is_some(),

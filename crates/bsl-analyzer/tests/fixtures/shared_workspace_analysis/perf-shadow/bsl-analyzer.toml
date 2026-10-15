@@ -1,0 +1,6 @@
+[source]
+root = "."
+
+
+[diagnostics.parameters]
+UnresolvedBareCall = true

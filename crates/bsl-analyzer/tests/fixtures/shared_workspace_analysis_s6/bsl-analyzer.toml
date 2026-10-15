@@ -1,0 +1,6 @@
+[source]
+root = "base"
+extensions = [
+  { name = "Поставщик", path = "extensions/provider-a", scope = "InfoBase" },
+  { name = "Потребитель", path = "extensions/consumer", scope = "InfoBase", dependsOn = ["Поставщик"] },
+]

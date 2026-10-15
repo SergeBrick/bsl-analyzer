@@ -2656,8 +2656,8 @@ mod tests {
         WorkspaceDiff,
     };
     use super::super::test_support::{
-        meta_string, published_report, sample_workspace, seed_cache, wait_ready, wait_until,
-        wait_until_within, write, write_common_module, write_extension_config,
+        meta_string, published_report, sample_workspace, seed_cache, wait_ready, wait_settled,
+        wait_until, wait_until_within, write, write_common_module, write_extension_config,
         write_extension_workspace,
     };
     use super::*;
@@ -4427,7 +4427,7 @@ mod tests {
         let lease = crate::workspace_lease::WorkspaceLease::claim(root);
         let graph = GraphState::for_workspace(root.to_path_buf()).with_lease(lease.clone());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
         write(
             root,
             "CommonModules/Сервер/Ext/Module.bsl",
@@ -4631,6 +4631,58 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn borrowed_form_graph_is_independent_of_batch_size() {
+        fn copy_dir(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let fixture = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bsl-metadata/fixtures/extension_metadata"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        copy_dir(&fixture.join("base"), root);
+        let extension = root.join("cfe/Расширение");
+        copy_dir(&fixture.join("extension"), &extension);
+        declare_scoped_extension(root, "Расширение", "cfe/Расширение");
+
+        let meta = crate::graph_db::GraphMeta {
+            revision: 1,
+            fingerprint: crate::graph_db::GraphFp::default(),
+            files: 0,
+            built_at: "t".to_string(),
+            publication_id: "test-1".to_owned(),
+        };
+        let one_batch = root.join(".build/one-batch.db");
+        let all_batches = root.join(".build/all-modules.db");
+        fs::create_dir_all(one_batch.parent().unwrap()).unwrap();
+        build_whole_graph(root, &one_batch, 1, &meta).expect("single-file batches build");
+        build_whole_graph(root, &all_batches, usize::MAX, &meta)
+            .expect("the whole workspace batch builds");
+
+        let (one_nodes, one_edges, _, _) = dump_data(&one_batch);
+        let (all_nodes, all_edges, _, _) = dump_data(&all_batches);
+        assert_eq!(one_nodes, all_nodes, "all graph nodes match across batch sizes");
+        assert_eq!(one_edges, all_edges, "all graph edges match across batch sizes");
+        assert!(
+            one_nodes.iter().any(|row| {
+                row.contains("form_attr/Document/Заказ/ФормаДокумента/БазовыйРеквизитФормы")
+            }),
+            "batch size one must retain the inherited base-form attribute"
+        );
     }
 
     /// The straddle verdict is more than a fingerprint comparison: either
@@ -5725,7 +5777,7 @@ mod tests {
         });
 
         let (callers, module_placed, module_without_source) = rx
-            .recv_timeout(Duration::from_secs(20))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("no projection here can use the bytes, so none may block on reading them");
         assert_eq!(callers, 1, "the fixture has exactly one caller of Считать");
         assert!(module_placed, "the pair costs no I/O and is served without it");
@@ -9293,10 +9345,13 @@ mod form_twin_tests {
     use std::path::Path;
 
     fn wait_for_build_to_settle(graph: &GraphState) {
-        let deadline = std::time::Instant::now() + super::super::test_support::WAIT_CEILING;
+        let mut deadline = crate::change_hub::test_support::Patience::new(
+            crate::change_hub::test_support::STATE_CEILING,
+            std::time::Duration::from_millis(10),
+        );
         while graph.build_in_flight() {
-            assert!(std::time::Instant::now() < deadline, "initial graph build did not settle");
-            std::thread::yield_now();
+            assert!(deadline.allows(), "initial graph build did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

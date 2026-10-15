@@ -48,8 +48,8 @@ impl ide_host_core::VfsWrite for ResidentVfs {
     }
 }
 
-/// Retract everything a path's registration owns: its text input, its file-set entry
-/// and its `by_path` back-link. Returns whether the file set moved.
+/// Resolve a retired path to its registered id, then forget the adapter's backlink.
+/// The shared batch owns the Salsa source and FileSet removal.
 ///
 /// Where the id lives depends on whether the path was still serving, and the two
 /// removal routes disagree about that: the retry list owns paths that left `by_path`
@@ -63,28 +63,44 @@ impl ide_host_core::VfsWrite for ResidentVfs {
 /// so a path it merely REMEMBERS from an earlier life looks exactly like one this
 /// resident registered. Only the caller knows which it is.
 fn retire_registration(
-    resident: &mut DiagnosticsResident,
-    file_set: &mut vfs::FileSet,
+    vfs: &ResidentVfs,
+    by_path: &mut HashMap<String, FileId>,
     key: &str,
     registered: bool,
-) -> bool {
-    use ide_host_core::{set_file_text_source, FileTextSource, VfsWrite};
+) -> Option<FileId> {
+    use ide_host_core::VfsWrite;
 
-    let file_id = match resident.by_path.get(key) {
+    let file_id = match by_path.get(key) {
         Some(&file_id) => Some(file_id),
-        None if registered => {
-            resident.vfs.with_write(|vfs| vfs.file_id(&VfsPath::new(PathBuf::from(key))))
-        }
+        None if registered => vfs.with_write(|vfs| vfs.file_id(&VfsPath::new(PathBuf::from(key)))),
         None => None,
     };
-    let Some(file_id) = file_id else { return false };
-    set_file_text_source(&mut resident.db, file_id, FileTextSource::Deleted);
-    resident.by_path.remove(key);
-    if file_set.path_for_file(&file_id).is_some() {
-        file_set.remove(file_id);
-        return true;
+    if file_id.is_some() {
+        by_path.remove(key);
     }
-    false
+    file_id
+}
+
+pub(super) fn apply_project_compatibility_mode(
+    db: &mut RootDatabaseImpl,
+    resolved: Option<(String, project_model::CompatibilityModeSource)>,
+) {
+    use std::sync::Arc;
+
+    if let Some((value, source)) = &resolved {
+        if bsl_platform::PlatformVersion::parse_compatibility_mode(value).is_none() {
+            tracing::warn!(
+                compatibility_mode = %value,
+                ?source,
+                "compatibility mode is not a recognized value; the compatibility-mode check stays off"
+            );
+        }
+    }
+    let mode = resolved.map(|(value, _)| Arc::<str>::from(value));
+    if db.compatibility_mode().as_deref() != mode.as_deref() {
+        tracing::info!(compatibility_mode = ?mode, "updated compatibility mode");
+        db.set_compatibility_mode(mode);
+    }
 }
 
 /// Re-read every held hole. Returns `(healed, vanished)` by canonical key, so the
@@ -101,8 +117,7 @@ pub(super) fn retry_resident_holes(
     config_is_current: bool,
     only: Option<&str>,
 ) -> (Vec<(String, Option<u64>)>, Vec<String>) {
-    use base_db::{SourceDatabase, SourceRoot};
-    use ide_host_core::{set_file_text_source, FileTextSource, VfsWrite};
+    use ide_host_core::{apply_source_batch, BatchTextSource, SourceBatchChange, VfsWrite};
 
     let mut healed = Vec::new();
     let mut vanished = Vec::new();
@@ -113,68 +128,50 @@ pub(super) fn retry_resident_holes(
         .map(|(k, o)| (k.clone(), *o))
         .collect();
 
-    let mut file_set = {
-        let db = &resident.db;
-        db.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT).root(db).file_set().clone()
-    };
-    let mut file_set_modified = false;
-
-    for (key, origin) in candidates {
-        let path = Path::new(&key);
-        // Stat BEFORE the read, the same order every other applier uses. The baseline
-        // must describe the bytes actually applied: stat-after-read would record a
-        // write that landed between the two, so the baseline would match a disk state
-        // whose text was never served, no scan would ever see drift again, and the
-        // file would serve the older text at `stale: false` forever.
-        let fp_before = crate::graph::scan::file_fingerprint(path);
-        // Absence is established by trying to open the file, not by its absence from
-        // someone else's listing — an incomplete walk must not retire a hole.
-        match base_db::read_disk_text(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Gone. For a path that was serving, this is a removal and owes
-                // everything the ordinary removal branch does — otherwise the
-                // metadata back-link keeps pointing at a tombstoned FileId.
-                file_set_modified |= retire_registration(
-                    resident,
-                    &mut file_set,
-                    &key,
-                    origin == HoleOrigin::Admitted,
-                );
-                resident.holes.remove(&key);
-                vanished.push(key);
-            }
-            Err(_) => {} // still unreadable → stays a hole
-            Ok(text) => {
-                // Returning a NEW path to service asserts it belongs to the
-                // configuration being served, which is the one thing the retry list
-                // must not assume: it is memory, and the gate is deliberately asked
-                // of the disk. A path that was already serving is not re-admitted.
-                if origin == HoleOrigin::Pending && !config_is_current {
-                    continue;
+    {
+        let vfs = &resident.vfs;
+        let db = &mut resident.db;
+        let by_path = &mut resident.by_path;
+        let holes = &mut resident.holes;
+        let mut candidates = candidates.into_iter();
+        let changes = std::iter::from_fn(|| {
+            loop {
+                let (key, origin) = candidates.next()?;
+                let path = Path::new(&key);
+                // Stat before reading so the baseline describes the bytes applied.
+                let fp_before = crate::graph::scan::file_fingerprint(path);
+                // Absence is established by opening the file, not by another walk.
+                match base_db::read_disk_text(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let file_id =
+                            retire_registration(vfs, by_path, &key, origin == HoleOrigin::Admitted);
+                        holes.remove(&key);
+                        vanished.push(key);
+                        if let Some(file_id) = file_id {
+                            return Some(SourceBatchChange::Remove { file_id });
+                        }
+                    }
+                    Err(_) => {} // still unreadable → stays a hole
+                    Ok(text) => {
+                        // A pending hole is admitted only while its config identity is current.
+                        if origin == HoleOrigin::Pending && !config_is_current {
+                            continue;
+                        }
+                        let vfs_path = VfsPath::new(path.to_path_buf());
+                        let file_id = vfs.with_write(|vfs| vfs.alloc_file_id(vfs_path.clone()));
+                        by_path.insert(key.clone(), file_id);
+                        holes.remove(&key);
+                        healed.push((key, fp_before));
+                        return Some(SourceBatchChange::Upsert {
+                            file_id,
+                            path: vfs_path,
+                            source: Some(BatchTextSource::DiskOwned(text)),
+                        });
+                    }
                 }
-                let vfs_path = VfsPath::new(path.to_path_buf());
-                let file_id = resident.vfs.with_write(|vfs| vfs.alloc_file_id(vfs_path.clone()));
-                resident.db.set_file_source_root(file_id, crate::graph::input::GRAPH_SOURCE_ROOT);
-                set_file_text_source(&mut resident.db, file_id, FileTextSource::Disk(&text));
-                if file_set.path_for_file(&file_id).is_none() {
-                    file_set.insert(file_id, vfs_path);
-                    file_set_modified = true;
-                }
-                resident.by_path.insert(key.clone(), file_id);
-                resident.holes.remove(&key);
-                healed.push((key, fp_before));
             }
-        }
-    }
-
-    // The clone is published ONCE, after the loop — the same shape the add/remove
-    // branches use. An insert that never reaches the db leaves `path_for_file` empty
-    // and the first query panics.
-    if file_set_modified {
-        resident.db.set_source_root(
-            crate::graph::input::GRAPH_SOURCE_ROOT,
-            SourceRoot::new_local(file_set),
-        );
+        });
+        apply_source_batch(db, crate::graph::input::GRAPH_SOURCE_ROOT, changes);
     }
 
     // The substrate is re-issued for every transition, not just for paths that were
@@ -1304,8 +1301,8 @@ pub(super) fn apply_resident_changes(
     fp_of: impl Fn(&str) -> Option<u64>,
     stats: &HashMap<String, u64>,
 ) -> (bool, bool) {
-    use base_db::{SourceDatabase, SourceRoot};
-    use ide_host_core::{set_file_text_source, FileTextSource, VfsWrite};
+    use ide_host_core::{apply_source_batch, BatchTextSource, SourceBatchChange, VfsWrite};
+    use rustc_hash::FxHashSet;
 
     // Pre-classification: an XML path resolving outside every registered config root is
     // drift the point-refresh cannot express — `refresh_metadata_substrate` gates its
@@ -1319,92 +1316,135 @@ pub(super) fn apply_resident_changes(
     }
 
     let mut moved = false;
+    let mut needs_rebuild = false;
+    let mut became_holes: Vec<PathBuf> = Vec::new();
+    let mut changed_membership_paths: Vec<PathBuf> = Vec::new();
+    let mut phase = 0;
+    let (mut added, mut removed, mut modified) = (0, 0, 0);
 
-    // (1) Reconcile the file universe FIRST — mirrors the LSP's `process_changes`
-    // discipline (one FileSet clone, per-file inputs, one `set_source_root`), so the
-    // substrate refresh below resolves module back-links through an up-to-date VFS and
-    // root. Per-file ordering matters: the source-root + content-revision inputs are
-    // registered BEFORE the file becomes visible through the FileSet
-    // (`file_text_query` panics on a visible file with no revision).
-    let mut file_set_modified = false;
-    let mut file_set = {
-        let db = &resident.db;
-        db.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT).root(db).file_set().clone()
-    };
-    for path in added_bsl {
-        // Vanished again before we got here (create+delete coalesced apart): the
-        // removal pass — or the next drift window — settles it.
-        if fp_of(path).is_none() && !Path::new(path).is_file() {
-            continue;
-        }
-        // Read BEFORE interning. A file that cannot be read is not registered at all,
-        // and "at all" has to include the VFS: `alloc_file_id` used to run first, so
-        // skipping only from the read onwards would leave a `FileId` with no file-set
-        // entry, which the next query resolves into a `path_for_file` panic.
-        let text = match base_db::read_disk_text(Path::new(path)) {
-            Ok(text) => text,
-            Err(_) => {
-                // Never admitted into this resident, so healing it later must ask the
-                // configuration gate first.
-                resident.holes.insert(path.clone(), HoleOrigin::Pending);
-                moved = true;
-                continue;
+    // Keep the operation plan path-only. This iterator performs each disk read just
+    // before the shared batch applies it, so at most one MCP source text is resident
+    // in the reconciliation path at a time.
+    let db = &mut resident.db;
+    let vfs = &resident.vfs;
+    let by_path = &mut resident.by_path;
+    let holes = &mut resident.holes;
+    let changes = std::iter::from_fn(|| {
+        loop {
+            if needs_rebuild {
+                return None;
             }
-        };
-        let vfs_path = VfsPath::new(path.clone());
-        let file_id = resident.vfs.with_write(|vfs| vfs.alloc_file_id(vfs_path.clone()));
-        if let Some(&known) = resident.by_path.get(path.as_str()) {
-            if known != file_id {
-                // The path is already registered under a different id — an aliasing
-                // (symlink/canonicalisation) case registration cannot express safely.
-                return (true, moved);
+            match phase {
+                0 if added < added_bsl.len() => {
+                    let path = &added_bsl[added];
+                    added += 1;
+                    if fp_of(path).is_none() && !Path::new(path).is_file() {
+                        continue;
+                    }
+                    // Read BEFORE interning: a pending unreadable path has no FileId or
+                    // FileSet entry, and its next attempt still passes the admission gate.
+                    let text = match base_db::read_disk_text(Path::new(path)) {
+                        Ok(text) => text,
+                        Err(_) => {
+                            let inserted =
+                                holes.insert(path.clone(), HoleOrigin::Pending).is_none();
+                            moved |= inserted;
+                            if inserted {
+                                changed_membership_paths.push(PathBuf::from(path));
+                            }
+                            continue;
+                        }
+                    };
+                    let vfs_path = VfsPath::new(path.clone());
+                    let file_id = vfs.with_write(|vfs| vfs.alloc_file_id(vfs_path.clone()));
+                    if by_path.get(path.as_str()).is_some_and(|known| *known != file_id) {
+                        // The path is already registered under another id; aliasing needs
+                        // a full rescan, preserving the existing registration unchanged.
+                        needs_rebuild = true;
+                        return None;
+                    }
+                    by_path.insert(path.clone(), file_id);
+                    holes.remove(path.as_str());
+                    return Some(SourceBatchChange::Upsert {
+                        file_id,
+                        path: vfs_path,
+                        source: Some(BatchTextSource::DiskOwned(text)),
+                    });
+                }
+                0 => phase = 1,
+                1 if removed < removed_bsl.len() => {
+                    let path = &removed_bsl[removed];
+                    removed += 1;
+                    let was_hole = holes.remove(path.as_str());
+                    let registered = was_hole == Some(HoleOrigin::Admitted);
+                    let moved_here = was_hole.is_some() || by_path.contains_key(path.as_str());
+                    let file_id = by_path.remove(path.as_str()).or_else(|| {
+                        registered
+                            .then(|| {
+                                vfs.with_write(|vfs| {
+                                    vfs.file_id(&VfsPath::new(PathBuf::from(path)))
+                                })
+                            })
+                            .flatten()
+                    });
+                    moved |= moved_here;
+                    if was_hole.is_some() {
+                        changed_membership_paths.push(PathBuf::from(path));
+                    }
+                    if let Some(file_id) = file_id {
+                        return Some(SourceBatchChange::Remove { file_id });
+                    }
+                }
+                1 => phase = 2,
+                2 if modified < modified_bsl.len() => {
+                    let path = &modified_bsl[modified];
+                    modified += 1;
+                    let Some(fp) = fp_of(path) else { continue };
+                    if stats.get(path).copied() == Some(fp) {
+                        continue;
+                    }
+                    let Some(&file_id) = by_path.get(path) else {
+                        if holes.contains_key(path) {
+                            continue;
+                        }
+                        needs_rebuild = true;
+                        return None;
+                    };
+                    let vfs_path = VfsPath::new(PathBuf::from(path));
+                    match base_db::read_disk_text(Path::new(path)) {
+                        Ok(text) => {
+                            return Some(SourceBatchChange::Upsert {
+                                file_id,
+                                path: vfs_path,
+                                source: Some(BatchTextSource::DiskOwned(text)),
+                            });
+                        }
+                        Err(_) => {
+                            // Keep the FileSet registration but mark the body unreadable;
+                            // this preserves the admitted module identity during retries.
+                            by_path.remove(path);
+                            holes.insert(path.clone(), HoleOrigin::Admitted);
+                            became_holes.push(PathBuf::from(path));
+                            return Some(SourceBatchChange::Upsert {
+                                file_id,
+                                path: vfs_path,
+                                source: Some(BatchTextSource::Unreadable),
+                            });
+                        }
+                    }
+                }
+                2 => phase = 3,
+                _ => return None,
             }
         }
-        resident.db.set_file_source_root(file_id, crate::graph::input::GRAPH_SOURCE_ROOT);
-        set_file_text_source(&mut resident.db, file_id, FileTextSource::Disk(&text));
-        if file_set.path_for_file(&file_id).is_none() {
-            file_set.insert(file_id, vfs_path);
-            file_set_modified = true;
-        }
-        // The classifier's `key` IS the canonical by_path spelling (both come from the
-        // scan-universe canonicalisation), so insert it verbatim — re-canonicalising
-        // here could diverge on a path that vanished between classify and apply.
-        resident.by_path.insert(path.clone(), file_id);
-        // A path returning to service leaves the hole list, whichever branch brings it
-        // back. `by_path` and `holes` must not intersect: the workspace denominator is
-        // their sum, and the hole list drives the retry pass — a served path left in it
-        // would be re-read from disk every drift window for nothing.
-        resident.holes.remove(path.as_str());
-        moved = true;
+    });
+    let source_effects = apply_source_batch(db, crate::graph::input::GRAPH_SOURCE_ROOT, changes);
+    moved |= source_effects.bsl_source_changed;
+    if needs_rebuild {
+        return (true, moved);
     }
-    for path in removed_bsl {
-        // A deleted file is no longer a hole either: the retry list must not keep
-        // probing a path the workspace no longer has, and leaving it there would
-        // report a phantom in `unread_files` for as long as it is never recreated.
-        // The origin decides whether anything was ever registered under this path —
-        // a hole is not always the retry list's to retire, because the retry window
-        // is throttled and `reconcile_tick` never opens it at all.
-        let was_hole = resident.holes.remove(path.as_str());
-        let registered = was_hole == Some(HoleOrigin::Admitted);
-        // The resident moved if the removal changed anything the workspace REPORTS,
-        // and the hole list is reported: it is `unread_files`, it is half of
-        // `files_total`, and a non-empty one is what makes the answer stale. A
-        // `Pending` hole has no registration by construction, so counting only
-        // registrations would let all three change under an unmoved generation — the
-        // same `result_id` answering "unreadable" and then "not in workspace". The
-        // creation of that hole bumps the generation; its removal owes the same.
-        // Never indexed and never a hole → nothing moved (an untracked removal is not
-        // drift).
-        let moved_here = was_hole.is_some() || resident.by_path.contains_key(path.as_str());
-        file_set_modified |= retire_registration(resident, &mut file_set, path, registered);
-        moved |= moved_here;
-    }
-    if file_set_modified {
-        resident.db.set_source_root(
-            crate::graph::input::GRAPH_SOURCE_ROOT,
-            SourceRoot::new_local(file_set),
-        );
-    }
+    let changed_source_paths: FxHashSet<_> =
+        source_effects.affected_paths.iter().chain(&changed_membership_paths).cloned().collect();
 
     // (2) Refresh the per-MDO substrate. Beside the drifted `.xml`, a created or
     // deleted common-module/service body changes its listing's `module_file`
@@ -1418,6 +1458,7 @@ pub(super) fn apply_resident_changes(
         .map(PathBuf::from)
         .filter(|p| project_model::is_substrate_listed_body_path(p))
         .filter(|p| config_roots.iter().any(|(_, root)| p.starts_with(root)))
+        .filter(|p| changed_source_paths.contains(p))
         .collect();
     if !xml_paths.is_empty() || !structural_listing_bodies.is_empty() {
         let mut refresh: Vec<PathBuf> = xml_paths.to_vec();
@@ -1425,47 +1466,16 @@ pub(super) fn apply_resident_changes(
         ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &refresh);
         if !xml_paths.is_empty() {
             resident.db.bump_config_for_paths(xml_paths.iter().map(|p| p.as_path()));
+            apply_project_compatibility_mode(
+                &mut resident.db,
+                resident.project.compatibility_mode(),
+            );
         }
         moved = true;
     }
 
     // `.bsl` bodies: disk-backed re-key. A body already at its on-disk fingerprint (a
     // racing caller beat us) is skipped.
-    let mut became_holes: Vec<PathBuf> = Vec::new();
-    for path in modified_bsl {
-        let Some(fp) = fp_of(path) else { continue };
-        if stats.get(path).copied() == Some(fp) {
-            continue;
-        }
-        let Some(&file_id) = resident.by_path.get(path) else {
-            // A path already held as a hole is not "never indexed": the retry cycle
-            // owns it, and healing it HERE would be wrong twice over — the file set
-            // was already published above, so the insert would not reach the db, and
-            // an admission would slip past the configuration gate.
-            if resident.holes.contains_key(path) {
-                continue;
-            }
-            return (true, moved); // a modified `.bsl` we never indexed → structural
-        };
-        match base_db::read_disk_text(Path::new(path)) {
-            Ok(text) => {
-                set_file_text_source(&mut resident.db, file_id, FileTextSource::Disk(&text))
-            }
-            Err(_) => {
-                // Unreadable now. The empty overlay is mandatory (a disk-backed re-read
-                // would panic), but it is no longer passed off as content: the file
-                // leaves service and joins the retry list, so consumers see "known
-                // but unreadable" instead of an empty module. `Admitted` — it was
-                // already serving under this configuration.
-                set_file_text_source(&mut resident.db, file_id, FileTextSource::Unreadable);
-                resident.by_path.remove(path);
-                resident.holes.insert(path.clone(), HoleOrigin::Admitted);
-                became_holes.push(PathBuf::from(path));
-            }
-        }
-        moved = true;
-    }
-
     // A body that just became a hole has to LOSE its `module_file` back-link, and the
     // substrate pass above already ran — it keys off `added_bsl`/`removed_bsl`, and
     // this transition is neither. Without re-issuing it here, the same disk state
@@ -1687,6 +1697,89 @@ mod tests {
             }
             _ => panic!("expected Ready outcome"),
         }
+    }
+
+    /// A path/id disagreement is not repaired by overwriting the resident's existing
+    /// registration: the caller must rebuild from the filesystem's complete mapping.
+    #[test]
+    fn an_added_path_id_collision_requires_rebuild_without_mutating_registration() {
+        use base_db::SourceDatabase;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        write(root, "Other.bsl", "Процедура Другая()\nКонецПроцедуры\n");
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let target_path = module_path(root, "Сервер");
+        let other_path = root.join("Other.bsl");
+        let outcome = state.read_mut(|resident, _| {
+            let target_id = resident.file_id_for(&target_path).expect("target is resident");
+            let other_id = resident.file_id_for(&other_path).expect("other file is resident");
+            assert_ne!(target_id, other_id, "collision uses a different existing FileId");
+
+            let source_root = resident
+                .db
+                .source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
+                .root(&resident.db);
+            let file_set_before = source_root.file_set().clone();
+            let target_vfs_path = file_set_before
+                .path_for_file(&target_id)
+                .expect("target has an existing FileSet path")
+                .clone();
+            assert_eq!(file_set_before.file_for_path(&target_vfs_path), Some(&target_id));
+            assert_eq!(file_set_before.path_for_file(&target_id), Some(&target_vfs_path));
+            let revision_before = resident.db.file_revision_input(target_id);
+            let revision_value_before = revision_before.revision(&resident.db);
+            let unreadable_before = revision_before.unreadable(&resident.db);
+            let salsa_revision_before = salsa::plumbing::current_revision(&resident.db);
+            let text_before = resident.analysis().file_text(target_id).to_string();
+            assert!(
+                resident.db.try_file_text(target_id).is_none(),
+                "resident text stays disk-backed"
+            );
+
+            let key = canonical_key(&target_path);
+            resident.by_path.insert(key.clone(), other_id);
+            let by_path_before = resident.by_path.get(&key).copied();
+            let added = [key.clone()];
+            let stats = HashMap::new();
+
+            let result =
+                apply_resident_changes(resident, &[], &added, &[], &[], |_| Some(1), &stats);
+
+            assert_eq!(result, (true, false), "an existing path/id collision requests rebuild");
+            assert_eq!(resident.by_path.get(&key).copied(), by_path_before);
+            let source_root_after = resident
+                .db
+                .source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
+                .root(&resident.db);
+            let file_set_after = source_root_after.file_set();
+            assert_eq!(file_set_after, &file_set_before, "the FileSet registration is untouched");
+            let revision_after = resident.db.file_revision_input(target_id);
+            assert_eq!(revision_after.revision(&resident.db), revision_value_before);
+            assert_eq!(revision_after.unreadable(&resident.db), unreadable_before);
+            assert_eq!(
+                salsa::plumbing::current_revision(&resident.db),
+                salsa_revision_before,
+                "the collision path performs no same-value Salsa write"
+            );
+            assert!(resident.db.try_file_text(target_id).is_none(), "no pinned text was installed");
+            assert_eq!(
+                resident.analysis().file_text(target_id).as_str(),
+                text_before.as_str(),
+                "the known FileId still serves its original disk text"
+            );
+            result
+        });
+
+        assert!(
+            matches!(outcome, ResidentOutcome::Ready((true, false), _)),
+            "the resident reports rebuild required without a partial source mutation"
+        );
     }
 
     /// The resident loads the project's `bsl-analyzer.toml` and exposes it as the

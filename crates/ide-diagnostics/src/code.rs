@@ -188,6 +188,7 @@ pub enum DiagnosticCode {
     FieldsFromJoinsWithoutIsNull,
     FullOuterJoinQuery,
     IncorrectUseLikeInQuery,
+    InvalidVirtualTableParameters,
     JoinWithSubQuery,
     JoinWithVirtualTable,
     LogicalOrInJoinQuerySection,

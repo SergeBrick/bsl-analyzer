@@ -374,6 +374,12 @@ impl Register {
         if overlay.register_type.is_some() {
             self.register_type = overlay.register_type;
         }
+        if overlay.correspondence.is_some() {
+            self.correspondence = overlay.correspondence;
+        }
+        if overlay.chart_of_accounts.is_some() {
+            self.chart_of_accounts.clone_from(&overlay.chart_of_accounts);
+        }
         crate::common_attribute::merge_common_attribute_fields(
             &mut self.common_attributes,
             &overlay.common_attributes,
@@ -686,6 +692,31 @@ mod tests {
             .build();
 
         assert_eq!(reg1, reg2);
+    }
+
+    #[test]
+    fn extension_overlay_takes_correspondence_and_chart_when_specified() {
+        let mut base = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .correspondence(Some(false))
+            .chart_of_accounts(Some("План1".to_string()))
+            .build();
+        let overlay = Register::builder()
+            .name("Бухгалтерия1")
+            .mdo_type(MdoType::AccountingRegister)
+            .correspondence(Some(true))
+            .chart_of_accounts(Some("План2".to_string()))
+            .build();
+        base.apply_extension_overlay(&overlay);
+        assert_eq!(base.correspondence(), Some(true));
+        assert_eq!(base.chart_of_accounts(), Some("План2"));
+
+        let silent =
+            Register::builder().name("Бухгалтерия1").mdo_type(MdoType::AccountingRegister).build();
+        base.apply_extension_overlay(&silent);
+        assert_eq!(base.correspondence(), Some(true), "an omitted scalar stays with the base");
+        assert_eq!(base.chart_of_accounts(), Some("План2"));
     }
 
     #[test]

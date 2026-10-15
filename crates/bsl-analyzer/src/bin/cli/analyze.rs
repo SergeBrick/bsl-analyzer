@@ -489,13 +489,10 @@ fn analyze_salsa(
     );
 
     tracing::info!("Loading files into database");
-    let mut file_set = vfs::FileSet::new();
     let mut all_file_ids: Vec<(FileId, PathBuf)> = Vec::new();
 
     for (idx, path) in bsl_files.iter().enumerate() {
         let file_id = FileId(idx as u32);
-        let vfs_path = vfs::VfsPath::new(path.clone());
-        file_set.insert(file_id, vfs_path);
         all_file_ids.push((file_id, path.clone()));
     }
 
@@ -521,10 +518,8 @@ fn analyze_salsa(
         all_file_ids.clone()
     };
 
-    let file_set_arc = Arc::new(file_set);
     let source_root_id = base_db::SourceRootId(0);
-    let source_root = base_db::SourceRoot::new_local((*file_set_arc).clone());
-    db.set_source_root(source_root_id, source_root);
+    db.set_source_root(source_root_id, ide_host_core::build_source_root(&[]));
 
     // Disk-backed: record each file's content revision and drop the text (re-read on
     // demand by `file_text_query` under the salsa LRU, verified against the revision),
@@ -535,6 +530,11 @@ fn analyze_salsa(
     if let Some((path, err)) = unreadable.into_iter().next() {
         return Err(format!("failed to read BSL file {}: {err}", path.display()).into());
     }
+    let file_set_arc = {
+        use base_db::SourceDatabase;
+
+        Arc::new(db.source_root_input(source_root_id).root(&db).file_set().clone())
+    };
     ide::warm_batch_config_roots(&db, &file_ids);
 
     tracing::info!(

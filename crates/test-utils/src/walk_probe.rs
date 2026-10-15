@@ -10,12 +10,31 @@
 //! interleaving instead of a cancellation.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 const WALK_SPAN: &str = "find_references_in_file";
 
 /// Files the walk has entered since the last [`reset`].
 static WALKED: AtomicUsize = AtomicUsize::new(0);
+
+struct FirstSpanGate {
+    state: Mutex<FirstSpanState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct FirstSpanState {
+    claimed: bool,
+    entered: bool,
+    released: bool,
+}
+
+static FIRST_SPAN_GATE: Mutex<Option<Arc<FirstSpanGate>>> = Mutex::new(None);
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct WalkCounter;
 
@@ -28,6 +47,21 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WalkCounter {
     ) {
         if attrs.metadata().name() == WALK_SPAN {
             WALKED.fetch_add(1, Ordering::SeqCst);
+            let gate = lock_recover(&FIRST_SPAN_GATE).clone();
+            if let Some(gate) = gate {
+                let mut state = lock_recover(&gate.state);
+                if !state.claimed {
+                    state.claimed = true;
+                    state.entered = true;
+                    gate.changed.notify_all();
+                    while !state.released {
+                        state = gate
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+            }
         }
     }
 }
@@ -54,6 +88,74 @@ pub fn reset() {
 
 pub fn entered() -> usize {
     WALKED.load(Ordering::SeqCst)
+}
+
+/// Hold the first subsequent reference-walk span until the returned guard is released.
+///
+/// The guard releases the span and removes the process-global gate on drop, including when
+/// a test assertion unwinds.
+pub fn hold_first_span() -> (FirstSpanGuard, FirstSpanWaiter) {
+    let gate = Arc::new(FirstSpanGate {
+        state: Mutex::new(FirstSpanState::default()),
+        changed: Condvar::new(),
+    });
+    let mut active = lock_recover(&FIRST_SPAN_GATE);
+    assert!(active.is_none(), "a first-span gate is already active");
+    *active = Some(Arc::clone(&gate));
+    (FirstSpanGuard { gate: Arc::clone(&gate) }, FirstSpanWaiter { gate })
+}
+
+/// RAII handle that releases a held reference-walk span on drop.
+pub struct FirstSpanGuard {
+    gate: Arc<FirstSpanGate>,
+}
+
+impl FirstSpanGuard {
+    pub fn release(&self) {
+        let mut state = lock_recover(&self.gate.state);
+        state.released = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+impl Drop for FirstSpanGuard {
+    fn drop(&mut self) {
+        self.release();
+        let mut active = lock_recover(&FIRST_SPAN_GATE);
+        if active.as_ref().is_some_and(|gate| Arc::ptr_eq(gate, &self.gate)) {
+            *active = None;
+        }
+    }
+}
+
+/// Bounded observer for the first span held by [`hold_first_span`].
+#[derive(Clone)]
+pub struct FirstSpanWaiter {
+    gate: Arc<FirstSpanGate>,
+}
+
+impl FirstSpanWaiter {
+    /// Wait for the tracing callback to reach the held span, bounded by `timeout`.
+    pub fn wait_entered(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = lock_recover(&self.gate.state);
+        while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, result) = self
+                .gate
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if result.timed_out() && !state.entered {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Block until the walk has entered its first file, so a cancel lands mid-flight. A

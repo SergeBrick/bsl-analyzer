@@ -114,12 +114,11 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     let main_uri = lsp_types::Url::from_file_path(main.join("Main.bsl")).unwrap();
     let diagnostics = lsp.open(&main.join("Main.bsl"), "Процедура Проверка()\nКонецПроцедуры\n");
     assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    let hover_params = json!({
+        "textDocument": {"uri": main_uri}, "position": {"line": 0, "character": 10}
+    });
     for id in [2, 3] {
-        lsp.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
-            "params": {"textDocument": {"uri": main_uri.clone()}, "position": {"line": 0, "character": 10}}
-        }));
-        let response = lsp.wait_for(|message| message["id"] == id);
+        let response = lsp.request(id, "textDocument/hover", hover_params.clone());
         assert!(response.get("result").is_some(), "hover is answered: {response}");
     }
     assert!(
@@ -143,11 +142,7 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     // any other error remains a test failure.
     let mut response = Value::Null;
     for id in 4..=8 {
-        lsp.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": "textDocument/hover",
-            "params": {"textDocument": {"uri": main_uri.clone()}, "position": {"line": 0, "character": 10}}
-        }));
-        response = lsp.wait_for(|message| message["id"] == id);
+        response = lsp.request(id, "textDocument/hover", hover_params.clone());
         if response.get("result").is_some() {
             break;
         }
@@ -186,7 +181,7 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
 
     let started = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lsp.wait_for_judging(silence, |_| false);
+        lsp.wait_for_judging(silence, common::BUSY_CEILING, |_| false);
     }));
     let waited = started.elapsed();
 
@@ -202,4 +197,122 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
         waited < SILENCE,
         "an idle server is judged on its own silence window, not the default: {waited:?}",
     );
+}
+
+#[test]
+fn a_continuous_unrelated_message_stream_cannot_extend_a_wait_past_its_ceiling() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    let stream_for = Duration::from_millis(300);
+    let producer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + stream_for;
+        while std::time::Instant::now() < deadline {
+            if sender.send(json!({"method": "$/testNoise"})).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lsp.wait_for_judging(Duration::from_millis(20), Duration::from_millis(80), |_| false);
+    }));
+    let waited = started.elapsed();
+    let payload = outcome.expect_err("unrelated traffic cannot satisfy the requested condition");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("total deadline elapsed"),
+        "the verdict names the total bound: {message}"
+    );
+    assert!(message.contains("$/testNoise"), "the verdict names the unrelated traffic: {message}");
+    assert!(waited < stream_for, "the wait ended before the bounded noise producer: {waited:?}");
+    producer.join().expect("the bounded noise producer exits");
+    lsp.messages = original;
+}
+
+#[test]
+fn an_owned_live_lsp_child_is_killed_and_reaped_with_a_bounded_wait() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let pid = lsp.child.id();
+    assert!(lsp.child.try_wait().unwrap().is_none(), "owned LSP child {pid} is running");
+
+    assert_eq!(
+        lsp.wait_for_exit_within(Duration::from_millis(20), "process deadline control").unwrap(),
+        None,
+        "a running child remains alive when its bounded poll expires"
+    );
+    assert!(lsp.child.try_wait().unwrap().is_none(), "the deadline poll did not kill child {pid}");
+
+    lsp.child.kill().expect("the owned LSP child can be killed directly");
+    let status = lsp
+        .wait_for_exit_within(Duration::from_secs(2), "process cleanup control")
+        .expect("the post-kill process poll succeeds")
+        .expect("the killed LSP child is reaped within the bound");
+    assert!(!status.success(), "forced cleanup is not a graceful LSP shutdown");
+    assert!(lsp.child.try_wait().unwrap().is_some(), "owned LSP child {pid} was reaped");
+}
+
+#[test]
+fn a_server_request_reusing_the_client_id_is_not_taken_for_its_response() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    // Client and server number their requests independently, so a server request can
+    // carry the very id the client is waiting on.
+    let server_request = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "window/workDoneProgress/create",
+        "params": {"token": "bslAnalyzer/Analyzing"}
+    });
+    let response = json!({"jsonrpc": "2.0", "id": 2, "result": null});
+    sender.send(server_request).unwrap();
+    sender.send(response.clone()).unwrap();
+
+    let answer = lsp.request(2, "textDocument/hover", json!({}));
+    assert_eq!(answer, response, "the server request with the same id is skipped");
+    lsp.messages = original;
+}
+
+#[test]
+fn a_wait_whose_bound_has_run_out_still_takes_a_message_already_delivered() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    let delivered = json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {}});
+    sender.send(delivered.clone()).unwrap();
+
+    assert_eq!(
+        lsp.wait_for_within(Duration::ZERO, |_| true),
+        Some(delivered),
+        "a message that already arrived is not silence, however short the wait"
+    );
+    lsp.messages = original;
+}
+
+#[test]
+fn a_matching_message_taken_in_past_the_busy_ceiling_is_still_returned() {
+    let dir = project();
+    let mut lsp = Lsp::start(dir.path());
+    let (sender, injected) = std::sync::mpsc::channel::<Value>();
+    let original = std::mem::replace(&mut lsp.messages, injected);
+    let delivered = json!({"jsonrpc": "2.0", "method": "window/logMessage", "params": {}});
+    sender.send(delivered.clone()).unwrap();
+
+    // A zero ceiling has always run out by the time the message is taken in, as a late
+    // wake-up of the test thread leaves it under load.
+    assert_eq!(
+        lsp.wait_for_judging(Duration::ZERO, Duration::ZERO, |_| true),
+        delivered,
+        "a message delivered in time is judged, not lost to the ceiling"
+    );
+    lsp.messages = original;
 }

@@ -1,0 +1,8 @@
+[source]
+root = "."
+exclude = ["extensions/hidden"]
+extensions = [
+  { name = "Поставщик", path = "extensions/provider", scope = "InfoBase" },
+  { name = "Потребитель", path = "extensions/consumer", scope = "InfoBase", dependsOn = ["Поставщик"] },
+  { name = "Скрытое", path = "extensions/hidden", scope = "InfoBase" },
+]

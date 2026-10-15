@@ -5869,7 +5869,7 @@ mod rescan_hatch_consultations {
     /// The same for the answer-shaped miss this tool decides by its outcome.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn references_consults_the_rescan_hatch_on_a_named_symbol_miss() {
-        let _serialised = crate::walk_probe::WALK_GATE.lock().await;
+        let _walk_serial = crate::walk_probe::WALK_GATE.lock().await;
         let (_dir, server, diag) = stand();
 
         let before = diag.stale_miss_consultations();

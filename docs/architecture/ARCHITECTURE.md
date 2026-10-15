@@ -132,6 +132,7 @@ bsl-analyzer
 | Крейты | Назначение |
 |--------|------------|
 | `base-db` | базовые Salsa-input'ы, source roots, file text |
+| `ide-host-core` | общий алгоритм регистрации исходников, source effects и metadata bootstrap/refresh |
 | `vfs`, `vfs-notify` | виртуальная файловая система и слежение за файлами |
 | `project-model` | загрузка конфигурации проекта, legacy JSON-конфигов и search-настроек |
 | `bsl-metadata` | чтение `Configuration.xml` и метаданных 1С |
@@ -140,6 +141,38 @@ bsl-analyzer
 | `dataflow` | reaching definitions и liveness analysis |
 | `bsl-search` | индексирование и поиск по коду/документации |
 | `mcp-server` | MCP runtime и интеграция с AI-клиентами |
+
+### Обновление исходников через общий алгоритм
+
+`ide-host-core::apply_source_batch(db, source_root_id, changes)` применяет
+`SourceBatchChange::Upsert` и `Remove` к существующей базе. Он устанавливает
+source-root backlink и revision/text до публикации изменённого `FileSet`.
+`SourceBatchEffects` сообщает об изменении состава, BSL, FileId и путей;
+повтор неизменённых входов не создаёт новых effects. Алгоритм работает до
+metadata bootstrap и не обращается к metadata root(1).
+
+LSP `workspace::process_changes` выбирает overlay редактора или disk input.
+При перезагрузке конфигурации исключённые файлы и удалённые source roots
+проходят через VFS deletion и тот же batch: deleted text устанавливается,
+пока FileId ещё присутствует в FileSet, затем обновляются metadata back-links.
+Служебные inputs вне source roots сохраняются в VFS для watcher; общий `Remove`
+удаляет только их лишнюю регистрацию в SourceRoot, без нового config-change event.
+MCP resident использует тот же алгоритм для normal/scan/event drift, удаления
+и восстановления unreadable файлов. Admission, holes, fingerprint до чтения,
+mutex, generation и scope retirement остаются у MCP; buffers, initial
+suppression, публикация диагностик и semantic refresh — у LSP. После bootstrap
+адаптер вызывает существующий metadata refresh по затронутым путям.
+
+`register_files_disk_backed` передаёт файлы этому алгоритму по одному, сохраняя
+ошибки чтения и disk-backed inputs. Его используют CLI и MCP graph builder.
+Bounded graph batch сохраняет полный контекстный SourceRoot, загружая тексты
+только своей порции. Начальная MCP DB публикуется для запросов после завершения
+регистрации и metadata bootstrap.
+
+Процессы и DB LSP/MCP сохраняют собственные lifecycle и views. Общий алгоритм
+может вызываться будущим владельцем workspace; совместное хранение DB и
+одновременные session views требуют отдельного решения. Сокращение кода само
+по себе не доказывает уменьшение памяти или latency.
 
 ### Владение данными и диагностиками
 

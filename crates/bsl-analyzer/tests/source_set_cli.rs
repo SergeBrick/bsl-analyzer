@@ -515,6 +515,23 @@ fn a_tracked_source_removed_after_it_was_recorded_is_reported() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "source path disappeared after module removal")]
+fn a_tracked_module_removed_after_snapshot_is_reported_as_disappeared() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("Module.bsl");
+    std::fs::write(&module, "source").unwrap();
+    let before = tree_snapshot(root.path());
+    std::fs::remove_file(&module).unwrap();
+    assert_tree_unchanged_except_workspace_cache(
+        &before,
+        root.path(),
+        &root.path().join(".build/workspaces/v1/cache"),
+        "after module removal",
+    );
+}
+
 fn snapshot_report(snapshot: &TreeSnapshot) -> Value {
     serde_json::to_value(snapshot).unwrap()
 }
@@ -537,11 +554,13 @@ fn assert_tree_unchanged_except_workspace_cache(
 ) -> TreeSnapshot {
     let actual = tree_snapshot(root);
     let cache_rel = cache_leaf.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+    // A lost path is named before any changed one: removing a file also changes its directory,
+    // and that change would otherwise hide which source went missing.
+    if let Some(path) = expected.entries.keys().find(|path| !actual.entries.contains_key(*path)) {
+        panic!("source path disappeared {phase}: {path:?}");
+    }
     for (path, before) in &expected.entries {
-        let after = actual
-            .entries
-            .get(path)
-            .unwrap_or_else(|| panic!("source path disappeared {phase}: {path:?}"));
+        let after = &actual.entries[path];
         if path == ".build" {
             assert_eq!(after.kind, before.kind, "legacy namespace type is unchanged {phase}");
             assert_eq!(

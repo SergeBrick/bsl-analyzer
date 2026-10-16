@@ -3679,7 +3679,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ibcmd_path_accepts_ordinary_windows_paths_and_uses_exe_name() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::super::tests::canonical_tempdir();
         let designer = directory.path().join("1cv8.exe");
         let ibcmd = directory.path().join("ibcmd.exe");
         fs::write(&designer, b"designer stub").unwrap();
@@ -3692,7 +3692,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ibcmd_path_rejects_missing_and_noncanonical_executables() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::super::tests::canonical_tempdir();
         let designer = directory.path().join("1cv8.exe");
         fs::write(&designer, b"designer stub").unwrap();
         let profile = profile_with_designer_path(designer.clone());
@@ -4548,7 +4548,7 @@ mod tests {
 
     #[test]
     fn dropping_a_workspace_preserves_process_recovery_manifest() {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::super::tests::canonical_tempdir();
         let jobs = root.path().join("owned-jobs");
         fs::create_dir(&jobs).unwrap();
         #[cfg(unix)]
@@ -4567,7 +4567,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_cleanup_deadline_preserves_the_owner_manifest() {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::super::tests::canonical_tempdir();
         let jobs = root.path().join("owned-jobs");
         #[cfg(not(windows))]
         fs::create_dir(&jobs).unwrap();

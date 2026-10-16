@@ -1,6 +1,27 @@
 use super::*;
 use std::path::PathBuf;
 
+pub(super) fn canonical_tempdir() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let canonical = std::env::temp_dir().canonicalize().unwrap();
+        let canonical = canonical.to_string_lossy();
+        let dos_path = if let Some(unc_path) = canonical.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc_path}")
+        } else if let Some(dos_path) = canonical.strip_prefix(r"\\?\") {
+            dos_path.to_owned()
+        } else {
+            canonical.into_owned()
+        };
+        tempfile::tempdir_in(dos_path).unwrap()
+    }
+
+    #[cfg(not(windows))]
+    {
+        tempfile::tempdir().unwrap()
+    }
+}
+
 fn profile() -> NativeProfile {
     NativeProfile {
         designer_path: PathBuf::from("/unused/1cv8"),

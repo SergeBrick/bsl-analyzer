@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn private_directory_has_current_sid_and_protected_dacl() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::tests::canonical_tempdir();
         let private = temp.path().join("private");
         private_directory(&private).unwrap();
         verify_private_directory(&private).unwrap();

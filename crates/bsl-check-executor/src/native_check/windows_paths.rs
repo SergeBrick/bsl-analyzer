@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn ordinary_windows_profile_paths_accept_verbatim_canonicalization() {
         validate_canonical(&std::env::current_exe().unwrap(), false).unwrap();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::tests::canonical_tempdir();
         validate_canonical(temp.path(), true).unwrap();
     }
 }

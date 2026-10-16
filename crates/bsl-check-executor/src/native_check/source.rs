@@ -790,7 +790,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_file_source_preserves_validated_dos_path_and_rejects_invalid_sources() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::super::tests::canonical_tempdir();
         let configured = directory.path().to_path_buf();
         let configured_text = configured.to_string_lossy();
         assert!(!configured_text.starts_with(r"\\?\"));

@@ -357,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn independent_root_lock_wait_is_cancelled_and_releases_after_owner_drop() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::tests::canonical_tempdir();
         let root = temp.path().join("private-root");
         #[cfg(windows)]
         super::super::windows_acl::private_directory(&root).unwrap();

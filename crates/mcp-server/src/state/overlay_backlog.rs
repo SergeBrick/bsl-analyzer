@@ -1880,8 +1880,10 @@ mod tests {
         };
         let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         release_tx.send(()).unwrap();
-        request.join().unwrap();
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
         let (acquired, waited) = answered.expect("the request waited behind phase B");
+        request.join().unwrap();
         assert!(acquired);
         if cfg!(timing_contract) {
             assert!(

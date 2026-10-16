@@ -2166,17 +2166,21 @@ mod tests {
 
     #[test]
     fn deferred_slot_shutdown_wakes_a_pending_waiter() {
+        // The waiter's budget runs out with the same `false` a wake produces, so only the time
+        // tells the two apart. A budget of the shared ceiling makes half of it a bound that
+        // catches a waiter left to time out and that no slow machine comes near.
+        const BUDGET: Duration = crate::change_hub::test_support::STATE_CEILING;
         let deferred = DeferredBaselineRuntime::pending_for_test();
         let waiter = deferred.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            tx.send(waiter.wait_ready(Duration::from_secs(5))).unwrap();
+            tx.send(waiter.wait_ready(BUDGET)).unwrap();
         });
         std::thread::sleep(Duration::from_millis(20));
 
         let woken = std::time::Instant::now();
         deferred.shutdown();
-        let result = rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
+        let result = rx.recv_timeout(BUDGET / 2);
         let waited = woken.elapsed();
         deferred.publish(BaselineRuntime {
             configured_baseline: ConfiguredBaselineStatus {
@@ -2189,10 +2193,9 @@ mod tests {
         });
         handle.join().unwrap();
 
-        assert!(!result.unwrap());
+        assert!(!result.expect("the shutdown left the waiter to its budget"));
+        assert!(waited < BUDGET / 2, "the waiter woke only after {waited:?}");
         if cfg!(timing_contract) {
-            // The waiter's own budget runs out as well, so only the delay tells a shutdown that
-            // woke it from one that left it to time out.
             assert!(waited < Duration::from_millis(200), "the waiter woke only after {waited:?}");
         }
     }

@@ -596,9 +596,11 @@ mod tests {
         drop(lifecycle);
         drop(held_lease);
         drop(finish_tx);
-        reader.join().unwrap();
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
         let (first, published, over_cap, no_fence, waited) =
             answered.expect("a descriptor request waited on the lease");
+        reader.join().unwrap();
 
         assert!(first, "a resident descriptor needs no lease refresh");
         assert!(published, "published descriptor");

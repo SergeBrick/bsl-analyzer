@@ -1877,8 +1877,10 @@ mod tests {
         });
         let answered = answer.recv_timeout(HANG_WATCHDOG);
         drop(open_tx);
-        waiter.join().unwrap();
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
         let (stop, waited) = answered.expect("the halt was reported only after its stack");
+        waiter.join().unwrap();
         let stop = stop.expect("the halt is reported");
         if cfg!(timing_contract) {
             assert!(waited < Duration::from_millis(500), "{waited:?}");

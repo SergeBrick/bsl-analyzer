@@ -1567,9 +1567,11 @@ mod tests {
         };
         let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         release_the_lock.send(()).expect("the lock holder is still there to be released");
-        reading.join().unwrap();
+        // Answered before the join: a thread still stuck past the watchdog is left behind
+        // rather than waited on without a bound.
         let (checked, published, waited) =
             answered.expect("reading the published verdict waited on a check that is doing I/O");
+        reading.join().unwrap();
 
         if cfg!(timing_contract) {
             assert!(

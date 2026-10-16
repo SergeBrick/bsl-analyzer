@@ -454,6 +454,11 @@ fn tree_snapshot_with_before_stat(root: &Path, before_stat: &mut dyn FnMut(&Path
         }
     }
 
+    // Only entries inside the tree may vanish; a missing root would make an empty snapshot that
+    // equals any other empty one.
+    if let Err(error) = std::fs::symlink_metadata(root) {
+        panic!("stat snapshot root {}: {error}", root.display());
+    }
     let mut entries = BTreeMap::new();
     walk(root, root, &mut entries, before_stat);
     let encoded = serde_json::to_vec(&entries).unwrap();

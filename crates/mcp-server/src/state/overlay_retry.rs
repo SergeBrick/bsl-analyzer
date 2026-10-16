@@ -1416,11 +1416,10 @@ mod tests {
     /// outcome must not depend on that order: each step releases a different wait, and a
     /// driver whose exit needs them in one particular sequence is one reordering away from
     /// sitting out a half-hour backoff after the daemon has gone.
+    ///
+    /// Only the clock tells an exit on shutdown from a backoff sat out, so an ordinary run checks
+    /// that every order ends every driver, and the timing profile that it ends them at once.
     #[test]
-    #[cfg_attr(
-        not(timing_contract),
-        ignore = "timing contract: only the clock tells an exit on shutdown from a backoff sat out"
-    )]
     fn a_paused_driver_leaves_in_every_shutdown_order() {
         use crate::change_hub::WorkspaceChangeHub;
 
@@ -1441,6 +1440,7 @@ mod tests {
             engine: SharedSearchEngine,
             hub: WorkspaceChangeHub,
             retry: Arc<OverlayRetry>,
+            hold: (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>),
             _dir: tempfile::TempDir,
         }
 
@@ -1479,16 +1479,11 @@ mod tests {
         let daemons: Vec<Daemon> = built
             .into_iter()
             .map(|(dir, cache, engine, stop, hub)| {
-                // Held for far longer than the two refusals need, because this test shares a
-                // machine with the rest of the suite: a hold that expires between the first
-                // refusal and the second lets the pass publish and end instead of parking.
-                // The holder is left to expire on its own — joining it would add its whole
-                // hold to the test, and all it does after this point is release a lock in a
-                // directory the test has finished with.
-                drop(crate::workspace_lease::WorkspaceLease::hold_cache_lock_for(
-                    &cache,
-                    Duration::from_secs(60),
-                ));
+                // Held until the drivers have left, however long the machine takes to get them
+                // parked: a hold that ended between the first refusal and the second would let
+                // the pass publish and end instead of parking.
+                let hold =
+                    crate::workspace_lease::WorkspaceLease::hold_cache_lock_until_released(&cache);
                 let retry = OverlayRetry::spawn(
                     Arc::clone(&engine),
                     stop.clone(),
@@ -1497,7 +1492,7 @@ mod tests {
                     crate::workspace_lease::WorkspaceLease::claim_cache(&cache),
                     super::super::bootstrap::DEFAULT_EMBEDDING_PUBLISH_RETRY_BUDGET,
                 );
-                Daemon { stop, engine, hub, retry, _dir: dir }
+                Daemon { stop, engine, hub, retry, hold, _dir: dir }
             })
             .collect();
 
@@ -1540,9 +1535,14 @@ mod tests {
         // A driver that sat its backoff out would cost a whole tick; half of one is beyond any
         // slow machine.
         let exits = asked.elapsed();
-        assert!(exits < TICK / 2, "the six exits took {exits:?}");
         if cfg!(timing_contract) {
+            assert!(exits < TICK / 2, "the six exits took {exits:?}");
             assert!(exits < Duration::from_secs(2), "the six exits took {exits:?}");
+        }
+        for daemon in daemons {
+            let (holder, release) = daemon.hold;
+            release.send(()).expect("the holder still holds the lock");
+            holder.join().expect("the holder lets go");
         }
     }
 

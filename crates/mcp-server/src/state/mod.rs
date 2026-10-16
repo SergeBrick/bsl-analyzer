@@ -1770,10 +1770,6 @@ mod background_lifetime_tests {
     /// nobody owns any more; interrupting its waiters alone does not stop a poll that never
     /// waits on them.
     #[test]
-    #[cfg_attr(
-        not(timing_contract),
-        ignore = "timing contract: a poll that outlives shutdown shows only over a quiet window"
-    )]
     fn shutdown_stops_a_polling_hub() {
         use crate::change_hub::test_support::eventually;
         use crate::change_hub::{PollConfig, WatchTarget, WorkspaceChangeHub};
@@ -1799,8 +1795,12 @@ mod background_lifetime_tests {
 
         state.shutdown();
 
+        // The fallback poll runs on the hub's thread: once that thread has left, nothing polls.
+        assert!(eventually(|| hub.thread_has_left()), "the poll outlived the daemon that owned it");
         let stopped = hub.poll_count();
-        std::thread::sleep(PERIOD * 6);
+        if cfg!(timing_contract) {
+            std::thread::sleep(PERIOD * 6);
+        }
         assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
         assert!(
             eventually(|| !state.diagnostics.sweeper_running()),

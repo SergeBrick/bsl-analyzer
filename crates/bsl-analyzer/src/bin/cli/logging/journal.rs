@@ -701,11 +701,9 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// A spin is a rate over a real second and a delay is a wait, both read by the timing
+    /// profile; an ordinary run checks that the refused journal lets shutdown finish.
     #[test]
-    #[cfg_attr(
-        not(timing_contract),
-        ignore = "timing contract: a spin is a rate over a real second, and a delay is a wait"
-    )]
     fn a_refused_journal_neither_spins_nor_delays_shutdown() {
         let directory = private_temp();
         // A foreign entry makes every append fail closed until someone removes it.
@@ -734,9 +732,11 @@ mod tests {
             );
             done_tx.send(()).unwrap();
         });
-        std::thread::sleep(Duration::from_secs(1));
-        // A fixed 20 ms retry makes about fifty attempts in this second.
-        assert!(attempts.load(Ordering::Relaxed) < 15, "{attempts:?}");
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_secs(1));
+            // A fixed 20 ms retry makes about fifty attempts in this second.
+            assert!(attempts.load(Ordering::Relaxed) < 15, "{attempts:?}");
+        }
         let started = Instant::now();
         drop(JournalGuard(shared));
         if cfg!(timing_contract) {

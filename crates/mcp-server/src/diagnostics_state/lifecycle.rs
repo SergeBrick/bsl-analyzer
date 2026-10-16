@@ -1572,11 +1572,10 @@ mod tests {
     /// The sweeper parks between ticks, and the shutdown wakes it out of that park rather
     /// than leaving it to time out. The tick is half a minute: slept out, a daemon told to
     /// stop keeps a thread walking its workspace for the rest of it.
+    ///
+    /// Only the clock tells a woken sweeper from one that slept its tick out, so an ordinary run
+    /// checks that the shutdown ends it, and the timing profile that it ends it at once.
     #[test]
-    #[cfg_attr(
-        not(timing_contract),
-        ignore = "timing contract: only the clock tells a woken sweeper from one that slept its tick out"
-    )]
     fn a_shutdown_wakes_the_idle_sweeper_out_of_its_tick() {
         use crate::change_hub::test_support::eventually;
         use std::time::Instant;
@@ -1589,8 +1588,11 @@ mod tests {
             "the sweeper never started, so its exit below would prove nothing"
         );
 
-        // Parked: its next tick is SWEEP_INTERVAL away and nothing else wakes it.
-        std::thread::sleep(Duration::from_millis(100));
+        // Parked, in the timing profile: its next tick is SWEEP_INTERVAL away and nothing else
+        // wakes it. A shutdown that lands before it parks must end it just the same.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(state.sweeper_running());
         assert!(
             SWEEP_INTERVAL >= Duration::from_secs(5),
@@ -1607,8 +1609,11 @@ mod tests {
         // A sweeper that slept its tick out costs a whole interval; half of one is beyond any
         // slow machine.
         let stopped = asked.elapsed();
-        assert!(stopped < SWEEP_INTERVAL / 2, "the sweeper slept out its interval: {stopped:?}");
         if cfg!(timing_contract) {
+            assert!(
+                stopped < SWEEP_INTERVAL / 2,
+                "the sweeper slept out its interval: {stopped:?}"
+            );
             assert!(
                 stopped < Duration::from_secs(1),
                 "the sweeper slept out its interval: {stopped:?}"

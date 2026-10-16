@@ -2997,6 +2997,17 @@ impl WorkspaceChangeHub {
         self.inner.blind_poll.running.load(Ordering::SeqCst)
     }
 
+    /// Whether the hub's thread has left: nobody holds the other end of its control channel any
+    /// more. Probed with a tick, which a thread still there would answer with a poll — so a test
+    /// that reads polls after a stop sees a thread that outlived it either way.
+    #[cfg(test)]
+    pub(crate) fn thread_has_left(&self) -> bool {
+        matches!(
+            self.control().try_send(HubMsg::Tick),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_))
+        )
+    }
+
     /// How many fallback polls have landed, for a test that must see one stop happening.
     #[cfg(test)]
     pub(crate) fn poll_count(&self) -> u64 {
@@ -8512,10 +8523,6 @@ mod tests {
     /// kept walking the workspace after its daemon stopped would read every file in it on a
     /// schedule nobody owns any more.
     #[test]
-    #[cfg_attr(
-        not(timing_contract),
-        ignore = "timing contract: a poll that outlives shutdown shows only over a quiet window"
-    )]
     fn shutdown_stops_the_fallback_poll() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("Модуль.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
@@ -8526,10 +8533,15 @@ mod tests {
         hold.release();
         assert_eq!(hub.watch_readiness(STATE_CEILING), WatchReadiness::Failed);
         assert!(eventually(|| hub.poll_count() >= 2));
+        assert!(!hub.thread_has_left(), "control: a running hub's thread reads as still there");
 
         hub.shutdown();
+        // The poll runs on the hub's thread: once that thread has left, nothing is left to poll.
+        assert!(eventually(|| hub.thread_has_left()), "the poll outlived the daemon that owned it");
         let stopped = hub.poll_count();
-        std::thread::sleep(Duration::from_millis(120));
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(120));
+        }
         assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
     }
 

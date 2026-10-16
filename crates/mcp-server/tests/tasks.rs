@@ -382,11 +382,10 @@ async fn cancelling_a_waiting_handle_settles_it() {
 /// bound. It compares it with the wait behind the same sweep left running on an identical stand,
 /// taken under the same load: a released resident answers in a small fraction of the time the
 /// sweep takes to finish, and an abandoned one answers only after the sweep has finished.
+///
+/// The comparison of the two waits is the timing profile's; an ordinary run checks that the
+/// cancelled read answers as cancelled and that the next caller is answered after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    not(timing_contract),
-    ignore = "timing contract: the verdict is a comparison of two waits, and the dwell is real time"
-)]
 async fn cancelling_a_working_handle_stops_the_read_and_frees_the_resident() {
     arm_the_branch();
     let live_stand = stage(SWEEP_STAND_MODULES, SWEEP_STAND_BODIES);
@@ -429,8 +428,11 @@ async fn wait_behind_sweep(server: &McpServer, cancel: bool) -> Duration {
     // The phase flips when the work is handed to a blocking thread, not when that thread
     // gets to run. Cancelling in that window stops work that had not started, which every
     // build survives; the dwell puts the sweep in flight — and holding the resident — before
-    // anything is asked of the cancellation.
-    tokio::time::sleep(SWEEP_DWELL).await;
+    // anything is asked of the cancellation. Only the timing profile, which compares the
+    // waits, needs the sweep in flight.
+    if cfg!(timing_contract) {
+        tokio::time::sleep(SWEEP_DWELL).await;
+    }
 
     if cancel {
         wire.cancel_task(&id).await;

@@ -1500,7 +1500,7 @@ mod tests {
         // Parked in the backoff: a pass began, has not ended, and is not working.
         for daemon in &daemons {
             assert!(
-                wait_for(30_000, || daemon.retry.passes_started() >= 1
+                wait_for(CEILING_MS, || daemon.retry.passes_started() >= 1
                     && daemon.retry.pass_count() == 0
                     && !daemon.retry.pass_active()),
                 "a driver never reached its backoff (started {}, finished {}, active {})",
@@ -1523,7 +1523,7 @@ mod tests {
 
         for (daemon, order) in daemons.iter().zip(ORDERS) {
             assert!(
-                wait_for(1_000, || daemon.stop.live() == 0),
+                wait_for(CEILING_MS, || daemon.stop.live() == 0),
                 "the driver stayed in its backoff under order {order:?}"
             );
             let owed =

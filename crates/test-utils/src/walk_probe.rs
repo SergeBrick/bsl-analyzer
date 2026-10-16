@@ -158,10 +158,37 @@ impl FirstSpanWaiter {
     }
 }
 
-/// Block until the walk has entered its first file, so a cancel lands mid-flight. A
-/// fixed sleep would race the build of whatever the walk reads first. The bound counts
-/// polls, and only under `timing_contract`, so a slow machine waits longer for the walk to
-/// start instead of failing on it.
+/// A walk that will be held at its first file until a cancel has landed. Seeing the walk
+/// start is not enough for that: a walk left running can reach its end before the cancel
+/// does, and the gate then judges a finished walk.
+pub struct HeldWalk {
+    hold: FirstSpanGuard,
+    entered: FirstSpanWaiter,
+}
+
+/// Arm the hold BEFORE starting the walk, so its first file is the one held.
+pub fn hold_walk_start() -> HeldWalk {
+    let (hold, entered) = hold_first_span();
+    HeldWalk { hold, entered }
+}
+
+impl HeldWalk {
+    /// Wait for the walk to reach its held first file, run `cancel`, then let the walk go on,
+    /// so the walk can only meet the cancel with files still ahead of it.
+    pub fn cancel_once_entered(self, cancel: impl FnOnce()) {
+        assert!(
+            self.entered.wait_entered(crate::wait::ceiling(Duration::from_secs(60))),
+            "the walk never started"
+        );
+        cancel();
+        drop(self.hold);
+    }
+}
+
+/// Block until the walk has entered its first file. It is not held there: a cancel that must
+/// land mid-flight goes through [`hold_walk_start`]. A fixed sleep would race the build of
+/// whatever the walk reads first. The bound counts polls, and only under `timing_contract`,
+/// so a slow machine waits longer for the walk to start instead of failing on it.
 pub fn await_walk_start() {
     let started =
         crate::wait::poll_until(Duration::from_secs(60), Duration::from_millis(1), || {

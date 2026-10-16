@@ -292,7 +292,9 @@ mod tests {
     use crate::diagnostics_state::test_support::{
         wait_ready, wait_until, write, write_common_module,
     };
-    use crate::walk_probe::{await_walk_start, entered, install, reset, WALK_GATE};
+    use crate::walk_probe::{
+        await_walk_start, entered, hold_walk_start, install, reset, WALK_GATE,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
 
@@ -402,9 +404,9 @@ mod tests {
         let subject = ready_state(dir.path());
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(subject.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         let (waited_behind_a_cancelled_call, walked_behind_a_cancelled_call) =
             neighbour(subject.clone()).await;
         assert!(
@@ -466,9 +468,9 @@ mod tests {
         let state = ready_state(dir.path());
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(state.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         assert!(matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled));
 
         // The blocking body is detached: take the resident lock to know it has unwound.
@@ -499,9 +501,9 @@ mod tests {
 
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(state.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         assert!(matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled));
 
         // Edit a body: the next read polls drift and applies it in place — the write
@@ -539,9 +541,9 @@ mod tests {
 
         reset();
         let ct = tokio_util::sync::CancellationToken::new();
+        let held = hold_walk_start();
         let cancelled = tokio::spawn(resident_call(state.clone(), ct.clone(), walk));
-        await_walk_start();
-        ct.cancel();
+        held.cancel_once_entered(|| ct.cancel());
         assert!(matches!(cancelled.await.expect("joined"), CallOutcome::Cancelled));
 
         let after =

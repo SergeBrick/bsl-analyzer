@@ -4370,9 +4370,9 @@ mod tests {
             walk_probe::reset();
             let (mut state, client_receiver) = stand(None);
 
+            let held = walk_probe::hold_walk_start();
             dispatch_references(&mut state, 41);
-            walk_probe::await_walk_start();
-            cancel(&mut state, 41);
+            held.cancel_once_entered(|| cancel(&mut state, 41));
             let response = response(&mut state, &client_receiver, 41);
 
             let err = response.error.expect("a cancelled walk must not answer with locations");
@@ -4394,9 +4394,9 @@ mod tests {
             walk_probe::reset();
             let (mut state, client_receiver) = stand(Some(1));
 
+            let held = walk_probe::hold_walk_start();
             dispatch_references(&mut state, 42);
-            walk_probe::await_walk_start();
-            cancel(&mut state, 42);
+            held.cancel_once_entered(|| cancel(&mut state, 42));
             dispatch_references(&mut state, 43);
             let first = response(&mut state, &client_receiver, 42);
             let second = response(&mut state, &client_receiver, 43);

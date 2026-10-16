@@ -93,7 +93,8 @@ PR (`:798`, `if: github.event_name != 'pull_request'`).
    со сторожем ≥ 10 с, например `CLIENT_RESPONSE_HANG_GUARD` (шаг 2), не
    меняются.
 3. **Граница «половина бюджета».** Если регрессия видна только по тому, что
-   код прождал продуктовый бюджет B, а B ≥ 20 с, утверждение остаётся в
+   код прождал бюджет B (константу продукта или значение, которое тест сам
+   передаёт продукту, как `WatchWaitPolicy::new`, `sync.rs:176`), а B ≥ 20 с, утверждение остаётся в
    обязательном прогоне в форме `elapsed < B / 2`. Такая граница ≥ 10 с,
    поэтому она одновременно детектор и сторож. Если B < 20 с, а наблюдаемого
    состояния без продуктового хука нет, временное утверждение уходит в (б).
@@ -144,8 +145,7 @@ PR (`:798`, `if: github.event_name != 'pull_request'`).
 сообщением
 `LSP definition failed: {"error":{"code":-32603,"message":"internal handler panic"},"id":4,"jsonrpc":"2.0"}`.
 
-Ответ `internal handler panic` сервер формирует только после реальной паники в
-процессе:
+Ответ `internal handler panic` возникает только после реальной паники:
 - `crates/bsl-analyzer/src/handlers/dispatch.rs:605` и
   `crates/bsl-analyzer/src/server.rs:1006` — при `panic_watch::panicked_in`;
 - `dispatch.rs:678` — из `catch_unwind`.
@@ -212,8 +212,6 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
   - Тесты `:657`, `:829`, `:846`, `:868` время только печатают.
 
 ### 3. Граница: что считается зависимостью от нагрузки
-
-Классы. Каждый тест в шагах помечен одним из них.
 
 | Класс | Определение | В границе |
 |---|---|---|
@@ -408,7 +406,7 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 | `status_tells_an_unread_root_table_from_a_missing_one` | `crates/mcp-server/src/tools/search/status.rs:1288`, `:1339` | SLEEP | Н: держатель отпускает лок по каналу после возврата `search_status_with_cap` |
 | `the_body_observes_the_request_token` | `crates/mcp-server/src/tools/search/call.rs:98`, `:114-115` | SLEEP | Н: канал из тела после `store`, затем `recv_timeout` с потолком |
 | `a_waiting_task_counts_as_use_of_the_resident` | `crates/mcp-server/src/tasks.rs:918`, `:922`, `:935`, `:939-943` | UPPER (сравнение возрастов) | Н: опрос до `STATE_CEILING`, пока `access_age()` меньше времени с запуска (`mark_in_use` на каждом проходе, `tasks.rs:413`); сравнение — Т |
-| `a_failed_graph_is_retried_when_its_backoff_runs_out` | `crates/mcp-server/src/graph/watcher.rs:839`, `:847-851` | UPPER | Н: прочитать статус, затем `now`; проверить «статус ушёл с `Failed` ⇒ `now ≥ due`» |
+| `a_failed_graph_is_retried_when_its_backoff_runs_out` | `crates/mcp-server/src/graph/watcher.rs:839`, `:847-851` | UPPER (запас 400 мс до `due`) | Т для `:847-851`; нижняя граница `:855` остаётся |
 | `a_body_edit_reloads_the_graph_with_no_other_consumer` | `watcher.rs:1055`, `:1076-1081` | TIMER (debounce 150 мс / 1 с, `:29-30`) | И: `revision > before`, `full_builds` не растут; точный счёт — Т |
 | `superseded_daemon_lifecycle` | `crates/mcp-server/tests/superseded_daemon_lifecycle.rs`: `wait_superseded` `:46-55`, инициализация хранилища `:156-161`, `wait_current_graph` `:31-43` | SHORT (5–10 с) | В: в файл добавляется `mod common;`, ожидания — `common::Patience` с `common::STATE_CEILING` (`crates/mcp-server/tests/common/mod.rs:20`, `:23`) |
 
@@ -487,7 +485,7 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 | `the_published_verdict_is_readable_while_a_check_holds_the_lifecycle_lock` | `crates/mcp-server/src/workspace_lease.rs:1535`, `:1563` | I/O проверки | Н: `hold_cache_lock_until_released`; чтение в потоке до ответа под потолком, пока лок держится; `waited < 100 мс` — Т |
 | `the_restamp_window_spans_separate_fences` | `crates/mcp-server/src/workspace_lease.rs:2232`, `:2247` | `CHECKPOINT_MIN_INTERVAL` = 1 с (`:74`) | Т (окно < 10 с, хука часов нет) |
 | `reading_every_stored_key_does_not_hold_the_engine_lock` | `crates/mcp-server/src/state/sync.rs:1632-1633` | `ACQUIRE_POLL` | Н: до `release_tx.send` (`:1628`) `!preparer.is_finished()` и захват получен; сравнение — Т |
-| `the_wait_never_overshoots_its_budget_by_a_slice` | `sync.rs:3152`, `:3165`, `:3171` | слайс — параметр теста | Б/2: слайс 30 с, бюджет 20 мс, граница `< 15 с` |
+| `the_wait_never_overshoots_its_budget_by_a_slice` | `sync.rs:3152`, `:3165`, `:3171` | слайс, который тест передаёт `WatchWaitPolicy::new` | Б/2: слайс 400 мс → 30 с (B), бюджет 20 мс, граница 200 мс → `< 15 с` |
 | `the_boot_does_not_wait_out_a_permanent_failure` | `sync.rs:3179`, `:3195` | 600 с (`:3192`) | В: граница `STATE_CEILING` < 600 с остаётся детектором |
 | `a_request_does_not_wait_on_a_held_lease_lock` | `crates/mcp-server/src/lib.rs:4504`, `:4532` | — | В для завершения; журнал `:4537` остаётся; `500 мс` — Т |
 | `every_workspace_search_cell_answers_a_cancelled_request_before_the_lock_frees` | `crates/mcp-server/src/lib.rs:5962`, `assert_cancelled` `:5955`, `BOUND` `:5945` | лок держится до ответа | Т; сторож `STATE_CEILING` (`:5983`) остаётся |
@@ -549,11 +547,10 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 
 ### Шаг 7. Тесты, которые нельзя сделать независимыми без продуктового хука (O)
 
-Ожидание паузы замены ограничено продуктовой константой
-`INSTALL_READERS_WAIT` = 5 с (`build.rs:1600`, передаётся в `build.rs:2141`).
-Тест обязан успеть внутри неё: синхронизироваться с паузой (одно `Busy` стоит
-`ADMISSION_WAIT` = 2 с) и отпустить чтение. Запас — 3–4,7 с, и правка без
-хука его не расширит. Регрессия здесь не превращается в зависание.
+Пауза замены ограничена константой `INSTALL_READERS_WAIT` = 5 с
+(`build.rs:1600`, `:2141`). Тест должен внутри неё синхронизироваться с паузой
+(одно `Busy` стоит `ADMISSION_WAIT` = 2 с) и отпустить чтение: запас 3–4,7 с,
+без хука его не расширить. Регрессия здесь не превращается в зависание.
 
 | Тест | Место | Решение |
 |---|---|---|
@@ -561,13 +558,10 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 | `a_replacement_waits_for_four_concurrent_reads` | `crates/mcp-server/src/graph/build.rs:2752`, `:2775-2781` | O; та же синхронизация вместо `sleep(150)` |
 | `a_read_during_the_pause_is_refused_after_the_admission_wait` | `crates/mcp-server/src/graph/build.rs:2790`, `:2808-2814` | O; та же синхронизация; окно `[1900, 3500)` сохраняется |
 
-В обязательном прогоне остаётся свойство «читатель, переживший ожидание,
-сохраняет старый граф и замену»: его проверяет
-`a_read_outlasting_the_wait_keeps_the_old_graph_and_the_replacement`
-(`build.rs:2822`). Единственное временное утверждение этого теста — нижняя
-граница `:2837`. Верхняя граница ожидания читателей («не дольше бюджета»)
-в обязательном прогоне не проверяется. Её проверяют только тесты этого шага
-в профиле `timing_contract`.
+В обязательном прогоне остаётся «читатель, переживший ожидание, сохраняет
+старый граф и замену»: `a_read_outlasting_the_wait_keeps_the_old_graph_and_the_replacement`
+(`build.rs:2822`), временное утверждение — только нижняя граница `:2837`.
+Верхнюю границу ожидания читателей проверяют лишь тесты шага в `timing_contract`.
 
 ### Шаг 8. Сверка
 
@@ -580,7 +574,7 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 - **И1. Opt-in профиль.**
   - Вход: `cargo test --workspace` без cfg и с `RUSTFLAGS="--cfg timing_contract"`.
   - Свойство: тесты O (шаги 5 и 7) в первом случае `ignored`, во втором
-    выполняются.
+    выполняются и проходят.
   - Каждое утверждение Т выполняется только во втором.
 - **И2. Порядок.**
   - Вход: в канал клиента перед ответом на запрос 731 (и на запросы двух
@@ -660,10 +654,10 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
     выполняет ≥ 1 тест; скрипт проходит.
 - **И14. Только тесты.**
   - Вход: `git diff 5b65205d...HEAD`.
-  - Свойство: каждая изменённая строка лежит в тестовом коде:
-    - в файле под `tests/` или `*_tests.rs`;
-    - в модуле, который родитель объявляет под `#[cfg(test)]`;
-    - или после первой строки `#[cfg(test)]` своего файла.
+  - Свойство: каждая изменённая строка лежит в тестовом коде: в файле под
+    `tests/` или `*_tests.rs`, в модуле, который родитель объявляет под
+    `#[cfg(test)]`, или внутри блока `#[cfg(test)] mod … { }` (по скобкам).
+    Атрибут на `use` вне такого блока (`graph/build.rs:6`) не в счёт.
   - Вне `crates/` меняются только `Cargo.toml:20` и
     `docs/contributing/DEVELOPMENT_RULES.md`.
 
@@ -671,7 +665,7 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 
 | Обещание или инвариант | Проверка | Положительный контроль | Критерий |
 |---|---|---|---|
-| И1 | `cargo test -p parser --test integration_tests -- --list --ignored`, `cargo test -p ide formatting::engine -- --list --ignored` и `cargo test -p mcp-server --lib graph::build::tests -- --list --ignored`, без cfg и с `RUSTFLAGS="--cfg timing_contract"` | без cfg список содержит три теста O шага 5 и три теста шага 7 | с cfg их нет среди ignored; `CARGO_TARGET_DIR=target-timing RUSTFLAGS="--cfg timing_contract" cargo test --workspace` выполняет тесты O и утверждения Т |
+| И1 | `cargo test -p parser --test integration_tests -- --list --ignored`, `cargo test -p ide formatting::engine -- --list --ignored` и `cargo test -p mcp-server --lib graph::build::tests -- --list --ignored`, без cfg и с `RUSTFLAGS="--cfg timing_contract"` | без cfg список содержит три теста O шага 5 и три теста шага 7 | с cfg их нет среди ignored; `CARGO_TARGET_DIR=target-timing RUSTFLAGS="--cfg timing_contract" cargo test --workspace` выполняет тесты O и утверждения Т, и они проходят |
 | И2 | три теста шага 2 | локальная мутация: перед последним `handle_task` отправить в канал клиента `Notification` — на базе `:570` падает `expected retry response` | после PR тесты проходят с той же мутацией и без неё |
 | И3 | тесты шага 3 и новый тест с паузой 1,1 с | на базе с той же паузой точное `records.len()` ложно | новый тест и тесты шага 3 проходят |
 | И4 | сканеры A2, A10 и A11 после PR; плюс команда A12 по телам тестов с решением В — каждое найденное место либо строка Приложения Б, либо не срок ожидания | на базе 44 из 82 строк A2 (82 − 25 − 13) и 15 из 28 строк A10 без допустимого класса; `SHUTDOWN_TIMEOUT` и `HANG_GUARD` задают положительные сроки | всё — как в И4 |
@@ -813,7 +807,7 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 | `mcp-server/src/tasks.rs:530` | не ожидание | срок — вход продукта: тест проверяет, что срок сработал, и медленность только откладывает это |
 | `mcp-server/src/graph/debt.rs:2986`, `:3285`, `:4401`, `:4717`; `state/overlay_backlog.rs:1227` | не ожидание | арифметика виртуального времени |
 | `mcp-server/src/state/overlay_backlog.rs:1591` | NEG | окно, в котором лок не должен браться |
-| `mcp-server/src/graph/watcher.rs:843` | не ожидание | ожидаемый срок для импликации шага 4 (`a_failed_graph_is_retried_when_its_backoff_runs_out`) |
+| `mcp-server/src/graph/watcher.rs:843` | не ожидание | срок `due`, который тест задаёт продукту (`a_failed_graph_is_retried_when_its_backoff_runs_out`, шаг 4) |
 
 **A11: 28 констант**
 

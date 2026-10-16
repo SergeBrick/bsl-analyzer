@@ -1274,7 +1274,9 @@ mod tests {
         let (held, result) = owners
             .0
             .wake
-            .wait_timeout_while(held, Duration::from_secs(5), |_| owners.live() != 0)
+            .wait_timeout_while(held, crate::change_hub::test_support::STATE_CEILING, |_| {
+                owners.live() != 0
+            })
             .unwrap();
         assert!(
             !result.timed_out(),
@@ -1330,7 +1332,7 @@ mod tests {
         finish_tx.send(()).unwrap();
         owner.join().unwrap();
         done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("shutdown completes after owner exit");
         shutdown.join().unwrap();
         assert!(!lease.owns_caches(), "lease release follows the last owner exit");
@@ -1396,7 +1398,7 @@ mod tests {
             );
             let _ = done_tx.send(first && second);
         });
-        let answered = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let answered = done_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         assert!(
@@ -1501,7 +1503,7 @@ mod tests {
 
         std::thread::spawn(move || tx.send(state.superseded()).unwrap());
 
-        assert!(!rx.recv_timeout(std::time::Duration::from_millis(100)).unwrap());
+        assert!(!rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap());
         drop(held);
     }
 }
@@ -1711,8 +1713,8 @@ mod background_lifetime_tests {
         state.shutdown();
 
         assert!(
-            crate::change_hub::test_support::eventually_within(100, || state.owners.live() == 0),
-            "{} owner(s) still running a second after shutdown",
+            eventually(|| state.owners.live() == 0),
+            "{} owner(s) still running after shutdown",
             state.owners.live()
         );
     }
@@ -1743,11 +1745,10 @@ mod background_lifetime_tests {
             "no owner came for the engine, so the stop below would prove nothing"
         );
         state.shutdown();
-        let left =
-            crate::change_hub::test_support::eventually_within(100, || state.owners.live() == 0);
+        let left = eventually(|| state.owners.live() == 0);
         let live = state.owners.live();
         drop(hold);
-        assert!(left, "{live} owner(s) still waiting for the engine a second after shutdown");
+        assert!(left, "{live} owner(s) still waiting for the engine after shutdown");
     }
 
     /// The daemon's own shutdown stops the hub's fallback poll, through the production path a
@@ -1784,9 +1785,7 @@ mod background_lifetime_tests {
         std::thread::sleep(PERIOD * 6);
         assert_eq!(hub.poll_count(), stopped, "the poll outlived the daemon that owned it");
         assert!(
-            crate::change_hub::test_support::eventually_within(100, || !state
-                .diagnostics
-                .sweeper_running()),
+            eventually(|| !state.diagnostics.sweeper_running()),
             "the daemon's shutdown left the diagnostics sweeper running"
         );
     }
@@ -1831,10 +1830,7 @@ mod background_lifetime_tests {
         let stopped = hub.poll_count();
         std::thread::sleep(PERIOD * 6);
         assert_eq!(hub.poll_count(), stopped, "the blind poll outlived its daemon");
-        assert!(
-            crate::change_hub::test_support::eventually_within(100, || !hub.blind_poll_running()),
-            "the blind poller thread is still there"
-        );
+        assert!(eventually(|| !hub.blind_poll_running()), "the blind poller thread is still there");
     }
 
     /// An owner asleep in a hub wait is released by the stop itself, not by the hub's own
@@ -1846,6 +1842,7 @@ mod background_lifetime_tests {
         use crate::change_hub::WorkspaceChangeHub;
         use std::time::{Duration, Instant};
 
+        const HUB_WAIT: Duration = Duration::from_secs(30);
         let dir = tempfile::tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
         assert!(hub.wait_until_watching());
@@ -1875,8 +1872,7 @@ mod background_lifetime_tests {
         std::thread::spawn(move || {
             let _live = live;
             let since = owner_hub.generation();
-            owner_hub
-                .wait_for_change_or(since, Duration::from_secs(30), || owner_stop.is_stopped());
+            owner_hub.wait_for_change_or(since, HUB_WAIT, || owner_stop.is_stopped());
             let _ = left_tx.send(());
         });
         // Asleep before the stop is raised: the ordering that used to cost a whole wait.
@@ -1885,10 +1881,9 @@ mod background_lifetime_tests {
 
         stop.stop();
 
-        assert!(
-            left.recv_timeout(std::time::Duration::from_secs(1)).is_ok(),
-            "the owner slept through its stop"
-        );
+        // Half the hub wait: an owner that slept through its stop returns only when the wait
+        // runs out, while a merely slow machine stays far inside this bound.
+        assert!(left.recv_timeout(HUB_WAIT / 2).is_ok(), "the owner slept through its stop");
         hub.shutdown();
     }
 

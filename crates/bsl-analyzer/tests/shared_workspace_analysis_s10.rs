@@ -13,6 +13,10 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
 
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+
 const CONSUMER: &str = include_str!(
     "fixtures/shared_workspace_analysis_s6/extensions/consumer/CommonModules/Потребитель/Ext/Module.bsl"
 );
@@ -476,7 +480,7 @@ async fn invalid_project_config_preserves_lsp_and_rejects_mcp_until_repair() {
     assert_mcp_diagnostic(&mcp_diagnostic(&new_client, &consumer_path).await);
 
     new_client.cancel().await.expect("restored MCP client disconnects");
-    tokio::time::timeout(Duration::from_secs(5), new_task)
+    tokio::time::timeout(HANG_WATCHDOG, new_task)
         .await
         .expect("restored MCP session exits")
         .expect("restored MCP task joins")
@@ -647,7 +651,7 @@ async fn unknown_and_excluded_rooted_paths_do_not_collide() {
     assert_eq!(unknown_result["error"], "not_in_workspace", "unknown file path: {unknown}");
 
     client.cancel().await.expect("MCP client disconnects");
-    tokio::time::timeout(Duration::from_secs(5), task)
+    tokio::time::timeout(HANG_WATCHDOG, task)
         .await
         .expect("MCP task exits")
         .expect("MCP task joins")

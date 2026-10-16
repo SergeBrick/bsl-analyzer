@@ -1625,14 +1625,18 @@ mod tests {
         )
         .is_ok();
         let waited = started.elapsed();
+        // The read is still parked, so the engine was taken while it was under way.
+        assert!(!preparer.is_finished(), "the stored-key read ended before the request");
+        assert!(acquired, "the request did not get the engine behind the stored-key read");
         release_tx.send(()).unwrap();
         let plan = preparer.join().unwrap();
 
-        assert!(acquired);
-        assert!(
-            waited < crate::tools::search::ACQUIRE_POLL,
-            "the request waited {waited:?} behind the stored-key read"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < crate::tools::search::ACQUIRE_POLL,
+                "the request waited {waited:?} behind the stored-key read"
+            );
+        }
         assert!(!plan.context_keys.is_empty(), "the mark still covers every stored key");
     }
 
@@ -3090,6 +3094,8 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // Read before the releaser starts its sleep, so the release can only come later.
+        let started = Instant::now();
         let releaser = {
             let hold = hold.shared();
             std::thread::spawn(move || {
@@ -3097,7 +3103,6 @@ mod tests {
                 hold.release();
             })
         };
-        let started = Instant::now();
         let armed = SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
@@ -3158,19 +3163,28 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // A slice far longer than the budget: a wait that spent one whole slice is caught at
+        // half of it, a bound no slow machine reaches for a twenty-millisecond budget.
+        let slice = Duration::from_secs(30);
         let started = Instant::now();
         let armed = SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
-            super::WatchWaitPolicy::new(Duration::from_millis(400), Duration::from_millis(20)),
+            super::WatchWaitPolicy::new(slice, Duration::from_millis(20)),
         );
         let waited = started.elapsed();
 
         assert!(!armed, "the hub is held short of arming");
         assert!(
-            waited < Duration::from_millis(200),
-            "a budget of 20ms must not be spent as a 400ms slice: {waited:?}"
+            waited < slice / 2,
+            "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
         );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < Duration::from_millis(200),
+                "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
+            );
+        }
     }
 
     /// A permanent failure is answered at once. Waiting out a ten-minute budget over a hub
@@ -3191,10 +3205,17 @@ mod tests {
             &crate::state::OwnerStop::default(),
             super::WatchWaitPolicy::new(Duration::from_millis(50), Duration::from_secs(600))
         ));
+        let waited = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "a permanent failure is not something to spend a budget on"
+            waited < crate::change_hub::test_support::STATE_CEILING,
+            "a permanent failure is not something to spend a budget on: {waited:?}"
         );
+        if cfg!(timing_contract) {
+            assert!(
+                waited < Duration::from_secs(5),
+                "a permanent failure is not something to spend a budget on: {waited:?}"
+            );
+        }
     }
 
     #[test]

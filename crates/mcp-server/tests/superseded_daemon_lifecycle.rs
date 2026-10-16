@@ -1,5 +1,9 @@
 #![cfg(unix)]
 
+// Shared helpers for the gates in this binary; not every binary uses every one.
+#[allow(dead_code)]
+mod common;
+
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -8,6 +12,11 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
+
+/// The waits below poll every 25 ms; this is how many polls the shared ceiling allows.
+fn patience() -> common::Patience {
+    common::Patience::new(common::STATE_CEILING, Duration::from_millis(25))
+}
 
 async fn client(server: McpServer) -> RunningService<RoleClient, ()> {
     let (client_io, server_io) = tokio::io::duplex(4 * 1024 * 1024);
@@ -30,7 +39,8 @@ async fn graph_status(client: &RunningService<RoleClient, ()>) -> Value {
 
 async fn wait_current_graph(client: &RunningService<RoleClient, ()>, previous: Option<u64>) -> u64 {
     let mut last = Value::Null;
-    for _ in 0..400 {
+    let mut patience = patience();
+    while patience.allows() {
         last = graph_status(client).await;
         if last["state"] == "ready" && last["stale"] == false {
             let revision = last["revision"].as_u64().expect("ready status carries revision");
@@ -45,7 +55,8 @@ async fn wait_current_graph(client: &RunningService<RoleClient, ()>, previous: O
 
 async fn wait_superseded(client: &RunningService<RoleClient, ()>) -> Value {
     let mut last = Value::Null;
-    for _ in 0..200 {
+    let mut patience = patience();
+    while patience.allows() {
         last = graph_status(client).await;
         if last["superseded"] == true {
             return last;
@@ -153,10 +164,8 @@ async fn superseded_daemon_lifecycle() {
     let nodes: i64 = old_db.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert!(nodes > 0, "the pre-replacement SQLite handle remains readable");
 
-    for _ in 0..200 {
-        if cache.search_db_path().exists() {
-            break;
-        }
+    let mut patience = patience();
+    while !cache.search_db_path().exists() && patience.allows() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(cache.search_db_path().exists(), "workspace search store was initialized");

@@ -6537,7 +6537,7 @@ mod tests {
         }
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
 
         let snapshot = graph.snapshot().expect("a ready graph publishes a snapshot");
         assert!(
@@ -6553,6 +6553,9 @@ mod tests {
         drop(snapshot);
 
         fs::set_permissions(&hidden, open).unwrap();
+        // The probe must be this test's own: one taken while a background walk holds the
+        // reservation does nothing, and nothing drives it again.
+        wait_until(&graph, "the recovery walk to come back", || !graph.walk_out());
         lock_recover(&graph.debt).probe_now(Instant::now());
         graph.drive();
 
@@ -8535,6 +8538,15 @@ mod tests {
         // satisfied by the healing alone — on a published graph the drive dispatches a RELOAD,
         // whose spawn had no seam at all, so the leg that was supposed to prove what a refused
         // thread leaves behind quietly ran an ordinary build instead.
+        //
+        // A reload another driver started is waited out first: while it runs, the drive below
+        // finds the slot taken and has nothing to spawn, and the slot then reads `Running`.
+        wait_until(&graph, "a reload already running to finish", || {
+            !matches!(
+                lock_recover(&graph.inner).published.as_ref().map(|p| &p.reload),
+                Some(ReloadState::Running)
+            )
+        });
         let started = graph.builders_started.load(Ordering::SeqCst);
         graph.loader_cannot_spawn.store(true, Ordering::SeqCst);
         graph.drive();
@@ -9448,13 +9460,16 @@ mod tests {
         }
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        wait_settled(&graph);
         wait_until(&graph, "the initial build to leave its slot", || !graph.facts().in_flight);
         let generation =
             lock_recover(&graph.inner).published.as_ref().expect("the build published").generation;
         let first_interval = lock_recover(&graph.debt).probe_interval().expect("a probe is owed");
 
+        // Each probe is this test's own: a background recovery walk holding the reservation
+        // would turn it into a no-op that leaves the interval where it was.
         for _ in 0..5 {
+            wait_until(&graph, "the recovery walk to come back", || !graph.walk_out());
             lock_recover(&graph.debt).probe_now(Instant::now());
             graph.drive();
         }

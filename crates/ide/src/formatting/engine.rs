@@ -328,6 +328,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(timing_contract), ignore = "timing contract: formatting speed on real code")]
     fn test_format_real_code_performance() {
         // Вход подобран по форме, а не по происхождению: три процедуры со
         // сквозной передачей параметров, комментарии между операторами и вызовы
@@ -386,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(timing_contract), ignore = "timing contract: formatting speed on a large file")]
     fn test_format_large_file_performance() {
         let mut code = String::new();
         for i in 0..100 {

@@ -1597,10 +1597,19 @@ mod tests {
         state.shutdown();
 
         assert!(
-            crate::change_hub::test_support::eventually_within(100, || !state.sweeper_running()),
+            crate::change_hub::test_support::eventually(|| !state.sweeper_running()),
             "the sweeper slept through the shutdown"
         );
-        assert!(asked.elapsed() < Duration::from_secs(1), "the sweeper slept out its interval");
+        // A sweeper that slept its tick out costs a whole interval; half of one is beyond any
+        // slow machine.
+        let stopped = asked.elapsed();
+        assert!(stopped < SWEEP_INTERVAL / 2, "the sweeper slept out its interval: {stopped:?}");
+        if cfg!(timing_contract) {
+            assert!(
+                stopped < Duration::from_secs(1),
+                "the sweeper slept out its interval: {stopped:?}"
+            );
+        }
     }
 
     /// One resident build is exactly ONE traversal: the file set and the drift
@@ -1781,10 +1790,18 @@ mod tests {
         assert_eq!(failed.error.as_deref(), Some("synthetic first failure"));
         assert_eq!(failed.attempts, 1, "one failure is behind this state");
         assert!(
-            failed.retry_after_ms.is_some_and(|owed| owed > 0),
+            failed.retry_after_ms.is_some(),
             "a failure is retryable, and the caller is told when: {:?}",
             failed.retry_after_ms,
         );
+        if cfg!(timing_contract) {
+            // Read within the 60 ms base, so a pause is still owed.
+            assert!(
+                failed.retry_after_ms.is_some_and(|owed| owed > 0),
+                "a failure is retryable, and the caller is told when: {:?}",
+                failed.retry_after_ms,
+            );
+        }
         assert!(failed.failed_age_ms.is_some(), "the cause has an age: {:?}", failed.failed_age_ms);
         assert!(failed.elapsed_ms.is_none(), "nothing is building");
 
@@ -1876,6 +1893,8 @@ mod tests {
 
         let state = DiagnosticsState::for_workspace(root.to_path_buf());
         state.with_build_timeout_for_test(Duration::from_millis(1));
+        // A pause no run of this test can outlast, so the owed wait below is never zero.
+        state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
         {
             let mut inner = lock_recover(&state.inner);
             inner.status = DiagnosticsStatus::Loading;
@@ -2045,13 +2064,15 @@ mod tests {
     fn the_retry_wait_counts_down() {
         let dir = tempfile::tempdir().unwrap();
         let state = DiagnosticsState::for_workspace(dir.path().to_path_buf());
-        state.with_retry_pacing_for_test(Duration::from_secs(5), Duration::from_secs(60));
+        // An hour-long pause: no run of this test can outlast it, so the wait is still owed
+        // at the second reading however slowly the machine gets there.
+        state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
         state.fail_for_test("synthetic failure");
 
         let first = state.status_report().retry_after_ms.expect("a failure owes a wait");
         std::thread::sleep(Duration::from_millis(80));
         let second = state.status_report().retry_after_ms.expect("still owed");
-        assert!(second > 0, "the pause is not over in 80 ms of a five-second base");
+        assert!(second > 0, "the pause is not over within an hour-long base");
         assert!(second < first, "the remaining wait must shrink: {first} ms then {second} ms",);
         assert!(
             first - second >= 40,

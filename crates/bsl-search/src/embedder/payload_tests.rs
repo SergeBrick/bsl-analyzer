@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A joined loopback fixture shared by the native payload integration checks.
 pub(crate) struct PayloadServer {
@@ -24,10 +24,10 @@ impl PayloadServer {
         let stop = Arc::new(AtomicBool::new(false));
         let captured = requests.clone();
         let stopping = stop.clone();
+        // The loop ends at the stop the fixture's `Drop` raises; each exchange is bounded by
+        // the stream timeouts below, so a stuck peer cannot hold it either.
         let thread = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(30);
             while !stopping.load(Ordering::Acquire) {
-                assert!(Instant::now() < deadline, "payload fixture exceeded its watchdog");
                 let (mut stream, _) = match listener.accept() {
                     Ok(stream) => stream,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

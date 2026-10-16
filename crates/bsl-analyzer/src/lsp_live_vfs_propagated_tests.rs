@@ -563,12 +563,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
             },
         )
         .expect("production event loop sends the single successful response");
-        let Message::Response(wire_response) = client_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("retried request sends one terminal response")
-        else {
-            panic!("expected retry response")
-        };
+        let wire_response = recv_client_response(&client_receiver, request_id.clone());
         assert_eq!(wire_response.id, request_id);
         assert!(wire_response.error.is_none());
         assert!(gate.waiter_observed_propagated.load(Ordering::Acquire));
@@ -684,12 +679,7 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
         ));
         handle_task(&mut state, crate::global_state::Task::LatencyRequestFinished { key, outcome })
             .expect("production event loop terminally reports real panic");
-        let Message::Response(response) = client_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("panic produces one terminal response")
-        else {
-            panic!("expected a panic response")
-        };
+        let response = recv_client_response(&client_receiver, request_id.clone());
         assert_eq!(response.id, request_id);
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
@@ -764,12 +754,7 @@ fn g1_propagated_without_new_revision_is_refused_controller_control() {
             },
         )
         .expect("controller refusal passes through the production event-loop decision");
-        let Message::Response(response) = client_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("no-new-revision refusal sends a terminal response")
-        else {
-            panic!("expected one ContentModified response")
-        };
+        let response = recv_client_response(&client_receiver, request_id.clone());
         assert_eq!(response.id, request_id);
         assert_eq!(
             response.error.as_ref().map(|error| error.code),

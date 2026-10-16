@@ -9,6 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+/// not a latency measure.
+const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+
 fn command(root: &std::path::Path, profile: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
     command
@@ -88,7 +92,7 @@ fn vector_journal_failure_keeps_stdout_protocol_only() {
         serde_json::from_str(&second).expect("stdout contains protocol JSON only");
     assert_eq!(response["id"], 2);
     assert!(response["result"]["tools"].is_array());
-    observed.recv_timeout(Duration::from_secs(5)).expect("journal failure diagnostic");
+    observed.recv_timeout(HANG_WATCHDOG).expect("journal failure diagnostic");
     // This fixture tests a live protocol exchange. MCP transport teardown is
     // independent; JournalGuard's bounded graceful drain is exercised in unit tests.
     child.kill().unwrap();

@@ -359,6 +359,10 @@ mod tests {
     use std::io::{Read, Write};
     use tempfile::tempdir;
 
+    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Opening a FIFO that has no writer blocks forever, and these calls run inside
     /// LSP and MCP request handling. The type must be rejected before the open, not
     /// after it — a check that never runs rejects nothing.
@@ -378,7 +382,7 @@ mod tests {
             let _ = tx.send(directory.open_file("manifest.json").is_err());
             drop(root);
         });
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        match rx.recv_timeout(HANG_WATCHDOG) {
             Ok(rejected) => assert!(rejected, "a FIFO must be rejected, not opened"),
             Err(_) => panic!("open blocked on a FIFO instead of rejecting it"),
         }

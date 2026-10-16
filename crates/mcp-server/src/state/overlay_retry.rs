@@ -716,6 +716,9 @@ mod tests {
     use bsl_search::SearchEngine;
     use tempfile::tempdir;
 
+    /// The shared hang watchdog, in the milliseconds [`wait_for`] counts.
+    const CEILING_MS: u64 = crate::change_hub::test_support::STATE_CEILING.as_millis() as u64;
+
     #[test]
     fn payload_lifecycle_overlay_failure_and_retry_preserve_the_main_owner() {
         let _lock = env_lock();
@@ -808,13 +811,14 @@ mod tests {
         );
 
         state.fresh_epoch = epoch_before;
+        let at = Instant::now();
         dummy.settle_outcome(
             &mut state,
             super::super::WorkspaceSearchApply::TransientRefusal,
             epoch_before,
         );
         assert_eq!(state.streak, 1, "the backoff of a refused pass was cleared");
-        assert!(state.next_allowed > Instant::now(), "the pass may restart immediately");
+        assert!(state.next_allowed >= at + retry_delay(1), "the pass may restart immediately");
     }
 
     #[test]
@@ -1293,8 +1297,17 @@ mod tests {
         for kicker in kickers {
             kicker.join().unwrap();
         }
-        assert!(wait_for(5_000, || retry.pass_count() >= 1), "the first pass runs");
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(wait_for(CEILING_MS, || retry.pass_count() >= 1), "the first pass runs");
+        // The driver about to sleep with nothing due is the state in which no further pass is
+        // scheduled; the wake sends it through that decision once more.
+        let (idle_tx, idle_rx) = std::sync::mpsc::channel();
+        *retry.before_idle_wait.lock().unwrap() = Some(Box::new(move || {
+            let _ = idle_tx.send(());
+        }));
+        retry.coalesce();
+        idle_rx
+            .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
+            .expect("the driver never settled with no pass due");
         assert_eq!(retry.pass_count(), 1, "a kick storm still yields one pass");
         retry.stop();
     }
@@ -1383,14 +1396,16 @@ mod tests {
                 let lease = crate::workspace_lease::WorkspaceLease::claim_cache(&cache);
                 let retry = driver_over(crate::state::shared_engine(None), lease.clone());
                 retry.kick_fresh();
-                std::thread::sleep(Duration::from_millis(100));
-                assert!(retry.pass_count() >= 1, "the workflow owns its admission attempt");
+                assert!(
+                    wait_for(CEILING_MS, || retry.pass_count() >= 1),
+                    "the workflow owns its admission attempt"
+                );
                 assert!(!lease.is_superseded(), "lock contention is not terminal");
                 (retry, lease)
             });
 
         retry.kick_fresh();
-        assert!(wait_for(5_000, || retry.pass_count() >= 1), "the unclaimed lease retries");
+        assert!(wait_for(CEILING_MS, || retry.pass_count() >= 1), "the unclaimed lease retries");
         assert!(!lease.is_superseded());
         assert!(!retry.state.lock().unwrap().disarmed);
         retry.stop();
@@ -1518,11 +1533,13 @@ mod tests {
                 "the driver published an overlay after its daemon stopped, order {order:?}"
             );
         }
-        assert!(
-            asked.elapsed() < Duration::from_secs(2),
-            "the six exits took {:?}",
-            asked.elapsed()
-        );
+        // A driver that sat its backoff out would cost a whole tick; half of one is beyond any
+        // slow machine.
+        let exits = asked.elapsed();
+        assert!(exits < TICK / 2, "the six exits took {exits:?}");
+        if cfg!(timing_contract) {
+            assert!(exits < Duration::from_secs(2), "the six exits took {exits:?}");
+        }
     }
 
     /// A driver sitting out a publication backoff is waiting, not working: the flag the

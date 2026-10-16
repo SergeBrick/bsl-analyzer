@@ -4022,6 +4022,10 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+
     fn helper_program(response: &str, exit_code: i32) -> SearchPostgresCredentialHelperConfig {
         SearchPostgresCredentialHelperConfig {
             program: Some("python3".to_owned()),
@@ -5530,7 +5534,6 @@ extensions = [{ name = "T" }]
     #[test]
     fn a_fifo_named_configuration_xml_does_not_block_the_scan() {
         use std::sync::mpsc;
-        use std::time::Duration;
 
         let dir = tempdir().unwrap();
         let root = dir.path().join("weird");
@@ -5549,7 +5552,7 @@ extensions = [{ name = "T" }]
             let _ = tx.send(configuration_kind(&root));
         });
 
-        match rx.recv_timeout(Duration::from_secs(5)) {
+        match rx.recv_timeout(HANG_WATCHDOG) {
             Ok(kind) => assert_eq!(kind, ConfigurationKind::Unknown),
             Err(_) => panic!("configuration_kind blocked on a FIFO"),
         }

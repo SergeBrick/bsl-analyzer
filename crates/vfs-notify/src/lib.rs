@@ -1191,6 +1191,10 @@ mod tests {
     use stdx::path_exclusion::ExcludedPaths;
     use vfs::loader::Handle;
 
+    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
+    /// not a latency measure.
+    const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+
     fn fixture(count: usize, bytes_per_file: usize) -> (tempfile::TempDir, loader::Directories) {
         let dir = tempfile::tempdir().expect("tempdir");
         for i in 0..count {
@@ -1813,7 +1817,7 @@ mod tests {
         std::fs::write(&hidden_runtime, "").unwrap();
         std::fs::write(&allowed_runtime, "").unwrap();
         let (_, receiver) = actor.watcher.as_ref().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
         let mut delivered = Vec::new();
         while std::time::Instant::now() < deadline
             && !delivered.iter().any(|path: &PathBuf| path.ends_with("RuntimeAllowed.bsl"))
@@ -1888,7 +1892,7 @@ mod tests {
         let allowed_file = allowed.join("StillWatched.bsl");
         std::fs::write(&allowed_file, "").unwrap();
         let (_, receiver) = actor.watcher.as_ref().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + HANG_WATCHDOG;
         let mut delivered = Vec::new();
         while std::time::Instant::now() < deadline
             && !delivered.iter().any(|path: &PathBuf| path == &allowed_file)

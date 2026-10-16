@@ -194,9 +194,15 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
     assert!(message.contains("used no CPU"), "the verdict names idleness: {message}");
     assert!(message.contains(file!()), "the verdict names the waiting line: {message}");
     assert!(
-        waited < SILENCE,
-        "an idle server is judged on its own silence window, not the default: {waited:?}",
+        message.contains(&format!("for {silence:?} and used no CPU")),
+        "an idle server is judged on its own silence window, not the default: {message}",
     );
+    if cfg!(timing_contract) {
+        assert!(
+            waited < SILENCE,
+            "an idle server is judged on its own silence window, not the default: {waited:?}",
+        );
+    }
 }
 
 #[test]
@@ -232,7 +238,12 @@ fn a_continuous_unrelated_message_stream_cannot_extend_a_wait_past_its_ceiling()
         "the verdict names the total bound: {message}"
     );
     assert!(message.contains("$/testNoise"), "the verdict names the unrelated traffic: {message}");
-    assert!(waited < stream_for, "the wait ended before the bounded noise producer: {waited:?}");
+    if cfg!(timing_contract) {
+        assert!(
+            waited < stream_for,
+            "the wait ended before the bounded noise producer: {waited:?}"
+        );
+    }
     producer.join().expect("the bounded noise producer exits");
     lsp.messages = original;
 }

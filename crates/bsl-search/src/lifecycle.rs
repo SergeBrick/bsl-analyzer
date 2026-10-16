@@ -668,35 +668,46 @@ mod tests {
 
     #[test]
     fn aggregation_and_explicit_worker_context() {
-        let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
-        let context = batch.context();
-        let worker = context.clone();
-        std::thread::spawn(move || {
-            worker.in_scope(|| {
-                for _ in 0..127 {
-                    let mut mutation = Mutation::new(Path::new("db"), Reason::HashChanged);
-                    mutation.record.examples.push("file.bsl".into());
-                    mutation.finish(
-                        Outcome::Committed,
-                        Counts { sqlite_vectors_removed: Some(2), ..Counts::default() },
-                    );
-                }
+        let records = capture_with(|seen| {
+            let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
+            let context = batch.context();
+            let worker = context.clone();
+            std::thread::spawn(move || {
+                worker.in_scope(|| {
+                    for _ in 0..127 {
+                        let mut mutation = Mutation::new(Path::new("db"), Reason::HashChanged);
+                        mutation.record.examples.push("file.bsl".into());
+                        mutation.finish(
+                            Outcome::Committed,
+                            Counts { sqlite_vectors_removed: Some(2), ..Counts::default() },
+                        );
+                    }
+                })
             })
-        })
-        .join()
-        .unwrap();
-        let state = context.0.lock().unwrap();
-        assert_eq!(state.record.files, 127);
-        assert_eq!(state.record.examples.len(), 10);
-        assert_eq!(state.record.counts.sqlite_vectors_removed, Some(254));
-        drop(state);
-        context.in_scope(|| {
-            Mutation::new(Path::new("db"), Reason::HashChanged)
-                .finish(Outcome::RolledBack, Counts::default())
+            .join()
+            .unwrap();
+            let state = context.0.lock().unwrap();
+            assert_eq!(state.totals.sqlite_vectors_removed, Some(254));
+            assert_eq!(progress_files(&seen.lock().unwrap()) + state.record.files, 127);
+            if cfg!(timing_contract) {
+                assert_eq!(state.record.files, 127);
+                assert_eq!(state.record.examples.len(), 10);
+                assert_eq!(state.record.counts.sqlite_vectors_removed, Some(254));
+            }
+            drop(state);
+            context.in_scope(|| {
+                Mutation::new(Path::new("db"), Reason::HashChanged)
+                    .finish(Outcome::RolledBack, Counts::default())
+            });
+            let files = context.0.lock().unwrap().record.files;
+            assert_eq!(progress_files(&seen.lock().unwrap()) + files, 128);
+            if cfg!(timing_contract) {
+                assert_eq!(files, 0);
+            }
+            assert!(Context::current().is_none());
+            batch.finish(Outcome::Cancelled);
         });
-        assert_eq!(context.0.lock().unwrap().record.files, 0);
-        assert!(Context::current().is_none());
-        batch.finish(Outcome::Cancelled);
+        assert_summary_invariant(&records, 0, 128);
     }
 
     #[test]
@@ -720,7 +731,10 @@ mod tests {
             .unwrap();
             batch.finish(Outcome::Cancelled);
         });
-        assert_eq!(records.len(), 1 + 2 * (10_000 / 128) + 1);
+        assert_summary_invariant(&records, 0, 10_000);
+        if cfg!(timing_contract) {
+            assert_eq!(records.len(), 1 + 2 * (10_000 / 128) + 1);
+        }
         let terminal = records.last().unwrap();
         assert_eq!(terminal["committed_totals"]["sqlite_vectors_removed"], 10_000);
         assert_eq!(terminal["outcome"], "cancelled");
@@ -753,14 +767,25 @@ mod tests {
             });
             batch.finish(Outcome::Cancelled);
         });
-        assert_eq!(records.len(), 4); // Initial intent, progress, next intent, terminal.
+        assert_summary_invariant(&records, 0, SUMMARY_FILES);
+        assert_eq!(records[0]["outcome"], "started");
+        for (record, next) in records.iter().zip(&records[1..]) {
+            if record["outcome"] == "progress" {
+                assert_eq!(next["outcome"], "started", "{next}");
+            }
+        }
         for record in &records[1..] {
             assert!(record["committed_totals"]["sqlite_vectors_removed"].is_null());
             assert_eq!(record["count_quality"], "unavailable");
         }
-        assert_eq!(records[2]["outcome"], "started");
-        assert_eq!(records[3]["outcome"], "cancelled");
-        assert_eq!(records[3]["counts"]["sqlite_vectors_removed"], 0);
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["outcome"], "cancelled");
+        assert_eq!(terminal["counts"]["sqlite_vectors_removed"], 0);
+        if cfg!(timing_contract) {
+            assert_eq!(records.len(), 4); // Initial intent, progress, next intent, terminal.
+            assert_eq!(records[2]["outcome"], "started");
+            assert_eq!(records[3]["outcome"], "cancelled");
+        }
     }
 
     #[test]
@@ -779,8 +804,11 @@ mod tests {
             });
             batch.finish(Outcome::Completed);
         });
+        assert_summary_invariant(&records, 1, SUMMARY_FILES);
         let started: Vec<_> = records.iter().filter(|r| r["outcome"] == "started").collect();
-        assert_eq!(started.len(), 3); // Initial, pending, after the progress summary.
+        if cfg!(timing_contract) {
+            assert_eq!(started.len(), 3); // Initial, pending, after the progress summary.
+        }
         for record in started {
             assert_eq!(record["files"], 0, "{record}");
             assert!(record["outcomes"].as_object().unwrap().is_empty(), "{record}");
@@ -815,7 +843,48 @@ mod tests {
         assert_eq!(records[0]["kind"], "capture_probe");
     }
 
+    /// Holds however often the one-second summary timer fires, unlike exact record counts,
+    /// which assume that only the size limit flushes a summary.
+    fn assert_summary_invariant(
+        records: &[serde_json::Value],
+        pending_calls: usize,
+        mutations: u64,
+    ) {
+        let started: Vec<_> = records.iter().filter(|r| r["outcome"] == "started").collect();
+        let progress = records.iter().filter(|r| r["outcome"] == "progress").count();
+        assert_eq!(started.len(), 1 + pending_calls + progress, "{records:?}");
+        for record in records {
+            assert!(record["files"].as_u64().unwrap() <= SUMMARY_FILES, "{record}");
+        }
+        let files: u64 = records
+            .iter()
+            .filter(|r| r["outcome"] != "started")
+            .map(|r| r["files"].as_u64().unwrap())
+            .sum();
+        assert_eq!(files, mutations, "{records:?}");
+        assert!(progress as u64 + 1 >= mutations.div_ceil(SUMMARY_FILES), "{records:?}");
+        for record in started {
+            assert_eq!(record["files"], 0, "{record}");
+            assert!(record["outcomes"].as_object().unwrap().is_empty(), "{record}");
+            assert!(record["reasons"].as_object().unwrap().is_empty(), "{record}");
+            assert!(record["examples"].as_array().unwrap().is_empty(), "{record}");
+        }
+    }
+
+    fn progress_files(records: &[serde_json::Value]) -> u64 {
+        records
+            .iter()
+            .filter(|r| r["outcome"] == "progress")
+            .map(|r| r["files"].as_u64().unwrap())
+            .sum()
+    }
+
     fn capture(f: impl FnOnce()) -> Vec<serde_json::Value> {
+        capture_with(|_| f())
+    }
+
+    /// Like `capture`, but `f` can read the records emitted so far.
+    fn capture_with(f: impl FnOnce(&Mutex<Vec<serde_json::Value>>)) -> Vec<serde_json::Value> {
         use tracing_subscriber::prelude::*;
         struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
@@ -843,7 +912,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(
             Capture(records.clone()).with_filter(tracing_subscriber::filter::LevelFilter::INFO),
         );
-        test_with_subscriber(subscriber, f);
+        test_with_subscriber(subscriber, || f(&records));
         Arc::try_unwrap(records).unwrap().into_inner().unwrap()
     }
 }

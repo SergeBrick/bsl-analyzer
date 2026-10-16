@@ -45,6 +45,9 @@ const DEP: &str = "a/b/dep";
 #[cfg(unix)]
 const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchanged)";
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = Duration::from_secs(60);
 
 /// Drains child stderr continuously while retaining only a bounded tail. This
 /// keeps native startup diagnostics available without allowing a verbose child
@@ -101,7 +104,7 @@ impl StderrCapture {
 
     #[cfg(unix)]
     fn wait_for_cache_adoption(&self) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             let evidence = self.cache_adoption_evidence();
             if !evidence.is_empty() || Instant::now() >= deadline {
@@ -376,8 +379,20 @@ struct TreeSnapshot {
 }
 
 fn tree_snapshot(root: &Path) -> TreeSnapshot {
+    // An entry the live server replaces — the heartbeat writes `writer.tmp.<pid>` and renames
+    // it into place — can vanish between `read_dir` listing it and the reads below. It is then
+    // not in the snapshot: the snapshot describes what is there, and a source that disappears
+    // is caught by comparing snapshots, not by a panic here.
+    fn gone(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound
+    }
+
     fn walk(root: &Path, path: &Path, entries: &mut BTreeMap<String, TreeEntry>) {
-        let metadata = std::fs::symlink_metadata(path).unwrap();
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if gone(&error) => return,
+            Err(error) => panic!("stat snapshot entry {}: {error}", path.display()),
+        };
         let file_type = metadata.file_type();
         let kind = if file_type.is_symlink() {
             "symlink"
@@ -400,23 +415,31 @@ fn tree_snapshot(root: &Path) -> TreeSnapshot {
         };
         #[cfg(not(any(unix, windows)))]
         let permissions = if metadata.permissions().readonly() { 1 } else { 0 };
-        let symlink_target = file_type
-            .is_symlink()
-            .then(|| std::fs::read_link(path).unwrap().to_string_lossy().into_owned());
-        let hash = file_type.is_file().then(|| {
-            let bytes = std::fs::read(path)
-                .unwrap_or_else(|error| panic!("read snapshot file {}: {error}", path.display()));
-            blake3::hash(&bytes).to_hex().to_string()
-        });
+        let symlink_target = match file_type.is_symlink().then(|| std::fs::read_link(path)) {
+            None => None,
+            Some(Ok(target)) => Some(target.to_string_lossy().into_owned()),
+            Some(Err(error)) if gone(&error) => return,
+            Some(Err(error)) => panic!("read snapshot link {}: {error}", path.display()),
+        };
+        let hash = match file_type.is_file().then(|| std::fs::read(path)) {
+            None => None,
+            Some(Ok(bytes)) => Some(blake3::hash(&bytes).to_hex().to_string()),
+            Some(Err(error)) if gone(&error) => return,
+            Some(Err(error)) => panic!("read snapshot file {}: {error}", path.display()),
+        };
+        let children = match file_type.is_dir().then(|| std::fs::read_dir(path)) {
+            None => None,
+            Some(Ok(children)) => Some(children),
+            Some(Err(error)) if gone(&error) => return,
+            Some(Err(error)) => panic!("list snapshot directory {}: {error}", path.display()),
+        };
         let relative = path.strip_prefix(root).unwrap();
         entries.insert(
             relative.to_string_lossy().into_owned(),
             TreeEntry { kind, size: metadata.len(), hash, permissions, symlink_target },
         );
-        if file_type.is_dir() {
-            for child in std::fs::read_dir(path).unwrap() {
-                walk(root, &child.unwrap().path(), entries);
-            }
+        for child in children.into_iter().flatten() {
+            walk(root, &child.unwrap().path(), entries);
         }
     }
 
@@ -898,14 +921,13 @@ fn wait_for_scope_guard_exit(
         std::thread::sleep(Duration::from_millis(25));
     };
     stderr.join();
-    let diagnostic =
-        stderr.wait_for_text(SCOPE_STOP, Duration::from_secs(2)).unwrap_or_else(|| {
-            panic!("{phase} emits scope-stop diagnostic; stderr: {}", stderr.snapshot())
-        });
+    let diagnostic = stderr.wait_for_text(SCOPE_STOP, HANG_WATCHDOG).unwrap_or_else(|| {
+        panic!("{phase} emits scope-stop diagnostic; stderr: {}", stderr.snapshot())
+    });
     let occurrences = diagnostic.matches(SCOPE_STOP).count();
     assert_eq!(occurrences, 1, "{phase} emits exactly one scope-stop diagnostic");
     assert!(status.success(), "{phase} exits successfully after scope drift: {status}");
-    let lease_deadline = Instant::now() + Duration::from_secs(2);
+    let lease_deadline = Instant::now() + HANG_WATCHDOG;
     while lease_path.exists() && Instant::now() < lease_deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -2152,7 +2174,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         };
         stderr.join();
         assert!(status.success(), "HTTP child exits cleanly after SIGTERM: {status}");
-        let lease_deadline = Instant::now() + Duration::from_secs(2);
+        let lease_deadline = Instant::now() + HANG_WATCHDOG;
         while layout.lease_path().exists() && Instant::now() < lease_deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -2321,10 +2343,13 @@ fn workspace_cache_scope_optional_journal_overlap_keeps_source_clean() {
         "overlapping journal leaf remains source-clean while live"
     );
     assert!(session.shutdown().unwrap().success(), "overlap fixture shuts down cleanly");
-    let journal_diagnostic = session
-        .stderr
-        .wait_for_text(JOURNAL_UNAVAILABLE, Duration::from_secs(5))
-        .expect("native runtime reports that the optional overlapping journal is unavailable");
+    // The process has exited, so once the reader reaches EOF its tail is complete.
+    session.stderr.join();
+    let journal_diagnostic = session.stderr.snapshot();
+    assert!(
+        journal_diagnostic.contains(JOURNAL_UNAVAILABLE),
+        "native runtime reports that the optional overlapping journal is unavailable: {journal_diagnostic}"
+    );
     assert_tree_unchanged(&before, root.path(), "after optional journal overlap refusal");
     let journal_after = tree_snapshot(&journal_root);
     assert_eq!(
@@ -2714,7 +2739,7 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let marker_required = wait_for_marker(&mut required, "CACHE_LEXICAL_A_235");
     assert!(!marker_required.is_empty(), "broker-required search reaches daemon data");
     let log_fallback = daemon_stderr
-        .wait_for_text("Failed to setup logging:", Duration::from_secs(5))
+        .wait_for_text("Failed to setup logging:", HANG_WATCHDOG)
         .expect("daemon logging IO failure truthfully falls back to stderr");
     assert_leaf_artifacts(&layout);
     let lease_required = lease_receipt(&layout.lease_path(), daemon_pid);
@@ -3060,7 +3085,7 @@ fn s12_proxy_scope_mismatch_driver() {
     let child_count = std::fs::read_to_string(&count_path).unwrap().trim().parse::<u32>().unwrap();
     let broker_log = runtime.join("bsl-mcp").join(format!("{}.log", key.digest()));
     let child_failure = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             let log = std::fs::read_to_string(&broker_log).unwrap_or_default();
             if log.contains("workspace cache scope changed between launcher and daemon")
@@ -4088,7 +4113,7 @@ impl McpSession {
 
     fn shutdown(&mut self) -> std::io::Result<ExitStatus> {
         drop(self.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             if let Some(status) = self.child.try_wait()? {
                 return Ok(status);
@@ -4098,7 +4123,7 @@ impl McpSession {
                 let _ = self.child.wait()?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "MCP shutdown exceeded 5 seconds",
+                    "MCP shutdown exceeded its hang watchdog",
                 ));
             }
             std::thread::sleep(Duration::from_millis(25));

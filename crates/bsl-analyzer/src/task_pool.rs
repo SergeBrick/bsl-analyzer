@@ -195,6 +195,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Bound of a wait for a result that a regression would never deliver; a hang
+    /// watchdog, not a latency measure.
+    const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+
     #[test]
     fn bounded_pool_executes_more_jobs_than_workers() {
         let workers = 2;
@@ -219,7 +223,7 @@ mod tests {
                     Err(TrySpawnError::Full) => {
                         handle
                             .receiver
-                            .recv_timeout(Duration::from_secs(2))
+                            .recv_timeout(HANG_WATCHDOG)
                             .expect("a result must arrive while the queue is full");
                         received += 1;
                     }
@@ -229,7 +233,7 @@ mod tests {
         }
 
         while received < jobs {
-            match handle.receiver.recv_timeout(Duration::from_secs(2)) {
+            match handle.receiver.recv_timeout(HANG_WATCHDOG) {
                 Ok(_) => received += 1,
                 Err(err) => panic!("missing result after {received} of {jobs}: {err}"),
             }
@@ -319,7 +323,7 @@ mod tests {
         for i in 0..accepted {
             handle
                 .receiver
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(HANG_WATCHDOG)
                 .unwrap_or_else(|err| panic!("accepted job {i} must still run: {err}"));
         }
         assert!(handle.pool.has_capacity(), "draining the queue restores capacity");
@@ -347,7 +351,7 @@ mod tests {
         handle.pool.try_spawn(|| "ok").unwrap();
         let result = handle
             .receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(HANG_WATCHDOG)
             .expect("second job should run after panicking peer");
         assert_eq!(result, "ok");
     }

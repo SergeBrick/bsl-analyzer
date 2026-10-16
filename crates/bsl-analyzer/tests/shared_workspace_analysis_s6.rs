@@ -14,6 +14,10 @@ use tokio::task::JoinHandle;
 type Client = RunningService<RoleClient, ()>;
 type ServerTask = JoinHandle<anyhow::Result<()>>;
 
+/// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
+/// latency measure.
+const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+
 const CONSUMER: &str = include_str!(
     "fixtures/shared_workspace_analysis_s6/extensions/consumer/CommonModules/Потребитель/Ext/Module.bsl"
 );
@@ -364,7 +368,7 @@ async fn source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics() {
 
     eprintln!("S6 phase=source-set/lsp-shutdown");
     new_client.cancel().await.expect("new MCP client disconnects");
-    tokio::time::timeout(Duration::from_secs(5), new_task)
+    tokio::time::timeout(HANG_WATCHDOG, new_task)
         .await
         .expect("reconnected MCP session exits")
         .expect("new MCP task joins")

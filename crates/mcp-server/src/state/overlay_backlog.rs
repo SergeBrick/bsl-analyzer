@@ -1473,7 +1473,12 @@ mod tests {
         let times = handle.probe.publish_times.lock().unwrap().clone();
         assert!(times.len() >= 4, "{} batches for {files} marks", times.len());
         let widest = times.windows(2).map(|pair| pair[1] - pair[0]).max().unwrap();
-        assert!(widest < Duration::from_secs(1), "a pause of {widest:?} between batches");
+        // A pause between batches is an idle tick spent; half of one is slower than any
+        // machine and faster than the tick.
+        assert!(widest < pacing.idle_tick / 2, "a pause of {widest:?} between batches");
+        if cfg!(timing_contract) {
+            assert!(widest < Duration::from_secs(1), "a pause of {widest:?} between batches");
+        }
         finish(&handle, &stop);
     }
 
@@ -1795,12 +1800,23 @@ mod tests {
 
     /// A key whose file cannot be read is settled back into its mark every time. That is not
     /// progress: the owner backs off instead of re-reading it in a loop, so the passes over it
-    /// are counted by the schedule, not by the speed of the disk.
+    /// are counted by the schedule, not by the speed of the disk. The owner's clock is held
+    /// still, so the backoff never runs out under a slow observer and a second read can only
+    /// come from an owner that skipped its schedule.
     #[test]
     fn a_key_that_keeps_failing_is_retried_on_the_schedule() {
         let dir = tempfile::tempdir().unwrap();
         let shared = engine_over(dir.path(), 1);
-        let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, FAST);
+        let handle = OverlayBacklog::default();
+        *handle.probe.clock.lock().unwrap() = Some(Arc::new(test_probe::TestClock::default()));
+        let stop = OwnerStop::default();
+        assert!(handle.start_with(
+            Arc::clone(&shared),
+            WorkspaceLease::unmanaged(),
+            None,
+            stop.clone(),
+            FAST
+        ));
         let path = dir.path().join("M0.bsl");
         fs::write(&path, [0xff, 0xfe]).unwrap();
         assert!(shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&path).unwrap());
@@ -1847,16 +1863,32 @@ mod tests {
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the owner reached phase B");
 
-        let started = Instant::now();
-        let acquired = crate::tools::search::try_acquire_engine(
-            &shared,
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .is_ok();
-        let waited = started.elapsed();
+        // The request runs off this thread and is answered while phase B is still parked, so
+        // a request that waited for the owner never answers before the release below.
+        let (answer_tx, answer) = std::sync::mpsc::channel();
+        let request = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let acquired = crate::tools::search::try_acquire_engine(
+                    &shared,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .is_ok();
+                let _ = answer_tx.send((acquired, started.elapsed()));
+            })
+        };
+        let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
         release_tx.send(()).unwrap();
+        request.join().unwrap();
+        let (acquired, waited) = answered.expect("the request waited behind phase B");
         assert!(acquired);
-        assert!(waited < crate::tools::search::ACQUIRE_POLL, "waited {waited:?} behind phase B");
+        if cfg!(timing_contract) {
+            assert!(
+                waited < crate::tools::search::ACQUIRE_POLL,
+                "waited {waited:?} behind phase B"
+            );
+        }
         finish(&handle, &stop);
     }
 
@@ -1880,7 +1912,9 @@ mod tests {
         stop.stop();
         handle.stop();
         assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
-        assert!(asked.elapsed() < Duration::from_secs(1));
+        if cfg!(timing_contract) {
+            assert!(asked.elapsed() < Duration::from_secs(1));
+        }
         drop(held);
     }
 

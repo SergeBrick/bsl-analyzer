@@ -1796,7 +1796,10 @@ mod background_lifetime_tests {
         state.shutdown();
 
         // The fallback poll runs on the hub's thread: once that thread has left, nothing polls.
-        assert!(eventually(|| hub.thread_has_left()), "the poll outlived the daemon that owned it");
+        assert!(
+            eventually(|| crate::change_hub::test_support::thread_has_left(&hub)),
+            "the poll outlived the daemon that owned it"
+        );
         let stopped = hub.poll_count();
         if cfg!(timing_contract) {
             std::thread::sleep(PERIOD * 6);

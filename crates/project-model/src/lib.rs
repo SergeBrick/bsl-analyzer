@@ -4022,10 +4022,14 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
-    /// not a latency measure.
-    const HANG_WATCHDOG: std::time::Duration =
-        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
+    /// Bound of a wait for an event that a regression would never deliver: 60 s under
+    /// `timing_contract`, and a century otherwise, so an ordinary run waits for the event
+    /// however long a loaded machine takes. A century still fits in an `Instant` sum.
+    const HANG_WATCHDOG: std::time::Duration = if cfg!(timing_contract) {
+        std::time::Duration::from_secs(60)
+    } else {
+        std::time::Duration::from_secs(100 * 365 * 24 * 60 * 60)
+    };
 
     fn helper_program(response: &str, exit_code: i32) -> SearchPostgresCredentialHelperConfig {
         SearchPostgresCredentialHelperConfig {

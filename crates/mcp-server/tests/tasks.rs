@@ -189,8 +189,9 @@ impl Wire {
         self.request("tasks/cancel", json!({"taskId": task_id})).await
     }
 
-    /// Poll until `settled` accepts a `tasks/get` answer, or give up loudly. The bound counts
-    /// polls, so a slow machine waits longer for the same answer instead of failing on it.
+    /// Poll until `settled` accepts a `tasks/get` answer. Under `timing_contract` the polls are
+    /// counted against [`HANG_GUARD`] and running out gives up loudly; an ordinary run polls until
+    /// the answer comes, so a slow machine waits longer for it instead of failing on it.
     async fn poll_until(
         &mut self,
         task_id: &str,
@@ -383,8 +384,10 @@ async fn cancelling_a_waiting_handle_settles_it() {
 /// taken under the same load: a released resident answers in a small fraction of the time the
 /// sweep takes to finish, and an abandoned one answers only after the sweep has finished.
 ///
-/// The comparison of the two waits is the timing profile's; an ordinary run checks that the
-/// cancelled read answers as cancelled and that the next caller is answered after it.
+/// That comparison is the only thing that tells a released resident from an abandoned one, and
+/// it is a reading of the clock, so it — and with it the release this test is named for — is
+/// checked by the timing profile alone. An ordinary run checks less: that the cancelled read
+/// answers as cancelled and that the next caller is answered after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_working_handle_stops_the_read_and_frees_the_resident() {
     arm_the_branch();

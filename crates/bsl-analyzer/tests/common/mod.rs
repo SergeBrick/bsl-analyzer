@@ -200,6 +200,10 @@ impl Lsp {
     /// in which it used CPU is extended, up to [`BUSY_CEILING`], and a silent window in
     /// which it used none fails at once — with where the wait stood and what it last saw,
     /// so the failure names the condition instead of "Timeout".
+    ///
+    /// Both verdicts read the clock, so only the timing profile gives them: an ordinary run
+    /// waits for the message itself, and a wait that can never be met is a hang left to the
+    /// runner.
     #[track_caller]
     pub fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
         self.wait_for_judging(SILENCE, BUSY_CEILING, predicate)

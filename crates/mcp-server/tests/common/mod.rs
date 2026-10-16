@@ -76,7 +76,9 @@ impl Drop for Retired {
 #[allow(dead_code)]
 const RETIRE_BUDGET: Duration = test_utils::wait::ceiling(Duration::from_secs(180));
 
-/// Ask until the answer is the one the test asserts, or fail saying it never came.
+/// Ask until the answer is the one the test asserts; under `timing_contract`, fail saying it
+/// never came once [`DELIVERY_ATTEMPTS`] asks are spent. An ordinary run asks until it comes, so
+/// an answer that never does is a hang left to the runner.
 ///
 /// The shape every gate over a post-startup disk write needs. Such a write reaches the
 /// resident by two mechanisms, and BOTH can be late: the change hub's drain runs on a
@@ -85,7 +87,8 @@ const RETIRE_BUDGET: Duration = test_utils::wait::ceiling(Duration::from_secs(18
 /// test that fails for something it does not measure.
 ///
 /// This does not soften anything. `accept` is the test's own claim, so an answer that
-/// never satisfies it still fails, with the last answer quoted; a claim about what must
+/// never satisfies it is never taken for one, and in the timing profile it fails with the last
+/// answer quoted; a claim about what must
 /// STAY absent is not asked this way at all — one call already settles it, and asking
 /// again could only be answered by the thing the control says is not there.
 pub async fn settled<Ask, Fut>(

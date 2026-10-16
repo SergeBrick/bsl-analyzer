@@ -359,12 +359,15 @@ fn payload_transport_response_limit_and_timeout_are_independent() {
     );
     assert_eq!(server.requests().len(), 2);
     // The answer is held until the client has given up, so the client's own deadline is the
-    // only thing that can end the exchange, however the two are scheduled.
-    let (answer, held) = std::sync::mpsc::channel::<()>();
+    // only thing that can end the exchange, however the two are scheduled. The sender is bound
+    // after the server so that a failing assertion drops it first: the held answer is let go
+    // and the server's `Drop` can join its thread.
+    let (sender, held) = std::sync::mpsc::channel::<()>();
     let server = PayloadServer::new(move |i, body| {
         let _ = held.recv();
         success(i, body)
     });
+    let answer = sender;
     let mut embedder = Embedder::new(server.config(4096));
     embedder.interactive_agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_millis(20)))

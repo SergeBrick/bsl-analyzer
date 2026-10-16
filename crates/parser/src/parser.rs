@@ -5,6 +5,7 @@ use smallvec::smallvec;
 #[macro_use]
 pub(crate) mod input;
 pub mod token_set;
+mod torn_if;
 
 use crate::event::{Event, NodeKind};
 use crate::parser::input::{Input, Sig};
@@ -29,6 +30,10 @@ pub struct Parser<'a> {
     closed_inserts: std::cell::OnceCell<Vec<usize>>,
     open_preproc_ifs: u32,
     crossed_preproc_ifs: Vec<u32>,
+    conditionals: std::cell::OnceCell<Vec<torn_if::Conditional>>,
+    /// The torn conditional groups whose branch is being read: where the
+    /// branch ends and where the group closes.
+    open_torn_ifs: Vec<(usize, usize)>,
 }
 
 impl<'a> Parser<'a> {
@@ -48,6 +53,8 @@ impl<'a> Parser<'a> {
             closed_inserts: std::cell::OnceCell::new(),
             open_preproc_ifs: 0,
             crossed_preproc_ifs: Vec::new(),
+            conditionals: std::cell::OnceCell::new(),
+            open_torn_ifs: Vec::new(),
         }
     }
 
@@ -271,6 +278,112 @@ impl<'a> Parser<'a> {
         }
         closed.sort_unstable();
         closed
+    }
+
+    /// The closed conditional group whose `#Если` stands at `pos`.
+    ///
+    /// The groups are decided once for the whole input, as the inserts are:
+    /// asked at every directive, a scan to the group's end would make deeply
+    /// nested groups quadratic.
+    fn conditional_at(&self, pos: usize) -> Option<torn_if::Conditional> {
+        let groups = self.conditionals();
+        groups.binary_search_by_key(&pos, |group| group.open).ok().map(|index| groups[index])
+    }
+
+    fn conditionals(&self) -> &[torn_if::Conditional] {
+        self.conditionals.get_or_init(|| torn_if::conditionals(|at| self.input.kind(at)))
+    }
+
+    /// Whether the input holds whole constructs as the parser reads it — see
+    /// [`torn_if::whole`].
+    pub(crate) fn is_whole(&self) -> bool {
+        torn_if::whole(|at| self.input.kind(at), self.conditionals())
+    }
+
+    /// Whether the `#Если` here, standing where a statement may begin, tears
+    /// a construct apart: one of its branches opens what it does not close,
+    /// or closes or continues what it did not open.
+    ///
+    /// A group whose branches each hold whole statements keeps the structured
+    /// reading, every branch parsed.
+    pub(crate) fn at_torn_if_statement(&self) -> bool {
+        self.at(T![PreIf]) && self.conditional_at(self.pos).is_some_and(|group| !group.balanced)
+    }
+
+    /// Whether a closed `#Если` stands here. Inside an expression no
+    /// statement can begin, so any such group tears the expression apart.
+    pub(crate) fn at_torn_if_inline(&self) -> bool {
+        self.at(T![PreIf]) && self.conditional_at(self.pos).is_some()
+    }
+
+    /// Whether the directive here ends the branch being read of a torn group.
+    pub(crate) fn at_torn_if_end(&self) -> bool {
+        matches!(self.current(), Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]))
+            && self.open_torn_ifs.iter().any(|&(end, _)| end == self.pos)
+    }
+
+    /// The group whose `#Если` stands here.
+    pub(crate) fn torn_if_here(&self) -> Option<torn_if::Conditional> {
+        if self.at(T![PreIf]) {
+            self.conditional_at(self.pos)
+        } else {
+            None
+        }
+    }
+
+    /// Starts reading the branch of a torn group: it ends at `end`, and the
+    /// group closes at `close`.
+    pub(crate) fn open_torn_if(&mut self, end: usize, close: usize) {
+        self.open_torn_ifs.push((end, close));
+    }
+
+    /// Stops reading the branch that ends here and returns where its group
+    /// closes.
+    pub(crate) fn close_torn_if(&mut self) -> Option<usize> {
+        let index = self.open_torn_ifs.iter().position(|&(end, _)| end == self.pos)?;
+        Some(self.open_torn_ifs.remove(index).1)
+    }
+
+    /// Where a look-ahead resumes past the torn-group part starting `n`
+    /// tokens ahead, as an offset from here; `None` — no such part there.
+    ///
+    /// `pending` holds the branches the look-ahead itself entered: their ends
+    /// are parts just as the ends of the branches being read are.
+    pub(crate) fn torn_if_skip(
+        &self,
+        n: usize,
+        pending: &mut Vec<(usize, usize)>,
+    ) -> Option<usize> {
+        let at = self.pos + n;
+        match self.input.kind(at)? {
+            T![PreIf] => {
+                let group = self.conditional_at(at)?;
+                let resume = match group.active {
+                    Some((start, end)) => {
+                        pending.push((end, group.close));
+                        start
+                    }
+                    None => group.close + 1,
+                };
+                Some(resume - self.pos)
+            }
+            T![PreElsIf] | T![PreElse] | T![PreEndIf] => self
+                .open_torn_ifs
+                .iter()
+                .chain(pending.iter())
+                .find(|&&(end, _)| end == at)
+                .map(|&(_, close)| close + 1 - self.pos),
+            _ => None,
+        }
+    }
+
+    /// Consumes, as text not compiled in the variant read, every token before
+    /// the one at `next`.
+    pub(crate) fn bump_removed_until(&mut self, next: usize) {
+        while self.pos < next && !self.at_end() {
+            self.check_iteration_limit();
+            self.bump_removed();
+        }
     }
 
     /// How many insertions opened inside an expression still wait for their
@@ -615,6 +728,7 @@ impl<'a> Parser<'a> {
             || self.at(T![PreIf])
             || self.at_declared_boundary()
             || self.at_enclosing_boundary()
+            || self.at_torn_if_end()
     }
 
     /// The part of the boundary that holds for the whole parse, without the

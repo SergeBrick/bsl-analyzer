@@ -438,24 +438,17 @@ fn a_header_keeps_its_last_word_through_the_separator_before_it() {
 }
 
 #[test]
-fn a_region_that_crosses_a_block_keeps_its_own_closer() {
+fn a_region_that_crosses_a_block_is_read_as_one_variant() {
     // The scope stack holds constructs that nest. A conditional region and a
-    // statement block may cross instead, and then the region returns on a word
-    // that is not its own. The parser records the region as still open, so
-    // the `#КонецЕсли` that does belong to it is taken as its closer, not as
-    // an error nor as the closer of a region further out. What is left is the
-    // one complaint about the closer the region returned without.
-    let input = "Процедура П()
-Если А Тогда
-#Если Клиент Тогда
-	ИначеЕсли Б Тогда
-#КонецЕсли
-	КонецЕсли;
-КонецПроцедуры";
+    // statement block may cross instead; such a region tears the block apart
+    // and is read as one variant of the text — its branch as code, its
+    // directives as opaque parts — so its `#КонецЕсли` is taken where the
+    // branch ends, whatever rule stands there.
+    let input = "Процедура П()\nЕсли А Тогда\n#Если Клиент Тогда\n\tИначеЕсли Б Тогда\n#КонецЕсли\n\tКонецЕсли;\nКонецПроцедуры";
 
     assert!(covers(input, true));
     assert!(!swallowed(input, true, "#КонецЕсли"), "{:?}", error_node_texts(input, true));
-    assert_eq!(messages(input, true).len(), 1, "{:?}", messages(input, true));
+    assert!(messages(input, true).is_empty(), "{:?}", messages(input, true));
 }
 
 #[test]

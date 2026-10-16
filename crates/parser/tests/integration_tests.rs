@@ -607,9 +607,9 @@ fn test_preprocessor_not_without_parens() {
 
 #[test]
 fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
-    // A directive inside a condition is still an error, but recovery must not
-    // take its `#Если` alone: the `#КонецЕсли` left over would close the
-    // module-level region before the procedure that follows.
+    // A directive inside a condition must not leave its `#КонецЕсли` to the
+    // region around it: that would close the module-level region before the
+    // procedure that follows.
     let input = r#"#Если Не ТонкийКлиент И Не ВебКлиент Тогда
 Функция Первая()
     Если Ложь
@@ -626,7 +626,9 @@ fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
 КонецПроцедуры
 #КонецЕсли
 "#;
-    let root = parse(input).syntax_node();
+    let parsed = parse(input);
+    assert!(!parsed.has_errors(), "{:?}", parsed.errors());
+    let root = parsed.syntax_node();
     let regions: Vec<_> = root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
     assert_eq!(regions.len(), 1, "one module-level region: {regions:?}");
     let region = &regions[0];
@@ -639,8 +641,12 @@ fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
         region.descendants().any(|n| n.kind() == SyntaxKind::PROCEDURE_DEF),
         "the procedure after the torn condition stays inside the region"
     );
+    // The directive in the condition tears it apart and is read as one
+    // variant: its lines are opaque parts around the branch read, not a block.
     let nested = region.descendants().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).count() - 1;
-    assert_eq!(nested, 1, "the directive in the condition is a block of its own");
+    assert_eq!(nested, 0, "the directive in the condition is not a structured block");
+    let parts = region.descendants().filter(|n| n.kind() == SyntaxKind::PRE_TORN_IF_PART).count();
+    assert_eq!(parts, 2, "its `#Если` line and its `#КонецЕсли` line");
 }
 
 #[test]

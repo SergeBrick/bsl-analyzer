@@ -814,9 +814,8 @@ pub(crate) fn has_module_syntax(code: &str) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
-    #![cfg(unix)]
-
     use super::*;
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
 

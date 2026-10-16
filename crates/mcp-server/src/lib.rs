@@ -6,6 +6,7 @@ pub mod cache_windows;
 mod cancel;
 mod change_hub;
 #[cfg(test)]
+#[cfg(windows)]
 mod check_executor_windows_tests;
 #[cfg(test)]
 mod check_executor_wire_tests;

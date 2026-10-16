@@ -488,6 +488,14 @@ fn snapshot_skips_an_entry_removed_between_listing_and_stat() {
     assert_eq!(source.hash.as_deref(), Some(blake3::hash(b"source").to_hex().as_str()));
 }
 
+#[test]
+fn snapshot_rejects_a_missing_root() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    let result = std::panic::catch_unwind(|| tree_snapshot(&missing));
+    assert!(result.is_err(), "a missing root must not become an empty snapshot");
+}
+
 #[cfg(unix)]
 #[test]
 #[should_panic(expected = "source path disappeared after removal")]

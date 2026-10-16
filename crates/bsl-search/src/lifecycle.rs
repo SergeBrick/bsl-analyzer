@@ -754,6 +754,56 @@ mod tests {
     }
 
     #[test]
+    fn summary_invariant_survives_an_expired_interval() {
+        check_summary_after_interval_expiry(|context| {
+            context.0.lock().unwrap().since = Instant::now() - Duration::from_millis(1100);
+        });
+    }
+
+    #[test]
+    #[ignore = "необязательный тест: таймер std::time::Instant после реальной паузы; запуск: cargo test -p bsl-search lifecycle::tests::summary_invariant_survives_a_real_timer_pause -- --exact --ignored"]
+    fn summary_invariant_survives_a_real_timer_pause() {
+        check_summary_after_interval_expiry(|_| {
+            std::thread::sleep(Duration::from_millis(1100));
+        });
+    }
+
+    fn check_summary_after_interval_expiry(expire: impl FnOnce(&Context)) {
+        let mutations = SUMMARY_FILES + 2;
+        let records = capture(|| {
+            let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
+            let context = batch.context();
+            context.in_scope(|| {
+                let commit = || {
+                    let mut mutation = Mutation::new(Path::new("db"), Reason::HashChanged);
+                    mutation.record.examples.push("module.bsl".into());
+                    mutation.finish(
+                        Outcome::Committed,
+                        Counts { sqlite_vectors_removed: Some(2), ..Counts::default() },
+                    );
+                };
+                commit();
+                batch.pending(mutations - 1);
+                expire(&context);
+                commit();
+                for _ in 2..mutations {
+                    commit();
+                }
+            });
+            batch.finish(Outcome::Completed);
+        });
+        assert_summary_invariant(&records, 1, mutations);
+        // An early timer flush and the remaining full size interval both emit progress.
+        let progress = records.iter().filter(|r| r["outcome"] == "progress").count();
+        assert!(progress >= 2, "{records:?}");
+        let old_size_only_count = 1 + 1 + 2 * (mutations / SUMMARY_FILES) + 1;
+        assert_ne!(records.len() as u64, old_size_only_count);
+        let terminal = records.last().unwrap();
+        assert_eq!(terminal["outcome"], "completed");
+        assert_eq!(terminal["committed_totals"]["sqlite_vectors_removed"], 2 * mutations);
+    }
+
+    #[test]
     fn unavailable_totals_keep_their_quality_after_flush_and_at_termination() {
         let records = capture(|| {
             let batch = Batch::new(Path::new("db"), Reason::ExplicitRebuild);
@@ -865,6 +915,11 @@ mod tests {
         assert!(progress as u64 + 1 >= mutations.div_ceil(SUMMARY_FILES), "{records:?}");
         for record in started {
             assert_eq!(record["files"], 0, "{record}");
+            assert_eq!(
+                record["counts"],
+                serde_json::to_value(Counts::default()).unwrap(),
+                "{record}"
+            );
             assert!(record["outcomes"].as_object().unwrap().is_empty(), "{record}");
             assert!(record["reasons"].as_object().unwrap().is_empty(), "{record}");
             assert!(record["examples"].as_array().unwrap().is_empty(), "{record}");

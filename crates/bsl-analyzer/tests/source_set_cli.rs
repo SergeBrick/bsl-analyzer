@@ -379,6 +379,10 @@ struct TreeSnapshot {
 }
 
 fn tree_snapshot(root: &Path) -> TreeSnapshot {
+    tree_snapshot_with_before_stat(root, &mut |_| {})
+}
+
+fn tree_snapshot_with_before_stat(root: &Path, before_stat: &mut dyn FnMut(&Path)) -> TreeSnapshot {
     // An entry the live server replaces — the heartbeat writes `writer.tmp.<pid>` and renames
     // it into place — can vanish between `read_dir` listing it and the reads below. It is then
     // not in the snapshot: the snapshot describes what is there, and a source that disappears
@@ -387,7 +391,12 @@ fn tree_snapshot(root: &Path) -> TreeSnapshot {
         error.kind() == std::io::ErrorKind::NotFound
     }
 
-    fn walk(root: &Path, path: &Path, entries: &mut BTreeMap<String, TreeEntry>) {
+    fn walk(
+        root: &Path,
+        path: &Path,
+        entries: &mut BTreeMap<String, TreeEntry>,
+        before_stat: &mut dyn FnMut(&Path),
+    ) {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if gone(&error) => return,
@@ -439,14 +448,58 @@ fn tree_snapshot(root: &Path) -> TreeSnapshot {
             TreeEntry { kind, size: metadata.len(), hash, permissions, symlink_target },
         );
         for child in children.into_iter().flatten() {
-            walk(root, &child.unwrap().path(), entries);
+            let path = child.unwrap().path();
+            before_stat(&path);
+            walk(root, &path, entries, before_stat);
         }
     }
 
     let mut entries = BTreeMap::new();
-    walk(root, root, &mut entries);
+    walk(root, root, &mut entries, before_stat);
     let encoded = serde_json::to_vec(&entries).unwrap();
     TreeSnapshot { entries, fingerprint: blake3::hash(&encoded).to_hex().to_string() }
+}
+
+#[test]
+fn snapshot_skips_an_entry_removed_between_listing_and_stat() {
+    let root = tempfile::tempdir().unwrap();
+    let transient = root.path().join("writer.tmp");
+    std::fs::write(&transient, "lease").unwrap();
+    std::fs::write(root.path().join("Module.bsl"), "source").unwrap();
+    let mut removed = false;
+    let snapshot = tree_snapshot_with_before_stat(root.path(), &mut |path| {
+        if path == transient {
+            assert!(!removed, "the listed entry is visited once");
+            std::fs::remove_file(path).unwrap();
+            removed = true;
+        }
+    });
+    assert!(removed, "read_dir must deliver the transient entry before it is removed");
+    assert!(!snapshot.entries.contains_key("writer.tmp"));
+    assert!(snapshot.entries.contains_key(""));
+    assert_eq!(snapshot.entries.len(), 2);
+    let source = &snapshot.entries["Module.bsl"];
+    assert_eq!(source.kind, "file");
+    assert_eq!(source.hash.as_deref(), Some(blake3::hash(b"source").to_hex().as_str()));
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "source path disappeared after removal")]
+fn a_tracked_source_removed_after_it_was_recorded_is_reported() {
+    let root = tempfile::tempdir().unwrap();
+    // The legacy namespace permits directory-size changes, but its flat canaries stay tracked.
+    let canary = root.path().join(".build").join("canary.bsl");
+    std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
+    std::fs::write(&canary, "source").unwrap();
+    let before = tree_snapshot(root.path());
+    std::fs::remove_file(&canary).unwrap();
+    assert_tree_unchanged_except_workspace_cache(
+        &before,
+        root.path(),
+        &root.path().join(".build/workspaces/v1/cache"),
+        "after removal",
+    );
 }
 
 fn snapshot_report(snapshot: &TreeSnapshot) -> Value {

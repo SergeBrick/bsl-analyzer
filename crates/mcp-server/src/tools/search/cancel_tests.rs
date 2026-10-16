@@ -136,7 +136,10 @@ fn a_search_waiting_for_the_engine_lock_returns_at_its_cancellation() {
             let call = Arc::clone(&call);
             move || call(&engine, &cancel)
         });
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            crate::change_hub::test_support::eventually(|| engine.queued() == 1),
+            "{name}: the call did not queue on the lock"
+        );
         cancel.cancel();
         // The lock stays held through the control below, so a call that waited for it
         // instead of its cancellation never comes back before the watchdog.
@@ -407,7 +410,11 @@ fn a_search_inside_the_query_embed_holds_no_lock_and_returns_at_its_cancellation
             assert!(deadline.allows(), "{name}: the embed never reached the embedder");
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // A call that took the lock before it embeds holds it already; the timing profile also
+        // gives a call that would take it during the embed a moment to do so.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(engine.try_lock().is_ok(), "{name}: the engine lock is held across the embed");
         assert_eq!(embedder.accepted(), 1, "{name}: exactly one embed per query");
 

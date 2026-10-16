@@ -42,14 +42,14 @@ const SWEEP_STAND_BODIES: usize = 100;
 /// How long the sweep is left to run before it is cancelled.
 const SWEEP_DWELL: Duration = Duration::from_secs(2);
 
-/// Bound on any wait for the server to answer or for an owner to leave. It is a hang guard:
-/// every such wait ends on its own when the code is right, so the bound is only ever reached
-/// by a server that never answers, and no assertion depends on how long the answer took.
-const HANG_GUARD: Duration = Duration::from_secs(180);
+/// Bound on any wait for the server to answer or for an owner to leave, under
+/// `timing_contract`; none otherwise (see [`test_utils::wait`]). It is a hang guard: every
+/// such wait ends on its own when the code is right, so the bound is only ever reached by a
+/// server that never answers, and no assertion depends on how long the answer took.
+const HANG_GUARD: Duration = test_utils::wait::ceiling(Duration::from_secs(180));
 
 /// Polls `tasks/get` at this interval, for at most [`HANG_GUARD`] worth of polls.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const POLL_ATTEMPTS: u32 = (HANG_GUARD.as_millis() / POLL_INTERVAL.as_millis()) as u32;
 
 /// Enough modules that a cold resident is still building when the first call arrives. A
 /// smaller stand lets the build win the race, and the gates that need an unready resident
@@ -198,7 +198,7 @@ impl Wire {
         settled: impl Fn(&Value) -> bool,
     ) -> Value {
         let mut last = Value::Null;
-        for _ in 0..POLL_ATTEMPTS {
+        for _ in 0..test_utils::wait::polls(HANG_GUARD, POLL_INTERVAL) {
             let answer = self.get_task(task_id).await;
             let task = &answer["result"];
             if settled(task) {
@@ -383,6 +383,10 @@ async fn cancelling_a_waiting_handle_settles_it() {
 /// taken under the same load: a released resident answers in a small fraction of the time the
 /// sweep takes to finish, and an abandoned one answers only after the sweep has finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(timing_contract),
+    ignore = "timing contract: the verdict is a comparison of two waits, and the dwell is real time"
+)]
 async fn cancelling_a_working_handle_stops_the_read_and_frees_the_resident() {
     arm_the_branch();
     let live_stand = stage(SWEEP_STAND_MODULES, SWEEP_STAND_BODIES);

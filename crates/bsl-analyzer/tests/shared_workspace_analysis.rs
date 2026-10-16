@@ -16,7 +16,7 @@ type Client = RunningService<RoleClient, ()>;
 
 /// Bound of a wait for a state that a regression would never reach; a hang watchdog, not a
 /// latency measure.
-const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 const CALLER: &str =
     include_str!("fixtures/shared_workspace_analysis/CommonModules/Потребитель/Ext/Module.bsl");
@@ -56,7 +56,8 @@ async fn mcp_client(root: &Path) -> Client {
 }
 
 async fn poll_tool(client: &Client, tool: &'static str, args: Map<String, Value>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
     loop {
         let result = client
             .call_tool(CallToolRequestParams::new(tool).with_arguments(args.clone()))
@@ -73,7 +74,7 @@ async fn poll_tool(client: &Client, tool: &'static str, args: Map<String, Value>
 }
 
 async fn wait_symbol_status(client: &Client, expected: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let card = poll_tool(
             client,
@@ -93,7 +94,7 @@ async fn wait_symbol_status(client: &Client, expected: &str) -> Value {
 }
 
 async fn wait_symbol_return_type(client: &Client, expected: &str, stale: Option<&str>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "symbol_info never returned type {expected}");
@@ -138,7 +139,7 @@ fn wait_hover_type(
     expected: &str,
     stale: Option<&str>,
 ) -> Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());

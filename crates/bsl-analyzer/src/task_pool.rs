@@ -197,7 +197,7 @@ mod tests {
 
     /// Bound of a wait for a result that a regression would never deliver; a hang
     /// watchdog, not a latency measure.
-    const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
     #[test]
     fn bounded_pool_executes_more_jobs_than_workers() {
@@ -215,7 +215,11 @@ mod tests {
                 let counter = Arc::clone(&counter);
                 let job = move || {
                     let v = counter.fetch_add(1, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(2));
+                    // Slow enough to fill the queue in the timing profile; either way the loop
+                    // takes both turns a full queue and a free one can give it.
+                    if cfg!(timing_contract) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     v + 1
                 };
                 match handle.pool.try_spawn(job) {

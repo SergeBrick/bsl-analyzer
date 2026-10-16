@@ -840,7 +840,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         sample_workspace(dir.path());
         let (graph, hub, stop) = watched_graph(dir.path());
-        let due = Instant::now() + Duration::from_millis(700);
+        // Already run out in an ordinary run, so the watcher alone must notice it; the timing
+        // profile also holds it 700 ms and checks nothing retries before then.
+        let backoff =
+            if cfg!(timing_contract) { Duration::from_millis(700) } else { Duration::ZERO };
+        let due = Instant::now() + backoff;
         graph.fail_with_retry_held_until(due);
 
         assert!(start(&graph, &hub, None, stop.clone()));
@@ -857,7 +861,7 @@ mod tests {
         assert!(Instant::now() >= due);
         stop.stop();
         hub.interrupt_waiters();
-        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually(|| stop.live() == 0));
     }
 
     /// Work handed over inside the sampling window is not slept through.

@@ -6,18 +6,20 @@ use std::time::Duration;
 use mcp_server::McpServer;
 use serde_json::Value;
 
-/// How many times an answer that depends on a write reaching the resident is asked for. The
-/// bound counts asks, not seconds: a starved watcher thread takes longer to deliver, and a
-/// loaded machine stretches every ask, but neither can turn a delivered answer into a failure.
-/// Only an answer that never comes exhausts it, which is a broken mechanism, not a slow one.
+/// How many times an answer that depends on a write reaching the resident is asked for under
+/// `timing_contract`. The bound counts asks, not seconds: a starved watcher thread takes longer
+/// to deliver, and a loaded machine stretches every ask, but neither can turn a delivered answer
+/// into a failure. Only an answer that never comes exhausts it, which is a broken mechanism, not
+/// a slow one. An ordinary run asks until the answer comes.
 const DELIVERY_ATTEMPTS: u32 = 600;
 
-/// The ceiling every hand-written state wait is counted against: one minute, read as polls.
+/// The ceiling every hand-written state wait is counted against: one minute, read as polls,
+/// under `timing_contract`; none otherwise (see [`test_utils::wait`]).
 ///
 /// A poll budget, not a clock: [`Patience::allows`] spends one poll per call, so a wait that
 /// loops on it gives up after the same number of polls however fast the machine is.
 #[allow(dead_code)]
-pub const STATE_CEILING: Duration = Duration::from_secs(60);
+pub const STATE_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 #[allow(dead_code)]
 pub struct Patience {
@@ -68,10 +70,11 @@ impl Drop for Retired {
     }
 }
 
-/// Bound on an owner leaving. An owner always leaves at its next wake, after at most the batch
-/// it has in hand, so this is reached only by an owner that never stops.
+/// Bound on an owner leaving under `timing_contract`; none otherwise. An owner always leaves at
+/// its next wake, after at most the batch it has in hand, so this is reached only by an owner
+/// that never stops.
 #[allow(dead_code)]
-const RETIRE_BUDGET: Duration = Duration::from_secs(180);
+const RETIRE_BUDGET: Duration = test_utils::wait::ceiling(Duration::from_secs(180));
 
 /// Ask until the answer is the one the test asserts, or fail saying it never came.
 ///
@@ -95,7 +98,8 @@ where
     Fut: Future<Output = Value>,
 {
     let mut last = Value::Null;
-    for _ in 0..DELIVERY_ATTEMPTS {
+    let asks = test_utils::wait::polls(ASK_AGAIN_EVERY * DELIVERY_ATTEMPTS, ASK_AGAIN_EVERY);
+    for _ in 0..asks {
         let answer = ask().await;
         if accept(&answer) {
             return answer;

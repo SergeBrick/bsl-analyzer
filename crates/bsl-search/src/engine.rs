@@ -6639,7 +6639,8 @@ mod lifecycle_tests;
 mod tests {
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
 
     /// A pause is reversible, and that is all it is. Held past the end of the pass it paused —
     /// an ordering nothing reaches today and nothing forbade either — a guard that raised the

@@ -1573,6 +1573,10 @@ mod tests {
     /// than leaving it to time out. The tick is half a minute: slept out, a daemon told to
     /// stop keeps a thread walking its workspace for the rest of it.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "timing contract: only the clock tells a woken sweeper from one that slept its tick out"
+    )]
     fn a_shutdown_wakes_the_idle_sweeper_out_of_its_tick() {
         use crate::change_hub::test_support::eventually;
         use std::time::Instant;
@@ -1805,7 +1809,8 @@ mod tests {
         assert!(failed.failed_age_ms.is_some(), "the cause has an age: {:?}", failed.failed_age_ms);
         assert!(failed.elapsed_ms.is_none(), "nothing is building");
 
-        std::thread::sleep(Duration::from_millis(80));
+        // The backoff runs out by the failure's own clock, moved past it rather than slept out.
+        shift_failure_back(&state, Duration::from_millis(80));
         state.ensure_loading();
         wait_ready(&state);
 
@@ -1896,11 +1901,12 @@ mod tests {
         // A pause no run of this test can outlast, so the owed wait below is never zero.
         state.with_retry_pacing_for_test(Duration::from_secs(3600), Duration::from_secs(3600));
         {
+            // Started further back than the deadline, by the build's own clock.
             let mut inner = lock_recover(&state.inner);
             inner.status = DiagnosticsStatus::Loading;
-            inner.loading_since = Some(Instant::now());
+            inner.loading_since = Instant::now().checked_sub(Duration::from_millis(8));
+            assert!(inner.loading_since.is_some(), "the monotonic clock is older than 8 ms");
         }
-        std::thread::sleep(Duration::from_millis(8));
 
         assert!(state.expire_stuck_build(), "an overrun build is published as failed");
         let report = state.status_report();
@@ -2058,6 +2064,14 @@ mod tests {
         assert!(!state.sweeper_running(), "and no loader was started");
     }
 
+    /// Move the recorded failure `by` into the past: the time a retry pause measures has passed,
+    /// with no wait for it.
+    fn shift_failure_back(state: &DiagnosticsState, by: Duration) {
+        let mut inner = lock_recover(&state.inner);
+        let at = inner.failed_at.expect("a failure is on record");
+        inner.failed_at = Some(at.checked_sub(by).expect("the failure is younger than the clock"));
+    }
+
     /// The wait counts DOWN: a poller reading `retry_after_ms` twice sees the remaining pause
     /// shrink, which is the difference between a schedule and a number that never moves.
     #[test]
@@ -2070,7 +2084,7 @@ mod tests {
         state.fail_for_test("synthetic failure");
 
         let first = state.status_report().retry_after_ms.expect("a failure owes a wait");
-        std::thread::sleep(Duration::from_millis(80));
+        shift_failure_back(&state, Duration::from_millis(80));
         let second = state.status_report().retry_after_ms.expect("still owed");
         assert!(second > 0, "the pause is not over within an hour-long base");
         assert!(second < first, "the remaining wait must shrink: {first} ms then {second} ms",);

@@ -1266,10 +1266,14 @@ mod tests {
             done_tx.send(()).unwrap();
         });
         started_rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).unwrap();
-        assert_eq!(
-            done_rx.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
+        // The exit is blocked on the mutex this test holds, so it cannot have finished however
+        // long one looks; the timing profile also gives it a window to try.
+        let overtaken = if cfg!(timing_contract) {
+            done_rx.recv_timeout(Duration::from_millis(50)).is_ok()
+        } else {
+            done_rx.try_recv().is_ok()
+        };
+        assert!(!overtaken, "the exit finished while the waiter held its mutex");
         assert_eq!(owners.live(), 1, "the exit cannot overtake a waiter holding its mutex");
         let (held, result) = owners
             .0
@@ -1327,7 +1331,14 @@ mod tests {
             done_tx.send(()).unwrap();
         });
 
-        done_rx.recv_timeout(Duration::from_secs(1)).expect_err("shutdown must await its owner");
+        // The owner cannot leave before `finish`, so a shutdown that awaits it cannot be done
+        // however long one looks; the timing profile also gives a wrong one a window to finish.
+        let finished = if cfg!(timing_contract) {
+            done_rx.recv_timeout(Duration::from_secs(1)).is_ok()
+        } else {
+            done_rx.try_recv().is_ok()
+        };
+        assert!(!finished, "shutdown must await its owner");
         assert!(lease.owns_caches(), "the lease remains held while the owner may still write");
         finish_tx.send(()).unwrap();
         owner.join().unwrap();
@@ -1707,8 +1718,11 @@ mod background_lifetime_tests {
             eventually(|| state.owners.live() >= 1),
             "no background owner ever started, so the stop below would prove nothing"
         );
-        // Parked in its wait: a consumer caught mid-batch leaves on its own anyway.
-        std::thread::sleep(Duration::from_millis(300));
+        // Parked in its wait, in the timing profile: a consumer caught mid-batch leaves on its
+        // own anyway, so a stop that lands earlier must end it just the same.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
 
         state.shutdown();
 
@@ -1756,6 +1770,10 @@ mod background_lifetime_tests {
     /// nobody owns any more; interrupting its waiters alone does not stop a poll that never
     /// waits on them.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "timing contract: a poll that outlives shutdown shows only over a quiet window"
+    )]
     fn shutdown_stops_a_polling_hub() {
         use crate::change_hub::test_support::eventually;
         use crate::change_hub::{PollConfig, WatchTarget, WorkspaceChangeHub};
@@ -1827,10 +1845,14 @@ mod background_lifetime_tests {
 
         state.shutdown();
 
-        let stopped = hub.poll_count();
-        std::thread::sleep(PERIOD * 6);
-        assert_eq!(hub.poll_count(), stopped, "the blind poll outlived its daemon");
+        // The poller clears its flag on its way out, after its last poll: once it reads clear,
+        // nothing is left to poll the blind roots.
         assert!(eventually(|| !hub.blind_poll_running()), "the blind poller thread is still there");
+        let stopped = hub.poll_count();
+        if cfg!(timing_contract) {
+            std::thread::sleep(PERIOD * 6);
+        }
+        assert_eq!(hub.poll_count(), stopped, "the blind poll outlived its daemon");
     }
 
     /// An owner asleep in a hub wait is released by the stop itself, not by the hub's own
@@ -1842,24 +1864,26 @@ mod background_lifetime_tests {
         use crate::change_hub::WorkspaceChangeHub;
         use std::time::{Duration, Instant};
 
-        const HUB_WAIT: Duration = Duration::from_secs(30);
+        // Under `timing_contract` a minute, and half of it is the bound below; an ordinary run
+        // asks for a wait no run reaches, so an owner that slept through its stop never leaves.
+        const HUB_WAIT: Duration = crate::change_hub::test_support::STATE_CEILING;
         let dir = tempfile::tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
         assert!(hub.wait_until_watching());
 
         // Positive control: with nothing stopped and no event coming, the wait runs out on its
         // own — so the release below is the stop's doing and not the hub returning anyway.
-        let quiet = hub.clone();
-        let ran_out = {
+        if cfg!(timing_contract) {
+            let quiet = hub.clone();
             let since = quiet.generation();
             let started = Instant::now();
             quiet.wait_for_change(since, Duration::from_millis(300));
-            started.elapsed()
-        };
-        assert!(
-            ran_out >= Duration::from_millis(250),
-            "the hub wait returned on its own in {ran_out:?}; it proves nothing about a stop"
-        );
+            let ran_out = started.elapsed();
+            assert!(
+                ran_out >= Duration::from_millis(250),
+                "the hub wait returned on its own in {ran_out:?}; it proves nothing about a stop"
+            );
+        }
 
         let stop = super::OwnerStop::default();
         let woken = hub.clone();
@@ -1875,8 +1899,11 @@ mod background_lifetime_tests {
             owner_hub.wait_for_change_or(since, HUB_WAIT, || owner_stop.is_stopped());
             let _ = left_tx.send(());
         });
-        // Asleep before the stop is raised: the ordering that used to cost a whole wait.
-        std::thread::sleep(Duration::from_millis(200));
+        // Asleep before the stop is raised, in the timing profile: the ordering that used to cost
+        // a whole wait. A stop raised before the owner sleeps must end its wait just the same.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
         assert_eq!(stop.live(), 1, "the owner never started, so its exit proves nothing");
 
         stop.stop();

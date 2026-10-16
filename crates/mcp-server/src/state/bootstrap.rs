@@ -5066,7 +5066,12 @@ mod tests {
         let before = hub.generation();
         fs::write(root.join("Module.bsl"), "Процедура После() КонецПроцедуры").unwrap();
         assert!(crate::change_hub::test_support::eventually(|| { hub.generation() > before }));
-        std::thread::sleep(Duration::from_millis(100));
+        // Nothing tells when the guard has weighed the delivery, so only a quiet window shows a
+        // wrong stop; the window is the timing profile's. The topology change below is the
+        // control that the guard does stop on what it must.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(!owners.is_stopped(), "a BSL body edit remains a hot update");
         assert!(!transport_stop.is_cancelled());
 
@@ -5077,7 +5082,9 @@ mod tests {
         )
         .unwrap();
         assert!(crate::change_hub::test_support::eventually(|| { hub.generation() > before_xml }));
-        std::thread::sleep(Duration::from_millis(100));
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(
             !owners.is_stopped(),
             "ordinary configuration XML data changes do not retire the scope"
@@ -5319,7 +5326,11 @@ mod tests {
         state.baseline = DeferredBaselineRuntime::pending_for_test();
 
         state.ensure_loading_with_wait(std::time::Duration::from_millis(10));
-        std::thread::sleep(std::time::Duration::from_millis(35));
+        // The lifecycle reads `Loading` from the call itself; the pause that lets the loader
+        // spin a few waits first is the timing profile's.
+        if cfg!(timing_contract) {
+            std::thread::sleep(std::time::Duration::from_millis(35));
+        }
 
         assert_eq!(state.lifecycle(), super::ReferenceSearchLifecycle::Loading);
         assert!(state.engine.lock().unwrap().is_none());

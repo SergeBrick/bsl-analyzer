@@ -1377,7 +1377,7 @@ mod tests {
 
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
     const REGISTERED: &str = concat!(
         r#"<response xmlns:debugRDBGRequestResponse="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">"#,
@@ -1762,10 +1762,10 @@ mod tests {
         assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
 
         wait_for_reported_stop(&mut session);
-        assert!(
-            session.wait_for_stop(Duration::from_millis(50)).unwrap().is_none(),
-            "one halt is reported once"
-        );
+        // A second report would come from the announcement the session already holds, so the
+        // answer is there at once; the timing profile also leaves the event stream a window.
+        let window = if cfg!(timing_contract) { Duration::from_millis(50) } else { Duration::ZERO };
+        assert!(session.wait_for_stop(window).unwrap().is_none(), "one halt is reported once");
     }
 
     /// The step lands on the breakpoint line, and a later Continue reaches the same line: the
@@ -2095,7 +2095,11 @@ mod tests {
             warnings.iter().any(|w| w.contains("message-only") && w.contains("refused"))
         });
 
-        let stop = session.wait_for_stop(Duration::from_millis(200)).unwrap();
+        // The message-only event has been handled above, so a stop made of it would be queued
+        // already; the timing profile also leaves the event stream a window.
+        let window =
+            if cfg!(timing_contract) { Duration::from_millis(200) } else { Duration::ZERO };
+        let stop = session.wait_for_stop(window).unwrap();
         assert!(stop.is_none(), "a message-only stop is not a stop: {stop:?}");
     }
 }

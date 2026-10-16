@@ -579,7 +579,9 @@ mod tests {
             })
         };
         assert!(poisoner.join().is_err());
-        let cap = Duration::from_secs(30);
+        // A cap no ordinary run reaches, so an acquire that waited it out never returns; under
+        // `timing_contract` half a minute, and the clock says it was not waited out.
+        let cap = test_utils::wait::ceiling(Duration::from_secs(30));
         let started = Instant::now();
         let outcome = acquire_engine_within(
             &engine,
@@ -590,9 +592,9 @@ mod tests {
         let waited = started.elapsed();
 
         assert!(matches!(outcome, Err(AcquireFailure::Poisoned)));
-        // Half the cap: an acquire that waited the cap out is caught, a slow machine is not.
-        assert!(waited < cap / 2, "poison must not block on the cap: {waited:?}");
         if cfg!(timing_contract) {
+            // Half the cap: an acquire that waited the cap out is caught, a slow machine is not.
+            assert!(waited < cap / 2, "poison must not block on the cap: {waited:?}");
             assert!(
                 waited < Duration::from_secs(1),
                 "poison must not block on the cap: {waited:?}"
@@ -608,10 +610,15 @@ mod tests {
         let engine: crate::state::SharedSearchEngine = crate::state::shared_engine(None);
         let held = engine.lock().unwrap();
         let cancel = CancellationToken::new();
+        // The pause that has the request queued before it is cancelled is the timing profile's;
+        // a cancellation that lands first must end the wait just the same. The cap is one no
+        // ordinary run reaches, so only the cancellation can end the wait.
         let canceller = {
             let cancel = cancel.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                if cfg!(timing_contract) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 cancel.cancel();
             })
         };
@@ -619,7 +626,7 @@ mod tests {
         let outcome = acquire_engine_within(
             &engine,
             &cancel,
-            Duration::from_secs(2),
+            test_utils::wait::ceiling(Duration::from_secs(2)),
             Duration::from_millis(10),
         );
         let waited = started.elapsed();

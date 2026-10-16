@@ -10,6 +10,7 @@ use std::time::Duration;
 /// A joined loopback fixture shared by the native payload integration checks.
 pub(crate) struct PayloadServer {
     pub url: String,
+    address: std::net::SocketAddr,
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -18,28 +19,24 @@ pub(crate) struct PayloadServer {
 impl PayloadServer {
     pub fn new(mut reply: impl FnMut(usize, &[u8]) -> (u16, String) + Send + 'static) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let captured = requests.clone();
         let stopping = stop.clone();
-        // The loop ends at the stop the fixture's `Drop` raises; each exchange is bounded by
-        // the stream timeouts below, so a stuck peer cannot hold it either.
-        let thread = std::thread::spawn(move || {
-            while !stopping.load(Ordering::Acquire) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(stream) => stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(e) => panic!("loopback accept: {e}"),
-                };
-                // Use timeout-bounded blocking I/O even when accept inherits the listener mode.
-                stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        // The loop ends at the stop the fixture's `Drop` raises, woken out of `accept` by the
+        // connection `Drop` makes after it. An exchange waits for its peer as long as the peer
+        // takes; only the timing profile bounds it, so a slow client is never cut off.
+        let thread = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().expect("loopback accept");
+            if stopping.load(Ordering::Acquire) {
+                break;
+            }
+            {
+                let exchange = test_utils::wait::ceiling(Duration::from_secs(2));
+                stream.set_read_timeout(Some(exchange)).unwrap();
+                stream.set_write_timeout(Some(exchange)).unwrap();
                 let mut bytes = Vec::new();
                 let mut buffer = [0; 4096];
                 let body = loop {
@@ -77,7 +74,7 @@ impl PayloadServer {
                 );
             }
         });
-        Self { url, requests, stop, thread: Some(thread) }
+        Self { url, address, requests, stop, thread: Some(thread) }
     }
 
     pub fn requests(&self) -> Vec<Vec<u8>> {
@@ -98,6 +95,7 @@ impl PayloadServer {
 impl Drop for PayloadServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let _ = std::net::TcpStream::connect(self.address);
         let result = self.thread.take().unwrap().join();
         if !std::thread::panicking() {
             result.unwrap();
@@ -360,8 +358,11 @@ fn payload_transport_response_limit_and_timeout_are_independent() {
         "embedding_response_too_large"
     );
     assert_eq!(server.requests().len(), 2);
-    let server = PayloadServer::new(|i, body| {
-        std::thread::sleep(Duration::from_millis(100));
+    // The answer is held until the client has given up, so the client's own deadline is the
+    // only thing that can end the exchange, however the two are scheduled.
+    let (answer, held) = std::sync::mpsc::channel::<()>();
+    let server = PayloadServer::new(move |i, body| {
+        let _ = held.recv();
         success(i, body)
     });
     let mut embedder = Embedder::new(server.config(4096));
@@ -371,4 +372,5 @@ fn payload_transport_response_limit_and_timeout_are_independent() {
         .new_agent();
     assert_eq!(embedder.embed("small").unwrap_err().to_string(), "embedding_timeout");
     assert_eq!(server.requests().len(), 1);
+    answer.send(()).unwrap();
 }

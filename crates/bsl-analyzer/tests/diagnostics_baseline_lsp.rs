@@ -174,6 +174,10 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
 /// wait that could only ever report "Timeout" after a minute could not tell this case
 /// from a server still working, which is what every timeout in this family looked like.
 #[test]
+#[cfg_attr(
+    not(timing_contract),
+    ignore = "timing contract: an idle verdict reads CPU use over a real silence window"
+)]
 fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
     let dir = project();
     let lsp = Lsp::start(dir.path());
@@ -206,6 +210,10 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
 }
 
 #[test]
+#[cfg_attr(
+    not(timing_contract),
+    ignore = "timing contract: the verdict depends on a producer keeping a real-time cadence"
+)]
 fn a_continuous_unrelated_message_stream_cannot_extend_a_wait_past_its_ceiling() {
     let dir = project();
     let mut lsp = Lsp::start(dir.path());

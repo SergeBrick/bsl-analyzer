@@ -690,7 +690,7 @@ mod tests {
 
     /// Bound of a wait for a task that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
     fn response_task(task: Task) -> Response {
         match task {
@@ -1123,9 +1123,8 @@ mod tests {
         let token = state.request_tokens.get(&id).expect("attempt token is registered").clone();
         crate::server::handle_task(&mut state, task)
             .expect("event loop applies request completion");
-        let lsp_server::Message::Response(response) = client_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("event loop sends one response")
+        let lsp_server::Message::Response(response) =
+            client_receiver.recv_timeout(HANG_WATCHDOG).expect("event loop sends one response")
         else {
             panic!("expected request response")
         };

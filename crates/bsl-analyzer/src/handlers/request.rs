@@ -2462,10 +2462,12 @@ mod tests {
     /// How long a stand waits for a thread to reach a parked or published state before
     /// calling the test hung. Scheduling latency on a loaded machine is the only thing
     /// it absorbs, so it is generous and nothing is measured against it.
-    const PARK_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+    const PARK_HANG_GUARD: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
 
     /// A symbol whose range does not project onto the open buffer is the one case where a
     /// map can lie without looking wrong: the answer stays well-formed while a method — or

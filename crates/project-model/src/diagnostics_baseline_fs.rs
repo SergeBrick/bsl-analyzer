@@ -361,7 +361,8 @@ mod tests {
 
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
 
     /// Opening a FIFO that has no writer blocks forever, and these calls run inside
     /// LSP and MCP request handling. The type must be rejected before the open, not

@@ -3094,28 +3094,38 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
-        // Read before the releaser starts its sleep, so the release can only come later.
+        // Read before the releaser starts its sleep, so the release can only come later. The
+        // sleep that makes slices expire first is the timing profile's; an ordinary run
+        // releases whenever the releaser gets there, and the budget is one no run reaches.
         let started = Instant::now();
         let releaser = {
             let hold = hold.shared();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
+                if cfg!(timing_contract) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 hold.release();
             })
         };
         let armed = SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
-            super::WatchWaitPolicy::new(Duration::from_millis(5), Duration::from_secs(30)),
+            super::WatchWaitPolicy::new(
+                Duration::from_millis(5),
+                crate::change_hub::test_support::STATE_CEILING,
+            ),
         );
         let waited = started.elapsed();
         releaser.join().unwrap();
 
         assert!(armed, "a hub that is merely slow to start must not be given up on");
-        assert!(
-            waited >= Duration::from_millis(100),
-            "the wait has to have crossed several expired slices to prove it resumed: {waited:?}"
-        );
+        if cfg!(timing_contract) {
+            assert!(
+                waited >= Duration::from_millis(100),
+                "the wait has to have crossed several expired slices to prove it resumed: \
+                 {waited:?}"
+            );
+        }
     }
 
     /// The budget is what bounds the wait — not a count of slices, which is what a naive
@@ -3163,9 +3173,10 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
-        // A slice far longer than the budget: a wait that spent one whole slice is caught at
-        // half of it, a bound no slow machine reaches for a twenty-millisecond budget.
-        let slice = Duration::from_secs(30);
+        // A slice far longer than the budget: one no ordinary run reaches, so a wait that spent
+        // a whole slice never returns; under `timing_contract` half a minute, caught at half of
+        // it, a bound no slow machine reaches for a twenty-millisecond budget.
+        let slice = test_utils::wait::ceiling(Duration::from_secs(30));
         let started = Instant::now();
         let armed = SharedState::await_watch(
             &hub,
@@ -3175,11 +3186,11 @@ mod tests {
         let waited = started.elapsed();
 
         assert!(!armed, "the hub is held short of arming");
-        assert!(
-            waited < slice / 2,
-            "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
-        );
         if cfg!(timing_contract) {
+            assert!(
+                waited < slice / 2,
+                "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
+            );
             assert!(
                 waited < Duration::from_millis(200),
                 "a budget of 20ms must not be spent as a {slice:?} slice: {waited:?}"
@@ -3199,18 +3210,23 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
+        // A budget no ordinary run reaches: a wait that spent it never returns. Under
+        // `timing_contract` ten minutes, and the clock says it was not spent.
         let started = Instant::now();
         assert!(!SharedState::await_watch(
             &hub,
             &crate::state::OwnerStop::default(),
-            super::WatchWaitPolicy::new(Duration::from_millis(50), Duration::from_secs(600))
+            super::WatchWaitPolicy::new(
+                Duration::from_millis(50),
+                test_utils::wait::ceiling(Duration::from_secs(600)),
+            )
         ));
         let waited = started.elapsed();
-        assert!(
-            waited < crate::change_hub::test_support::STATE_CEILING,
-            "a permanent failure is not something to spend a budget on: {waited:?}"
-        );
         if cfg!(timing_contract) {
+            assert!(
+                waited < crate::change_hub::test_support::STATE_CEILING,
+                "a permanent failure is not something to spend a budget on: {waited:?}"
+            );
             assert!(
                 waited < Duration::from_secs(5),
                 "a permanent failure is not something to spend a budget on: {waited:?}"

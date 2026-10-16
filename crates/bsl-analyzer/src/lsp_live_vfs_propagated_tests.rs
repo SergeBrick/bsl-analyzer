@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Bound of a wait for an event a regression would never deliver: ten seconds under
+/// `timing_contract`, none otherwise (see [`test_utils::wait`]).
+const HANG_GUARD: Duration = test_utils::wait::ceiling(Duration::from_secs(10));
+
 #[derive(Clone, Copy)]
 enum OwnerExit {
     PendingWrite,
@@ -213,7 +217,7 @@ fn live_definition_fixture() -> (
 }
 
 fn wait_until_blocked(db: &ide_db::RootDatabaseImpl, baseline: u64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HANG_GUARD;
     loop {
         let blocked = db
             .salsa_event_report()
@@ -251,7 +255,7 @@ fn g1_removed_recursive_invalidates_queued_origin_and_preserves_open_buffer() {
         .on_retryable_latency::<GotoDefinition>(g1_definition_waiting_for_vfs_write)
         .finish();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + HANG_GUARD;
         while !G1_READER_ENTERED.load(Ordering::Acquire) {
             assert!(Instant::now() < deadline, "semantic reader did not enter");
             std::thread::yield_now();
@@ -277,7 +281,7 @@ fn g1_removed_recursive_invalidates_queued_origin_and_preserves_open_buffer() {
 
         let completion = loop {
             let task = task_receiver
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(HANG_GUARD)
                 .expect("writer-cancelled semantic attempt completes");
             if matches!(&task, Task::LatencyRequestFinished { key, .. } if key.id == request_id) {
                 break task;
@@ -430,7 +434,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
             shared_blocking_query(&owner_db, owner_key)
         });
         owner_entered
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HANG_GUARD)
             .expect("peer owns the tracked query before the LSP request");
 
         let task_receiver = state.task_pool.receiver.clone();
@@ -447,7 +451,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
         std::fs::write(&changed, writer_text).expect("write changed source file");
         let observer_db = state.analysis_host.raw_database().clone();
         let observed_writer = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + HANG_GUARD;
             let mut observed = false;
             loop {
                 let cancellation = observer_db
@@ -490,7 +494,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
         let request_id = lsp_server::RequestId::from(731);
         let first_attempt = loop {
             let task = task_receiver
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(HANG_GUARD)
                 .expect("first LSP attempt did not complete");
             if matches!(
                 &task,
@@ -532,7 +536,7 @@ fn g1_propagated_cancellation_from_live_writer_retries_only_after_new_revision()
             .expect("admit original request through production router");
         let retry_task = loop {
             let task = task_receiver
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(HANG_GUARD)
                 .expect("production retry did not complete");
             if matches!(
                 &task,
@@ -635,7 +639,7 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
             shared_blocking_query(&owner_db, owner_key)
         });
         owner_entered
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(HANG_GUARD)
             .expect("peer owns the tracked query before the LSP request");
 
         let task_receiver = state.task_pool.receiver.clone();
@@ -654,7 +658,7 @@ fn g1_propagated_cancellation_from_real_query_panic_is_terminal_internal_error()
         let request_id = lsp_server::RequestId::from(732);
         let first_attempt = loop {
             let task = task_receiver
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(HANG_GUARD)
                 .expect("panicking LSP attempt did not complete");
             if matches!(
                 &task,

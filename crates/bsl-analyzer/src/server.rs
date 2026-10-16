@@ -2246,11 +2246,13 @@ mod tests {
     /// Hang guard for a response that the test has already caused to be sent.
     /// Not an expected wait: notifications may precede the response, so the
     /// reader must not sleep for a particular arrival order.
-    const CLIENT_RESPONSE_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+    const CLIENT_RESPONSE_HANG_GUARD: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(10));
 
     /// Bound of a wait for an event that a regression would never deliver. A watchdog
     /// against hangs, not a latency measure: a slow machine must never reach it.
-    const HANG_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+    const HANG_WATCHDOG: std::time::Duration =
+        test_utils::wait::ceiling(std::time::Duration::from_secs(60));
 
     /// Read client messages until the `Response` for `id`.
     ///

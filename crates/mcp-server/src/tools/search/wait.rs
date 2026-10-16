@@ -106,10 +106,14 @@ mod tests {
     fn a_cancelled_request_stops_waiting_for_a_silent_producer() {
         let (tx, rx) = mpsc::channel::<u8>();
         let cancel = CancellationToken::new();
+        // The pause that has the caller waiting before the cancellation is the timing
+        // profile's; a cancellation that lands first must end the wait just the same.
         let canceller = {
             let cancel = cancel.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                if cfg!(timing_contract) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 cancel.cancel();
             })
         };

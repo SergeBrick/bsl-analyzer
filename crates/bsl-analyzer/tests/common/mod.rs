@@ -16,15 +16,19 @@ use serde_json::{json, Value};
 
 pub const BROKEN: &str = "Процедура Тест(\n";
 
-/// Silence a server at rest is allowed before a wait is judged lost.
-pub const SILENCE: Duration = Duration::from_secs(60);
+/// Silence a server at rest is allowed before a wait is judged lost: a minute under
+/// `timing_contract`. An ordinary run judges no wait by the clock — a server descheduled on a
+/// loaded machine is as quiet and as idle as a lost one — and waits for the answer itself
+/// (see [`test_utils::wait`]).
+pub const SILENCE: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
-/// Total bound for one wait, even while unrelated messages keep arriving.
-pub const BUSY_CEILING: Duration = Duration::from_secs(10 * 60);
+/// Total bound for one wait, even while unrelated messages keep arriving: ten minutes under
+/// `timing_contract`, none otherwise.
+pub const BUSY_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(10 * 60));
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_SHUTDOWN_TIMEOUT: Duration = test_utils::wait::ceiling(Duration::from_secs(10));
 
 pub fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -58,7 +62,11 @@ pub struct Provocation<F> {
 impl<F: Fn()> Provocation<F> {
     pub fn start(act: F) -> Self {
         act();
-        Self { act, deadline: std::time::Instant::now() + Duration::from_secs(60) }
+        Self {
+            act,
+            deadline: std::time::Instant::now()
+                + test_utils::wait::ceiling(Duration::from_secs(60)),
+        }
     }
 
     pub fn again(&self) {

@@ -919,9 +919,16 @@ mod tests {
         let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
         let dwell = READINESS_POLL * 3;
 
-        tokio::time::sleep(dwell).await;
-        let unattended = diag.access_age();
-        assert!(unattended >= dwell, "nothing has used it yet: {unattended:?}");
+        // The resident's last use is its creation, before the spawn below, so the comparison
+        // in the loop needs no pause to start from; the timing profile also measures one.
+        let unattended = if cfg!(timing_contract) {
+            tokio::time::sleep(dwell).await;
+            let unattended = diag.access_age();
+            assert!(unattended >= dwell, "nothing has used it yet: {unattended:?}");
+            Some(unattended)
+        } else {
+            None
+        };
 
         let manager = TaskManager::new();
         let waited_on = diag.clone();
@@ -950,7 +957,7 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        if cfg!(timing_contract) {
+        if let Some(unattended) = unattended {
             tokio::time::sleep(dwell).await;
             let attended = diag.access_age();
             assert!(

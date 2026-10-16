@@ -702,6 +702,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "timing contract: a spin is a rate over a real second, and a delay is a wait"
+    )]
     fn a_refused_journal_neither_spins_nor_delays_shutdown() {
         let directory = private_temp();
         // A foreign entry makes every append fail closed until someone removes it.

@@ -1632,8 +1632,9 @@ mod tests {
         assert!(matches!(typo0, ResidentOutcome::Ready(true, _)), "initial toml disables Typo");
 
         // Flip the config; mtime/len change is what config drift keys on.
-        std::thread::sleep(Duration::from_millis(10));
-        write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+        edit_moving_mtime(&root.join("bsl-analyzer.toml"), || {
+            write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n")
+        });
 
         // A read sees config drift → full reload (off-thread); poll until it lands.
         wait_until("config edit reloads the resident with the updated diagnostics config", || {
@@ -1674,6 +1675,23 @@ mod tests {
 
     fn restore_mtime(path: &Path, want: std::time::SystemTime) {
         fs::File::options().write(true).open(path).unwrap().set_modified(want).unwrap();
+    }
+
+    /// Run `edit` over the existing file `path` and set its mtime a second past the one it
+    /// had, so the stat the drift scan keys on moves however coarse the filesystem clock and
+    /// however soon after the last write the edit lands.
+    fn edit_moving_mtime(path: &Path, edit: impl FnOnce()) {
+        let before = mtime_of(path);
+        edit();
+        restore_mtime(path, before + Duration::from_secs(1));
+    }
+
+    /// Whether a full rebuild has been asked for, ever: one asked for marks the reload
+    /// running before its thread starts, and the thread counts itself before it lets the
+    /// mark go, so at any moment after the ask one of the two shows it.
+    fn a_rebuild_was_asked_for(state: &DiagnosticsState) -> bool {
+        lock_recover(&state.inner).reload == super::super::types::ReloadState::Running
+            || state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     #[test]
@@ -2701,8 +2719,9 @@ mod tests {
         let disabled0 = state.read(|r, _| r.config().is_disabled(DiagnosticCode::Typo));
         assert!(matches!(disabled0, ResidentOutcome::Ready(true, _)), "initial toml disables Typo");
 
-        std::thread::sleep(Duration::from_millis(10));
-        write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+        edit_moving_mtime(&root.join("bsl-analyzer.toml"), || {
+            write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n")
+        });
 
         // The reload runs off-thread; poll until the re-derived config lands.
         wait_until("a config edit full-rebuilds and re-derives the effective config", || {
@@ -2783,8 +2802,9 @@ mod tests {
 
         // Flip Server→false via the descriptor XML only (no body edit). Its canonical path
         // is outside the root, so the point-refresh cannot own it.
-        std::thread::sleep(Duration::from_millis(10));
-        write_common_module_xml(&real, "Сервер", false);
+        edit_moving_mtime(&real.join("CommonModules/Сервер.xml"), || {
+            write_common_module_xml(&real, "Сервер", false)
+        });
 
         // The full rebuild is async; poll until the edit lands.
         wait_until("an XML edit under a symlinked-outside subtree must not be lost", || {
@@ -3187,7 +3207,6 @@ mod tests {
         let disabled0 = state.read(|r, _| r.config().is_disabled(DiagnosticCode::Typo));
         assert!(matches!(disabled0, ResidentOutcome::Ready(true, _)), "initial toml disables Typo");
 
-        std::thread::sleep(Duration::from_millis(10));
         write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
 
         wait_until("a config edit via drain full-rebuilds and re-derives the config", || {
@@ -3219,7 +3238,6 @@ mod tests {
         wait_ready(&state);
 
         // Force a full rebuild via a config edit and wait for the fresh resident.
-        std::thread::sleep(Duration::from_millis(10));
         write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
         wait_until("the config rebuild completed", || {
             let disabled = state.read(|r, _| r.config().is_disabled(DiagnosticCode::Typo));
@@ -3232,7 +3250,6 @@ mod tests {
 
         // A body edit AFTER the rebuild must reach the freshly-built resident via drain.
         let module = module_path(root, "Сервер");
-        std::thread::sleep(Duration::from_millis(10));
         fs::write(&module, "&НаСервере\nФункция Считать() Экспорт Возврат 42; КонецФункции\n")
             .unwrap();
         // Waited for by THIS file's own baseline row, not by a generation move: the config
@@ -4774,13 +4791,14 @@ mod tests {
             if !close_dir(&closed) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
-            write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+            edit_moving_mtime(&root.join("bsl-analyzer.toml"), || {
+                write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n")
+            });
 
-            // Give a rebuild every chance to run and publish before asserting.
+            // Every read scans and decides on the spot; only the rebuild it might ask for runs
+            // elsewhere, and asking for one is itself visible at once.
             for _ in 0..50 {
                 let _ = state.read(|_, _| ());
-                std::thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(
                 file_id(&state, &hidden),
@@ -4788,11 +4806,10 @@ mod tests {
                 "a rebuild over a half-read tree must not replace the resident",
             );
             // And it was not merely refused at the swap: fifty windows of a config edit
-            // that cannot be applied must not have started fifty resident builds. Only the
-            // operation's own counter can say so — a declined build leaves nothing behind.
-            assert_eq!(
-                state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst),
-                0,
+            // that cannot be applied must not have asked for fifty resident builds. Only the
+            // operation's own record can say so — a declined build leaves nothing behind.
+            assert!(
+                !a_rebuild_was_asked_for(&state),
                 "a rebuild that would be declined is not started at all",
             );
 
@@ -4885,7 +4902,6 @@ mod tests {
                 return;
             }
             let mut observer = hub.subscribe();
-            std::thread::sleep(Duration::from_millis(10));
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
             // Without this the test could pass having never triggered a rebuild at all.
             wait_for_delivery(
@@ -4895,10 +4911,18 @@ mod tests {
                 "the hub delivered the config edit, so the drain will ask for a rebuild",
             );
 
-            for _ in 0..50 {
+            // The rebuild the drain asks for runs on its own thread; the verdict below is about
+            // its swap, so it waits for that rebuild to have run and let its mark go.
+            wait_until("the rebuild the delivered edit asked for has run its course", || {
                 let _ = state.read(|_, _| ());
-                std::thread::sleep(Duration::from_millis(10));
-            }
+                let started = state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst);
+                let reload = lock_recover(&state.inner).reload.clone();
+                if started > 0 && reload == super::super::super::types::ReloadState::Idle {
+                    Ok(())
+                } else {
+                    Err((started, reload))
+                }
+            });
             assert_eq!(
                 file_id(&state, &hidden),
                 Some(before),
@@ -4945,7 +4969,6 @@ mod tests {
                 return;
             }
             let mut observer = hub.subscribe();
-            std::thread::sleep(Duration::from_millis(10));
             // One window carrying both: the config edit asks for the rebuild that will be
             // declined, and the body edit is the bystander whose delivery it consumes.
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
@@ -5054,7 +5077,6 @@ mod tests {
             if !close_dir(&closed) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
             // An object module: ordinary source, so the structure rule lets it through —
             // the only thing that may hold it back is the pending configuration.
             write_catalog(root, "Товары", 9);
@@ -5063,12 +5085,14 @@ mod tests {
                 "Catalogs/Товары/Ext/ObjectModule.bsl",
                 "Процедура ПередЗаписью(Отказ) КонецПроцедуры",
             );
-            write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
+            edit_moving_mtime(&root.join("bsl-analyzer.toml"), || {
+                write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n")
+            });
 
+            // Every read scans and admits on the spot; nothing here waits on another thread.
             let object_module = root.join("Catalogs/Товары/Ext/ObjectModule.bsl");
             for _ in 0..50 {
                 let _ = state.read(|_, _| ());
-                std::thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(
                 file_id(&state, &object_module),
@@ -5104,7 +5128,6 @@ mod tests {
                 return;
             }
             let mut observer = hub.subscribe();
-            std::thread::sleep(Duration::from_millis(10));
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
             wait_for_delivery(
                 &hub,
@@ -5136,9 +5159,9 @@ mod tests {
                 "ObjectModule.bsl",
                 "the hub delivered the new file",
             );
+            // The delivery is in the hub; every read drains and admits on the spot.
             for _ in 0..20 {
                 let _ = state.read(|_, _| ());
-                std::thread::sleep(Duration::from_millis(10));
             }
             assert_eq!(
                 file_id(&state, &object_module),
@@ -5175,7 +5198,6 @@ mod tests {
                 return;
             }
             let mut observer = hub.subscribe();
-            std::thread::sleep(Duration::from_millis(10));
             write(root, "bsl-analyzer.toml", "[diagnostics.parameters]\nTypo = true\n");
             wait_for_delivery(
                 &hub,
@@ -5200,9 +5222,9 @@ mod tests {
                 "Товары.xml",
                 "the hub delivered the new descriptor",
             );
+            // The delivery is in the hub; every read drains and admits on the spot.
             for _ in 0..20 {
                 let _ = state.read(|_, _| ());
-                std::thread::sleep(Duration::from_millis(10));
             }
 
             let module = module_path(root, "Сервер");

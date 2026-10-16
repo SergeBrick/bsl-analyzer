@@ -2260,16 +2260,27 @@ mod tests {
         assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
         let first = stamp();
 
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
         if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
             // Inside the window only while the two fences are less than its second apart.
             assert_eq!(stamp(), first, "a second fence inside the window restamped the record");
         }
 
-        std::thread::sleep(CHECKPOINT_MIN_INTERVAL + Duration::from_millis(100));
+        // Past the window by the lease's own clock, moved back rather than slept out. The
+        // record's mtime is moved back too, so a restamp shows however fine the file clock.
+        {
+            let mut stamped = lock_recover(&lease.inner.stamped_at);
+            let last = stamped.expect("the first fence stamped the record");
+            *stamped = Some(
+                last.checked_sub(CHECKPOINT_MIN_INTERVAL + Duration::from_millis(100))
+                    .expect("the stamp is younger than the clock"),
+            );
+        }
+        let backdated = first - Duration::from_secs(1);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(backdated).unwrap();
         assert!(matches!(restamp(&lease), LeaseOperationOutcome::Applied(())));
-        assert!(stamp() > first, "a fence past the window did not restamp the record");
+        assert!(stamp() > backdated, "a fence past the window did not restamp the record");
     }
 
     /// Throttling the restamp must not throttle the stop check. The two live in one

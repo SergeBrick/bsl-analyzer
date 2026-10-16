@@ -170,8 +170,11 @@ async fn superseded_daemon_lifecycle() {
     }
     assert!(cache.search_db_path().exists(), "workspace search store was initialized");
     new_client.cancel().await.ok();
-    new_server.shutdown();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Waits for the owner's background work to leave, so nothing of it writes after the stamps.
+    new_server.shutdown_within(common::STATE_CEILING);
+    if cfg!(timing_contract) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     let graph_after_owner = stamp(&cache.graph_db_path());
     let search_after_owner = search_storage_stamp(&cache.search_db_path());
 
@@ -199,7 +202,11 @@ async fn superseded_daemon_lifecycle() {
         let _ =
             old_client.call_tool(CallToolRequestParams::new("search").with_arguments(search)).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A superseded daemon that wrote in the background would show only after a quiet window;
+    // the window is the timing profile's, the answers above are every run's.
+    if cfg!(timing_contract) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
     assert_eq!(stamp(&cache.graph_db_path()), graph_after_owner);
     assert_eq!(search_storage_stamp(&cache.search_db_path()), search_after_owner);
 

@@ -47,7 +47,7 @@ const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchan
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
 /// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
 /// latency measure.
-const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 /// Drains child stderr continuously while retaining only a bounded tail. This
 /// keeps native startup diagnostics available without allowing a verbose child
@@ -666,7 +666,9 @@ impl EmbeddingStub {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::{Read, Write};
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
+                            Duration::from_secs(2),
+                        )));
                         let mut request = Vec::new();
                         let mut buf = [0u8; 2048];
                         let mut header_end = None;
@@ -970,7 +972,7 @@ fn wait_for_scope_guard_exit(
 ) -> (ExitStatus, usize) {
     const SCOPE_STOP: &str = "workspace source composition changed; restart/reconnect MCP";
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll scope-guarded native child") {
             break status;
@@ -1074,7 +1076,7 @@ fn wait_for_semantic_scope(
     own_root: &str,
     foreign_root: &str,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let hits = semantic_hits(session, query);
         if hits.iter().any(|hit| hit["modality"] == "S" && hit["root_id"] == own_root) {
@@ -1154,7 +1156,7 @@ fn assert_same_lease_owner(before: &Value, after: &Value, phase: &str) {
 
 #[cfg(unix)]
 fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     while !path.is_file() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1164,7 +1166,7 @@ fn wait_for_file(path: &Path) {
 #[cfg(unix)]
 fn wait_for_embedding(stub: &EmbeddingStub, extension: &str) {
     let count = if extension == "EXT_A" { &stub.seen_a } else { &stub.seen_b };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     while count.load(std::sync::atomic::Ordering::Relaxed) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1185,8 +1187,10 @@ fn http_exchange(
     body: &Value,
     session_id: Option<&str>,
 ) -> (u16, String, Option<Value>) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut stream =
+        TcpStream::connect_timeout(&address, test_utils::wait::ceiling(Duration::from_secs(2)))
+            .unwrap();
+    stream.set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(10)))).unwrap();
     let body = body.to_string();
     let session = session_id.map(|id| format!("Mcp-Session-Id: {id}\r\n")).unwrap_or_default();
     use std::io::Write as _;
@@ -1322,7 +1326,7 @@ fn start_http_scope_session(
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("native HTTP scope fixture starts");
     let mut stderr = StderrCapture::attach(child.stderr.take().unwrap());
-    let health_deadline = Instant::now() + Duration::from_secs(30);
+    let health_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     while !http_health(address) && Instant::now() < health_deadline {
         if let Some(status) = child.try_wait().unwrap() {
             stderr.join();
@@ -1353,7 +1357,7 @@ fn start_http_scope_session(
     );
     assert!((200..300).contains(&status));
 
-    let graph_deadline = Instant::now() + Duration::from_secs(30);
+    let graph_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let status =
             http_call(address, &session_id, 2, "graph", serde_json::json!({"action":"status"}));
@@ -1368,7 +1372,7 @@ fn start_http_scope_session(
         http_call(address, &session_id, 3, "graph", serde_json::json!({"action":"overview"}))
             ["result"]
             .clone();
-    let search_deadline = Instant::now() + Duration::from_secs(30);
+    let search_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let status =
             http_call(address, &session_id, 4, "search", serde_json::json!({"action":"status"}));
@@ -1397,10 +1401,12 @@ fn start_http_scope_session(
 
 #[cfg(unix)]
 fn http_health(address: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) else {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&address, test_utils::wait::ceiling(Duration::from_millis(200)))
+    else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_millis(300))));
     use std::io::Write as _;
     if write!(stream, "GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
         .is_err()
@@ -1434,7 +1440,7 @@ fn graph_overview(session: &mut McpSession) -> Value {
 
 #[cfg(unix)]
 fn wait_for_graph_nodes(session: &mut McpSession, expected: u64) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let graph = graph_overview(session);
         if graph["nodes"].as_u64() == Some(expected) {
@@ -1449,7 +1455,7 @@ fn wait_for_graph_nodes(session: &mut McpSession, expected: u64) -> Value {
 }
 
 fn wait_for_marker(session: &mut McpSession, marker: &str) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let hits = search_marker(session, marker);
         if !hits.is_empty() || Instant::now() >= deadline {
@@ -2106,7 +2112,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("native HTTP MCP process starts");
         let mut stderr = StderrCapture::attach(child.stderr.take().unwrap());
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         while !http_health(address) && Instant::now() < deadline {
             if let Some(status) = child.try_wait().unwrap() {
                 stderr.join();
@@ -2140,7 +2146,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         );
         assert!((200..300).contains(&status), "HTTP initialized notification succeeds");
 
-        let ready_deadline = Instant::now() + Duration::from_secs(30);
+        let ready_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         let mut graph_status = Value::Null;
         while Instant::now() < ready_deadline {
             graph_status =
@@ -2157,7 +2163,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
                 .clone();
         assert_eq!(graph["nodes"], 2, "HTTP graph sees the extension source: {graph}");
 
-        let search_deadline = Instant::now() + Duration::from_secs(30);
+        let search_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         let mut search_status = Value::Null;
         while Instant::now() < search_deadline {
             search_status = http_call(
@@ -2225,7 +2231,7 @@ fn workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean() {
         };
         let signal_result = unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGTERM) };
         assert_eq!(signal_result, 0, "SIGTERM reaches the owned HTTP process {child_pid}");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -2786,7 +2792,10 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let mut daemon = daemon_command.spawn().expect("direct native daemon starts");
     let mut daemon_stderr = StderrCapture::attach(daemon.stderr.take().unwrap());
     let daemon_pid = daemon.id();
-    let daemon_lease = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(30));
+    let daemon_lease = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
     assert_eq!(daemon_lease, daemon_pid, "the direct daemon owns the live lease");
 
     let mut required = McpSession::start_transport(
@@ -2811,7 +2820,7 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let lease_required = lease_receipt(&layout.lease_path(), daemon_pid);
     assert_tree_unchanged(&before, root.path(), "with direct daemon and required proxy alive");
     assert!(required.shutdown().unwrap().success(), "required proxy exits cleanly");
-    let daemon_deadline = Instant::now() + Duration::from_secs(15);
+    let daemon_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
     let daemon_status = loop {
         if let Some(status) = daemon.try_wait().unwrap() {
             break status;
@@ -2831,7 +2840,10 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let mut warm_daemon = daemon_command.spawn().expect("direct native warm daemon starts");
     let mut warm_daemon_stderr = StderrCapture::attach(warm_daemon.stderr.take().unwrap());
     let warm_daemon_pid = warm_daemon.id();
-    let warm_lease_pid = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(30));
+    let warm_lease_pid = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
     assert_eq!(warm_lease_pid, warm_daemon_pid, "warm daemon owns the live lease");
     let mut warm_required = McpSession::start_transport(
         root.path(),
@@ -2848,7 +2860,11 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     assert_eq!(graph_warm_direct, graph_required, "direct warm daemon serves the same graph");
     let marker_warm_direct = wait_for_marker(&mut warm_required, "CACHE_LEXICAL_A_235");
     assert!(!marker_warm_direct.is_empty(), "direct warm daemon serves its search marker");
-    let direct_warm_adoption = wait_for_cache_adoption_log(&daemon_log, 0, Duration::from_secs(10));
+    let direct_warm_adoption = wait_for_cache_adoption_log(
+        &daemon_log,
+        0,
+        test_utils::wait::ceiling(Duration::from_secs(10)),
+    );
     assert!(
         !direct_warm_adoption.is_empty(),
         "direct warm daemon must publish the existing graph from disk; daemon log: {}",
@@ -2857,7 +2873,7 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let lease_direct_warm = lease_receipt(&layout.lease_path(), warm_daemon_pid);
     assert_tree_unchanged(&before, root.path(), "with direct warm daemon and required proxy alive");
     assert!(warm_required.shutdown().unwrap().success(), "warm required proxy exits cleanly");
-    let warm_daemon_deadline = Instant::now() + Duration::from_secs(15);
+    let warm_daemon_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
     let warm_daemon_status = loop {
         if let Some(status) = warm_daemon.try_wait().unwrap() {
             break status;
@@ -2896,21 +2912,24 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let broker_cache_adoption = wait_for_cache_adoption_log(
         &daemon_log,
         direct_warm_adoption.len(),
-        Duration::from_secs(10),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
     );
     assert!(
         !broker_cache_adoption.is_empty(),
         "broker-launched warm daemon must publish the existing graph from disk; daemon log: {}",
         std::fs::read_to_string(&daemon_log).unwrap_or_else(|error| error.to_string())
     );
-    let broker_lease_pid = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(10));
+    let broker_lease_pid = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
+    );
     assert_ne!(broker_lease_pid, broker.pid(), "broker proxy and daemon are separate processes");
     let lease_broker = lease_receipt(&layout.lease_path(), broker_lease_pid);
     assert_leaf_artifacts(&layout);
     assert_tree_unchanged(&before, root.path(), "with broker proxy and detached daemon alive");
     assert!(broker.shutdown().unwrap().success(), "broker proxy exits cleanly");
 
-    let cleanup_deadline = Instant::now() + Duration::from_secs(15);
+    let cleanup_deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
     while layout.lease_path().exists() && Instant::now() < cleanup_deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2999,7 +3018,7 @@ fn workspace_cache_scope_s12_proxy_parent_child_composition_mismatch() {
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("isolated native proxy fixture starts");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let status = loop {
         if let Some(status) = driver.try_wait().expect("poll isolated proxy fixture") {
             break status;
@@ -3113,7 +3132,7 @@ fn s12_proxy_scope_mismatch_driver() {
     let gate_for_thread = gate_path.clone();
     let count_for_thread = count_path.clone();
     let barrier = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
         loop {
             let count = std::fs::read_to_string(&count_for_thread)
                 .ok()
@@ -4106,7 +4125,7 @@ impl McpSession {
         self.send(
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         );
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let line = self.stdout.recv_timeout(remaining).unwrap_or_else(|err| {
@@ -4138,7 +4157,8 @@ impl McpSession {
     /// Poll `tool`'s `status` action until its state settles; the settled status.
     fn wait_ready(&mut self, tool: &str) -> Value {
         let mut status = Value::Null;
-        for _ in 0..300 {
+        let step = std::time::Duration::from_millis(50);
+        for _ in 0..test_utils::wait::polls(step * 300, step) {
             status = self.call(tool, serde_json::json!({"action": "status"}))["result"]
                 ["structuredContent"]
                 .clone();
@@ -4401,7 +4421,8 @@ fn wait_external_diagnostics(
     path: &Path,
     accept: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     loop {
         let body = external_diagnostics(session, path);
         if body["stale"] == false && accept(&body) {
@@ -4417,7 +4438,8 @@ fn wait_file_diagnostics(
     path: &Path,
     accept: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     loop {
         let body = session.diagnostics(serde_json::json!({
             "action": "file",
@@ -4434,7 +4456,8 @@ fn wait_file_diagnostics(
 }
 
 fn wait_query_semantics(session: &mut McpSession, query: &str, root_id: &str) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(30));
     loop {
         let reply = session.call(
             "query",

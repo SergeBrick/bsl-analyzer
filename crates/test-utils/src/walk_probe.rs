@@ -160,13 +160,12 @@ impl FirstSpanWaiter {
 
 /// Block until the walk has entered its first file, so a cancel lands mid-flight. A
 /// fixed sleep would race the build of whatever the walk reads first. The bound counts
-/// polls, so a slow machine waits longer for the walk to start instead of failing on it.
+/// polls, and only under `timing_contract`, so a slow machine waits longer for the walk to
+/// start instead of failing on it.
 pub fn await_walk_start() {
-    for _ in 0..60_000 {
-        if entered() > 0 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("the walk never started");
+    let started =
+        crate::wait::poll_until(Duration::from_secs(60), Duration::from_millis(1), || {
+            entered() > 0
+        });
+    assert!(started, "the walk never started");
 }

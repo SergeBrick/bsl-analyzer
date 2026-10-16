@@ -3173,8 +3173,13 @@ mod ticker_tests {
 
     #[test]
     fn note_stamps_position_and_resets_stall_clock() {
-        let ticker = GraphBuildTicker::default();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Started 30 ms ago by its own clock, rather than slept 30 ms after.
+        let ticker = GraphBuildTicker {
+            started: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(30))
+                .expect("the monotonic clock is older than 30 ms"),
+            ..GraphBuildTicker::default()
+        };
         let before = ticker.ms_since_progress();
         assert!(before >= 30, "the stall clock runs from the ticker's start: {before} ms");
         let noted = std::time::Instant::now();

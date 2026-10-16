@@ -1193,7 +1193,7 @@ mod tests {
 
     /// Bound of a wait for an event that a regression would never deliver; a hang watchdog,
     /// not a latency measure.
-    const HANG_WATCHDOG: Duration = Duration::from_secs(60);
+    const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
     fn fixture(count: usize, bytes_per_file: usize) -> (tempfile::TempDir, loader::Directories) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1812,6 +1812,9 @@ mod tests {
         );
         assert!(registered.keys().all(|path| !path.starts_with(&hidden)));
 
+        // The excluded write goes first: one watcher hands its events over in the order they
+        // happened, so the allowed write is the sentinel — by the time it is delivered, an event
+        // for the excluded one would have been too.
         let hidden_runtime = hidden.join("RuntimeHidden.bsl");
         let allowed_runtime = AsRef::<Path>::as_ref(&root).join("allowed/RuntimeAllowed.bsl");
         std::fs::write(&hidden_runtime, "").unwrap();
@@ -1826,8 +1829,10 @@ mod tests {
                 delivered.extend(event.paths);
             }
         }
-        while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(100)) {
-            delivered.extend(event.paths);
+        if cfg!(timing_contract) {
+            while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(100)) {
+                delivered.extend(event.paths);
+            }
         }
         assert!(
             delivered.iter().any(|path| path.ends_with("RuntimeAllowed.bsl")),

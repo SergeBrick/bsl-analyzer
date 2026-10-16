@@ -716,8 +716,9 @@ mod tests {
     use bsl_search::SearchEngine;
     use tempfile::tempdir;
 
-    /// The shared hang watchdog, in the milliseconds [`wait_for`] counts.
-    const CEILING_MS: u64 = crate::change_hub::test_support::STATE_CEILING.as_millis() as u64;
+    /// The shared hang watchdog's bound under `timing_contract`, in the milliseconds
+    /// [`wait_for`] counts.
+    const CEILING_MS: u64 = 60_000;
 
     #[test]
     fn payload_lifecycle_overlay_failure_and_retry_preserve_the_main_owner() {
@@ -942,14 +943,13 @@ mod tests {
         assert!(matches!(&*retry.semantic_runtime.lock().unwrap(), SemanticRuntimeStatus::Ready));
     }
 
-    fn wait_for(deadline_ms: u64, mut check: impl FnMut() -> bool) -> bool {
-        for _ in 0..(deadline_ms / 10) {
-            if check() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        check()
+    /// Polls `check` until it holds; `deadline_ms` bounds the wait only under `timing_contract`.
+    fn wait_for(deadline_ms: u64, check: impl FnMut() -> bool) -> bool {
+        test_utils::wait::poll_until(
+            Duration::from_millis(deadline_ms),
+            Duration::from_millis(10),
+            check,
+        )
     }
 
     /// A stop that lands while the driver is asking whether it has work leaves it at once,
@@ -1417,6 +1417,10 @@ mod tests {
     /// driver whose exit needs them in one particular sequence is one reordering away from
     /// sitting out a half-hour backoff after the daemon has gone.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "timing contract: only the clock tells an exit on shutdown from a backoff sat out"
+    )]
     fn a_paused_driver_leaves_in_every_shutdown_order() {
         use crate::change_hub::WorkspaceChangeHub;
 

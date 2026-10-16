@@ -5793,18 +5793,22 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use std::{path::PathBuf, sync::Arc};
 
-    /// Attempts a state wait makes before it gives up. The bound is a count of polls, not a
-    /// span of time: a loaded machine stretches every poll, so a state that is merely late
-    /// still arrives inside the bound, and only a state that never comes exhausts it. It
-    /// guards against a hang and is never the thing a test is asserting about.
+    /// Attempts a state wait makes under `timing_contract` before it gives up: a count of polls,
+    /// not a span of time, so a loaded machine that stretches every poll still fits a merely late
+    /// state inside it. An ordinary run makes no such count — see [`test_utils::wait`].
     const STATE_ATTEMPTS: u32 = 6_000;
 
     /// The ceiling every hand-written state wait is counted against: [`STATE_ATTEMPTS`] polls
-    /// at the ordinary ten-millisecond step.
-    pub(crate) const STATE_CEILING: Duration = Duration::from_secs(60);
+    /// at the ordinary ten-millisecond step under `timing_contract`, and none otherwise.
+    pub(crate) const STATE_CEILING: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
+    /// Polls `f` until it holds: a wait for a state the test goes on to assert, bounded by
+    /// [`STATE_CEILING`] only under `timing_contract`.
     pub(crate) fn eventually(f: impl FnMut() -> bool) -> bool {
-        eventually_within(STATE_ATTEMPTS, f)
+        if cfg!(timing_contract) {
+            return eventually_within(STATE_ATTEMPTS, f);
+        }
+        test_utils::wait::poll_until(STATE_CEILING, Duration::from_millis(10), f)
     }
 
     /// The polls a hand-written wait may spend: a ceiling read as "this many polls at one per
@@ -5854,8 +5858,10 @@ pub(crate) mod test_support {
         }
     }
 
-    /// [`eventually`] with a bound of its own, for a wait whose event is scheduled by a
-    /// production retry rather than by the work the test drives.
+    /// [`eventually`] with a bound of its own, in every run: `attempts` polls. For a window a
+    /// test reads either way — a statement given the time to become false before it is
+    /// believed — and for a wait whose event is scheduled by a production retry rather than by
+    /// the work the test drives.
     pub(crate) fn eventually_within(attempts: u32, mut f: impl FnMut() -> bool) -> bool {
         let started = std::time::Instant::now();
         for _ in 0..attempts {
@@ -6651,8 +6657,8 @@ mod tests {
         let budget = Duration::from_secs(30);
         let asked = Instant::now();
         assert_eq!(hub.watch_readiness(budget), WatchReadiness::Failed);
-        assert!(asked.elapsed() < budget / 2, "the failure is answered at once");
         if cfg!(timing_contract) {
+            assert!(asked.elapsed() < budget / 2, "the failure is answered at once");
             assert!(asked.elapsed() < Duration::from_secs(5), "the failure is answered at once");
         }
         assert_eq!(hub.health(), Health::Degraded(DegradeReason::WatcherSetup));
@@ -6668,7 +6674,7 @@ mod tests {
             dir.path().to_path_buf(),
         )]);
 
-        assert_eq!(hub.watch_readiness(Duration::from_millis(50)), WatchReadiness::NotYet);
+        assert_eq!(hub.watch_readiness(Duration::ZERO), WatchReadiness::NotYet);
         assert_eq!(hub.health(), Health::Healthy, "nothing has gone wrong yet");
 
         hold.release();
@@ -8506,6 +8512,10 @@ mod tests {
     /// kept walking the workspace after its daemon stopped would read every file in it on a
     /// schedule nobody owns any more.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "timing contract: a poll that outlives shutdown shows only over a quiet window"
+    )]
     fn shutdown_stops_the_fallback_poll() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("Модуль.bsl"), "Процедура П() КонецПроцедуры\n").unwrap();
@@ -9504,10 +9514,7 @@ mod tests {
         );
         let started = Instant::now();
         hub.shutdown();
-        assert!(
-            eventually_within(500, || !hub.blind_poll_running()),
-            "the blind poll outlived the hub",
-        );
+        assert!(eventually(|| !hub.blind_poll_running()), "the blind poll outlived the hub",);
         if cfg!(timing_contract) {
             assert!(started.elapsed() < Duration::from_secs(5));
         }
@@ -9901,9 +9908,10 @@ mod tests {
     fn interrupted_waiters_return_at_once_and_stay_released() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
-        // Each wait below would sleep a whole minute; half of that tells a released wait from
-        // one that slept on, and no slow machine comes near it.
-        const WAIT: Duration = Duration::from_secs(60);
+        // Each wait below would sleep its whole budget. An ordinary run gives it one no run
+        // reaches, so a wait that comes back at all was released; under `timing_contract` the
+        // budget is a minute, and half of that tells a released wait from one that slept on.
+        const WAIT: Duration = STATE_CEILING;
         let since = hub.generation();
         let waiter = {
             let hub = hub.clone();
@@ -9913,20 +9921,24 @@ mod tests {
                 started.elapsed()
             })
         };
-        std::thread::sleep(Duration::from_millis(100));
+        // Nothing tells when the waiter has parked, and an interruption that lands before it
+        // does must release it just the same; the timing profile aims at the parked wait.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         hub.interrupt_waiters();
         let parked = waiter.join().unwrap();
-        assert!(parked < WAIT / 2, "the parked wait slept on");
 
         let started = Instant::now();
         hub.wait_for_change(hub.generation(), WAIT);
         let later = started.elapsed();
-        assert!(later < WAIT / 2, "a later wait slept on");
         let started = Instant::now();
         hub.watch_readiness(WAIT);
         let readiness = started.elapsed();
-        assert!(readiness < WAIT / 2, "a readiness wait slept on");
         if cfg!(timing_contract) {
+            assert!(parked < WAIT / 2, "the parked wait slept on");
+            assert!(later < WAIT / 2, "a later wait slept on");
+            assert!(readiness < WAIT / 2, "a readiness wait slept on");
             assert!(parked < Duration::from_secs(5), "the parked wait slept on");
             assert!(later < Duration::from_secs(1), "a later wait slept on");
             assert!(readiness < Duration::from_secs(1), "a readiness wait slept on");
@@ -10702,7 +10714,7 @@ mod tests {
         let (hub, hold) = WorkspaceChangeHub::start_targets_held(vec![WatchTarget::recursive(
             dir.path().to_path_buf(),
         )]);
-        assert_eq!(hub.watch_readiness(Duration::from_millis(50)), WatchReadiness::NotYet);
+        assert_eq!(hub.watch_readiness(Duration::ZERO), WatchReadiness::NotYet);
 
         let started = Instant::now();
         drop(hold);

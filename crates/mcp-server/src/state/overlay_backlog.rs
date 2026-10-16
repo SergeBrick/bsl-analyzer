@@ -1457,7 +1457,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let files = 3 * bsl_search::POINT_BATCH_KEYS + 5;
         let shared = engine_over(dir.path(), files);
-        let pacing = Pacing { idle_tick: Duration::from_secs(30), ..FAST };
+        // An idle tick no ordinary run reaches: an owner that pauses on one between batches
+        // never drains. Under `timing_contract` the tick is half a minute and the clock says
+        // how long the drain and its widest gap took.
+        let idle_tick = test_utils::wait::ceiling(Duration::from_secs(30));
+        let pacing = Pacing { idle_tick, ..FAST };
         let (handle, stop) = start(&shared, &WorkspaceLease::unmanaged(), None, pacing);
         for index in 0..files {
             edit(
@@ -1469,14 +1473,15 @@ mod tests {
         let started = Instant::now();
         handle.fresh();
         assert!(eventually(|| backlog(&shared) == 0));
-        assert!(started.elapsed() < pacing.idle_tick, "the backlog waited on an idle tick");
+        let drained = started.elapsed();
         let times = handle.probe.publish_times.lock().unwrap().clone();
         assert!(times.len() >= 4, "{} batches for {files} marks", times.len());
         let widest = times.windows(2).map(|pair| pair[1] - pair[0]).max().unwrap();
-        // A pause between batches is an idle tick spent; half of one is slower than any
-        // machine and faster than the tick.
-        assert!(widest < pacing.idle_tick / 2, "a pause of {widest:?} between batches");
         if cfg!(timing_contract) {
+            assert!(drained < pacing.idle_tick, "the backlog waited on an idle tick");
+            // A pause between batches is an idle tick spent; half of one is slower than any
+            // machine and faster than the tick.
+            assert!(widest < pacing.idle_tick / 2, "a pause of {widest:?} between batches");
             assert!(widest < Duration::from_secs(1), "a pause of {widest:?} between batches");
         }
         finish(&handle, &stop);
@@ -1822,7 +1827,11 @@ mod tests {
         assert!(shared.lock().unwrap().as_ref().unwrap().mark_workspace_path_dirty(&path).unwrap());
         handle.fresh();
         assert!(eventually(|| matches!(handle.state(), BacklogState::Backoff { .. })));
-        std::thread::sleep(Duration::from_millis(300));
+        // An owner that skipped its schedule re-reads at a pace of its own, so only a quiet
+        // window shows it; the window is the timing profile's.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(handle.probe.captures.load(Ordering::SeqCst), 1, "the failing key was re-read");
         assert_eq!(backlog(&shared), 1, "the failing key lost its mark");
         finish(&handle, &stop);
@@ -1913,7 +1922,7 @@ mod tests {
         let asked = Instant::now();
         stop.stop();
         handle.stop();
-        assert!(crate::change_hub::test_support::eventually_within(100, || stop.live() == 0));
+        assert!(crate::change_hub::test_support::eventually(|| stop.live() == 0));
         if cfg!(timing_contract) {
             assert!(asked.elapsed() < Duration::from_secs(1));
         }

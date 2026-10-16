@@ -2143,7 +2143,7 @@ mod tests {
         assert!(view.pending);
         assert!(view.external.is_none());
         assert!(view.configured.is_none());
-        assert!(!deferred.wait_ready(Duration::from_millis(30)), "a pending slot times out");
+        assert!(!deferred.wait_ready(Duration::ZERO), "a pending slot is not ready");
 
         let waiter = deferred.clone();
         let handle = std::thread::spawn(move || {
@@ -2166,8 +2166,9 @@ mod tests {
 
     #[test]
     fn deferred_slot_shutdown_wakes_a_pending_waiter() {
-        // The waiter's budget runs out with the same `false` a wake produces, so only the time
-        // tells the two apart. A budget of the shared ceiling makes half of it a bound that
+        // The waiter's budget runs out with the same `false` a wake produces. An ordinary run
+        // gives it a budget no run reaches, so a waiter that comes back at all was woken; under
+        // `timing_contract` the budget is the shared ceiling, and half of it is a bound that
         // catches a waiter left to time out and that no slow machine comes near.
         const BUDGET: Duration = crate::change_hub::test_support::STATE_CEILING;
         let deferred = DeferredBaselineRuntime::pending_for_test();
@@ -2176,7 +2177,11 @@ mod tests {
         let handle = std::thread::spawn(move || {
             tx.send(waiter.wait_ready(BUDGET)).unwrap();
         });
-        std::thread::sleep(Duration::from_millis(20));
+        // Nothing tells when the waiter has parked, and a shutdown that lands before it does
+        // must end its wait just the same; the timing profile aims at the parked waiter.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let woken = std::time::Instant::now();
         deferred.shutdown();
@@ -2194,8 +2199,8 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!result.expect("the shutdown left the waiter to its budget"));
-        assert!(waited < BUDGET / 2, "the waiter woke only after {waited:?}");
         if cfg!(timing_contract) {
+            assert!(waited < BUDGET / 2, "the waiter woke only after {waited:?}");
             assert!(waited < Duration::from_millis(200), "the waiter woke only after {waited:?}");
         }
     }
@@ -3114,11 +3119,15 @@ mod tests {
                 let _ = second_tx.send((out, waited.elapsed()));
             });
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // Nothing tells when B has queued, and a cancellation that reaches B before it does
+        // must withdraw it just the same; the timing profile aims at the queued B.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         cancel.cancel();
-        // Bounded: a B that waits for A's latched query instead of its own cancellation
-        // must fail this gate, not hang it. A stays latched until B is back, so such a B
-        // never comes back before the watchdog.
+        // A stays latched until B is back, so a B that waits for A's latched query instead of
+        // its own cancellation never comes back: the run hangs, and under `timing_contract`
+        // the watchdog fails it.
         let (out, waited) = second_rx
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("B never came back from its wait");

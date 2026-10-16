@@ -83,17 +83,23 @@ PR (`:798`, `if: github.event_name != 'pull_request'`).
    событий в этих тестах — миллисекунды, так что 10 с дают запас на три-четыре
    порядка. Тот же порог разведка использовала при классификации; на нём
    построен сканер A2.
-2. **Срок положительного ожидания поднимается до общего потолка крейта, а не
-   до 10 с.** Ожидание события, которое при регрессии не наступит никогда,
-   ограничивается существующей общей константой:
-   - `change_hub::test_support::STATE_CEILING` = 60 с
-     (`crates/mcp-server/src/change_hub.rs:5804`) — в mcp-server;
-   - `graph::test_support::WAIT_CEILING` = 30 с
-     (`crates/mcp-server/src/graph/test_support.rs:76`) — в тестах графа;
-   - в остальных крейтах — одна константа `HANG_WATCHDOG` = 60 с на тестовый
-     модуль.
+2. **Срок положительного ожидания поднимается до общего потолка, а не до
+   10 с.** Ожидание события, которое при регрессии не наступит никогда,
+   ограничивается так:
+   - в `crates/mcp-server/src/` — существующая
+     `change_hub::test_support::STATE_CEILING` = 60 с (`change_hub.rs:5804`),
+     в тестах графа — `graph::test_support::WAIT_CEILING` = 30 с
+     (`graph/test_support.rs:76`);
+   - в `crates/mcp-server/tests/` — существующая `common::STATE_CEILING` = 60 с
+     (`crates/mcp-server/tests/common/mod.rs:20`) с `common::Patience` (`:23`);
+   - в остальных крейтах общей константы нет. Каждый затронутый тестовый
+     модуль вводит **новую** константу `HANG_WATCHDOG` = 60 с, равную
+     `STATE_CEILING`.
 
-   Произвольное новое число не вводится.
+   Другие числа не вводятся. Если тест сам задаёт срок ожидания (например
+   10 с или 30 с), этот срок тоже заменяется потолком. Существующие помощники
+   со сторожем ≥ 10 с, например `CLIENT_RESPONSE_HANG_GUARD` (шаг 2), не
+   меняются.
 3. **Граница «половина бюджета».** Если регрессия видна только по тому, что
    код прождал продуктовый бюджет B, а B ≥ 20 с, утверждение остаётся в
    обязательном прогоне в форме `elapsed < B / 2`. Такая граница ≥ 10 с,
@@ -244,11 +250,14 @@ Id 731 принадлежит только этому тесту (`:438`, `:490`
 - **A2** — ожидания со сроком < 10 с в тестовом коде: 82.
 - **A3** — `thread::sleep`/`time::sleep` в тестовом коде: 421, из них 87 в
   `crates/mcp-server/src/diagnostics_state/drift.rs`.
+- **A10** — вычисляемые дедлайны `Instant::now() + Duration::from_…(< 10 с)`
+  в тестовом коде, которых A2 не видит: 28.
 
 Каждое место A1–A3 разведчики разобрали по пяти группам: bsl-analyzer 128,
 mcp-server state/change_hub/lease/lib/baseline 198, mcp-server
 graph/tools/tasks/tests 167, остальные крейты 52, `diagnostics_state` 107. По
-каждому месту есть `файл:строка`. Подмножество в границе — тесты шагов 2–7.
+каждому месту есть `файл:строка`. 28 строк A10 разобраны в этом плане: 15 —
+в шагах 4 и 6, 13 — в Приложении Б. Подмножество в границе — тесты шагов 2–7.
 
 Почему граница шире кандидатов run 5328. Кандидаты — четыре файла, а
 требование владельца касается всего обязательного прогона. Те же классы
@@ -358,18 +367,21 @@ SEEN (шаг 6) и g1 (шаг 2).
 
 | Тест | Место | Класс | Решение |
 |---|---|---|---|
-| `g1_workspace_diagnostic_real_partial_is_terminal_after_pending_write` | `crates/bsl-analyzer/src/server.rs:4545`, `:4758` (50 мс) | SHORT | В: `recv_timeout(deadline − now)` внутри существующего 10-секундного дедлайна (`:4751`) |
+| `g1_workspace_diagnostic_real_partial_is_terminal_after_pending_write` | `crates/bsl-analyzer/src/server.rs:4545`, `:4758` (50 мс), дедлайн `:4751` (10 с) | SHORT | В: дедлайн `:4751` = `HANG_WATCHDOG`, `recv_timeout(deadline − now)` |
 | `bounded_pool_executes_more_jobs_than_workers` | `crates/bsl-analyzer/src/task_pool.rs:199`, `:222`, `:232` | SHORT | В |
 | `try_spawn_reports_full_and_recovers` | `task_pool.rs:291`, `:322` | SHORT | В |
 | `panicking_job_does_not_kill_pool` | `task_pool.rs:341`, `:350` | SHORT | В |
 | `on_latency_happy_path`, `on_latency_panic_becomes_internal_error`, `on_latency_duplicate_id_cancels_previous`, `late_cancel_after_completion_is_noop` | `crates/bsl-analyzer/src/handlers/dispatch.rs`: ожидания 5 с на `:783`, `:810`, `:844`, `:1120` (последний тест объявлен на `:1101`) | SHORT | В |
 | `vector_journal_failure_keeps_stdout_protocol_only` | `crates/bsl-analyzer/tests/vector_journal_cli.rs:91` | SHORT | В. CI `:311` |
 | `watched_bsl_remove_and_recreate_updates_both_protocols` | `crates/bsl-analyzer/tests/shared_workspace_analysis.rs:425`, `:450`, `:478` | SLEEP (8 × 25 мс) | Н: цикл до условия с дедлайном файла (как `:55-68`) |
-| `source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics` | `crates/bsl-analyzer/tests/shared_workspace_analysis_s6.rs:260`, ожидание `:367` | SHORT (5 с) | В (30 с, как дедлайны файла) |
+| `source_set_change_retires_mcp_scope_and_reconnects_to_new_semantics` | `crates/bsl-analyzer/tests/shared_workspace_analysis_s6.rs:260`, ожидание `:367` | SHORT (5 с) | В (`HANG_WATCHDOG`) |
 | `invalid_project_config_preserves_lsp_and_rejects_mcp_until_repair`, `unknown_and_excluded_rooted_paths_do_not_collide` | `crates/bsl-analyzer/tests/shared_workspace_analysis_s10.rs:358` (ожидание `:479`), `:492` (ожидание `:650`) | SHORT | В |
 | `McpSession::shutdown` (все `workspace_cache_scope_*`) | `crates/bsl-analyzer/tests/source_set_cli.rs:4089-4091` | SHORT (5 с, затем kill и Err) | В. CI `:36`, `:367` |
 | `workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean` | `source_set_cli.rs:1960`; `wait_for_cache_adoption` `:103-112` | SHORT | В. CI `:36`, `:367` |
-| `workspace_cache_scope_s12_proxy_parent_child_composition_mismatch` | `source_set_cli.rs:2870`, драйвер `:3062-3073` | SHORT | В. CI `:36`, `:367` |
+| `workspace_cache_scope_s12_proxy_parent_child_composition_mismatch` | `source_set_cli.rs:2870`, драйвер `s12_proxy_scope_mismatch_driver` `:3062-3073` | SHORT | В. CI `:36`, `:367` |
+| `call_hierarchy_index_single_worker_no_deadlock` | `crates/bsl-analyzer/src/handlers/request.rs:3126`, дедлайны `:3161` (1 с), `:3176` (2 с) | SHORT | В |
+| `call_hierarchy_index_lsp_cancelled_wait_releases_permit_without_cancelling_build` | `request.rs:3303`, дедлайн `:3324` (100 мс) | SHORT | В |
+| помощник `wait_for_scope_guard_exit` и помощник `exercise` теста `workspace_cache_scope_http_cold_and_warm_runs_keep_sources_clean` | `source_set_cli.rs:876`, `:908`; `:1974`, `:2155` (2 с до снятия lease) | SHORT | В. CI `:36`, `:367` |
 | `workspace_cache_scope_optional_journal_overlap_keeps_source_clean` | `source_set_cli.rs:2238`, `:2326` | SHORT | Н: `join` потока stderr после shutdown, затем снимок, как `:898-902` |
 | `workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf` | `source_set_cli.rs:2650`, `:2717` | SHORT | В. CI `:36`, `:367` |
 
@@ -416,7 +428,7 @@ SEEN (шаг 6) и g1 (шаг 2).
 | `a_waiting_task_counts_as_use_of_the_resident` | `crates/mcp-server/src/tasks.rs:918`, `:922`, `:935`, `:939-943` | UPPER (сравнение возрастов) | Н: опрос до `STATE_CEILING`, пока `access_age()` меньше времени с запуска (`mark_in_use` на каждом проходе, `tasks.rs:413`); сравнение — Т |
 | `a_failed_graph_is_retried_when_its_backoff_runs_out` | `crates/mcp-server/src/graph/watcher.rs:839`, `:847-851` | UPPER | Н: прочитать статус, затем `now`; проверить «статус ушёл с `Failed` ⇒ `now ≥ due`» |
 | `a_body_edit_reloads_the_graph_with_no_other_consumer` | `watcher.rs:1055`, `:1076-1081` | TIMER (debounce 150 мс / 1 с, `:29-30`) | И: `revision > before`, `full_builds` не растут; точный счёт — Т |
-| `superseded_daemon_lifecycle` | `crates/mcp-server/tests/superseded_daemon_lifecycle.rs`: `wait_superseded` `:46-55`, инициализация хранилища `:156-161`, `wait_current_graph` `:31-43` | SHORT (5–10 с) | В (`Patience(STATE_CEILING)`) |
+| `superseded_daemon_lifecycle` | `crates/mcp-server/tests/superseded_daemon_lifecycle.rs`: `wait_superseded` `:46-55`, инициализация хранилища `:156-161`, `wait_current_graph` `:31-43` | SHORT (5–10 с) | В: в файл добавляется `mod common;`, ожидания — `common::Patience` с `common::STATE_CEILING` (`crates/mcp-server/tests/common/mod.rs:20`, `:23`) |
 
 **остальные крейты**
 
@@ -463,7 +475,7 @@ SEEN (шаг 6) и g1 (шаг 2).
 
 | Тест | Место | Класс | Решение |
 |---|---|---|---|
-| `the_retry_wait_counts_down` | `crates/mcp-server/src/diagnostics_state/lifecycle.rs:2045`, `:2054` (база 5 с) | UPPER | Н: `with_retry_pacing_for_test(3600 с, 3600 с)` (`:512`) |
+| `the_retry_wait_counts_down` | `crates/mcp-server/src/diagnostics_state/lifecycle.rs:2045`, `:2054` (база 5 с) | UPPER | Н: `with_retry_pacing_for_test(3600 с, 3600 с)` (`:512`). `sleep(80)` (`:2052`) остаётся: он даёт нижнюю границу `first − second ≥ 40` (`:2056-2057`), а медленность её только увеличивает |
 | `a_loading_build_that_overruns_its_deadline_is_published_failed` | `crates/mcp-server/src/diagnostics_state/lifecycle.rs:1872`, `:1897` | UPPER | Н: то же |
 | `a_failed_build_is_retried_after_its_backoff_and_then_succeeds` | `crates/mcp-server/src/diagnostics_state/lifecycle.rs:1770`, `:1784` (база 60 мс) | UPPER | Т для `owed > 0`; то же свойство при базе 3600 с проверяет `a_retry_before_its_backoff_starts_no_build` (`:1832`) |
 | `a_cancel_arriving_during_the_wait_stops_the_retry` | `crates/mcp-server/src/diagnostics_state/session.rs:743`, тикер `:757-766` | WINDOW | Н: отмена из `set_pre_force_probe` (`drift.rs:103`) |
@@ -514,7 +526,7 @@ SEEN (шаг 6) и g1 (шаг 2).
 | `search_status_returns_promptly_with_busy_note_when_engine_lock_is_held` | `crates/mcp-server/src/tools/search/status.rs:1981`, `:1992`, `:2019` | — | Н: держатель отпускает лок по каналу после возврата; вызов в потоке с потолком; `< 2 с` — Т |
 | `search_status_reports_pending_probe_without_blocking` | `crates/mcp-server/src/tools/search/status.rs:1751`, `:1775` | — | Т |
 | `a_cancelled_request_stops_waiting_for_a_silent_producer` | `crates/mcp-server/src/tools/search/wait.rs:106`, `:122` | — | Т |
-| `rendering_cost_stays_proportional_to_the_number_of_findings` | `crates/mcp-server/src/tools/query.rs:983`, `:1009` | замер производительности | Т для границы; если других утверждений нет — O |
+| `rendering_cost_stays_proportional_to_the_number_of_findings` | `crates/mcp-server/src/tools/query.rs:983`, `:1009` | замер производительности | Т для границы `:1009`; утверждение о размере фикстуры (`:990`) остаётся |
 | `cancelling_a_working_handle_stops_the_read_and_frees_the_resident` | `crates/mcp-server/tests/tasks.rs:386`, `:396` (отношение) | — | Т |
 | `superseded_backend_lifecycle` | `crates/mcp-server/tests/broker.rs:247`, `:337-338` | `idle_ttl` 10 с, запас 5 с | Т для окна «ещё жив через 5 с». CI `:531` (тест остаётся) |
 | `a_shutdown_wakes_the_idle_sweeper_out_of_its_tick` | `crates/mcp-server/src/diagnostics_state/lifecycle.rs:1576`, `:1600`, `:1603` | `SWEEP_INTERVAL` = 30 с (`:25`) | Б/2: `< SWEEP_INTERVAL / 2`; `:1600` — В. CI `:150`, `:675` |
@@ -567,15 +579,17 @@ SEEN (шаг 6) и g1 (шаг 2).
 | `a_replacement_waits_for_four_concurrent_reads` | `crates/mcp-server/src/graph/build.rs:2752`, `:2775-2781` | O; та же синхронизация вместо `sleep(150)` |
 | `a_read_during_the_pause_is_refused_after_the_admission_wait` | `crates/mcp-server/src/graph/build.rs:2790`, `:2808-2814` | O; та же синхронизация; окно `[1900, 3500)` сохраняется |
 
-Функциональное свойство «публикатор ждёт читателей не дольше бюджета и
-сохраняет старый граф» остаётся в обязательном прогоне через
+В обязательном прогоне остаётся свойство «читатель, переживший ожидание,
+сохраняет старый граф и замену»: его проверяет
 `a_read_outlasting_the_wait_keeps_the_old_graph_and_the_replacement`
-(`build.rs:2822`). Его единственное временное утверждение — нижняя граница
-`:2837`.
+(`build.rs:2822`). Единственное временное утверждение этого теста — нижняя
+граница `:2837`. Верхняя граница ожидания читателей («не дольше бюджета»)
+в обязательном прогоне не проверяется. Её проверяют только тесты этого шага
+в профиле `timing_contract`.
 
 ### Шаг 8. Сверка
 
-- Повторный запуск A1–A3 и команд таблицы проверок.
+- Повторный запуск A1–A3, A10 и команд таблицы проверок.
 - Мутационные проверки (раздел «Таблица проверок») выполняются локально и в
   PR не коммитятся.
 
@@ -596,11 +610,13 @@ SEEN (шаг 6) и g1 (шаг 2).
   - Свойства: `started = 1 + pending + progress`; `files ≤ 128` у каждой
     записи; Σ`files` = N; `started` без интервальных данных.
 - **И4. Нет коротких положительных сроков.**
-  - Вход: тестовый код после PR, сканер A2.
-  - Свойство: каждая строка вывода A2 есть в A2-части Приложения Б с классом
-    NEG, SYNC или PACE. Сверка по файлу и функции: номера строк могут
-    сдвинуться.
-  - Каждый тест шага 4 с решением В использует общий потолок крейта.
+  - Вход: тестовый код после PR, сканеры A2 и A10.
+  - Свойство: каждая строка вывода A2 и A10 есть в Приложении Б с классом
+    NEG, SYNC, PACE или «не ожидание». Сверка по файлу и функции: номера
+    строк могут сдвинуться.
+  - Срок каждого положительного ожидания из строки с решением В — константа
+    потолка допущения 2. Литеральные сроки остаются только у строк
+    Приложения Б.
 - **И5. Нет временных верхних границ < 10 с в обычном профиле.**
   - Вход: сканер A1f после PR.
   - Сканер расширяется: печатает, стоит ли строка под `timing_contract`.
@@ -610,8 +626,9 @@ SEEN (шаг 6) и g1 (шаг 2).
     - строка A1f-части Приложения Б, где сравнивается не время.
 - **И6. Нет sleep-синхронизации перед положительным утверждением.**
   - Вход: тесты с решением Н в шагах 4 и 6.
-  - Свойство: если убрать из теста любой оставшийся `sleep`, вердикт на
-    корректном коде не меняется.
+  - Свойство: если убрать из теста любой оставшийся `sleep`, кроме
+    помеченных в строке теста как нижняя граница, вердикт на корректном коде
+    не меняется.
 - **И7. Граница Б/2.**
   - Вход: девять тестов с решением Б/2 в шаге 5.
   - Свойство: граница ≥ 10 с и < B.
@@ -620,11 +637,22 @@ SEEN (шаг 6) и g1 (шаг 2).
   - Вход: `graph_data_requests_are_pool_only_under_held_lease` плюс поток,
     который всё окно в цикле зовёт `lease.owns_caches()` (имитация heartbeat).
   - Свойство: тест проходит.
-- **И9. Ожидания графа в SEEN.**
-  - Вход: четыре теста `graph::state`/`graph::build` шага 6; перед окном
-    проверки параллельно зарезервирована проба (имитация фонового обхода).
-  - Свойство: на базе тест падает с тем же текстом, что в CI; после PR
-    проходит.
+- **И9. Ожидания графа в SEEN.** У каждого теста шага 6 свой вход, по его
+  механизму:
+  - `a_chronically_unreadable_subtree_is_probed_but_never_rebuilt` и
+    `a_healed_subtree_is_found_by_the_probe_and_rebuilt` — перед окном
+    проверки параллельно зарезервирована проба (имитация фонового обхода);
+  - `a_build_that_never_started_spends_no_healing` — перед `:8539` вызван
+    `set_reload_running_for_test()` (`state.rs:2295`);
+  - `a_failed_reload_whose_retry_is_held_stays_owed` — между `drive()`
+    (`build.rs:4442`) и `wake_at(now)` (`:4445`) пауза `HELD_RETRY` + 100 мс.
+    Это нижняя граница, поэтому срок удержания истекает гарантированно.
+
+  Свойство:
+  - на базе каждый тест падает с тем же текстом, что в CI;
+  - после PR первые два и четвёртый проходят на том же входе;
+  - третий после PR падает на ожидании `reload != Running` с именем ожидания,
+    а не на `:8552`.
 - **И10. Фикстура payload.**
   - Вход: фикстура `PayloadServer`, которая живёт дольше 30 с (локально —
     дедлайн 0 с на базе).
@@ -659,12 +687,12 @@ SEEN (шаг 6) и g1 (шаг 2).
 | И1 | `cargo test -p parser --test integration_tests -- --list --ignored`, `cargo test -p ide formatting::engine -- --list --ignored` и `cargo test -p mcp-server --lib graph::build::tests -- --list --ignored`, без cfg и с `RUSTFLAGS="--cfg timing_contract"` | без cfg список содержит три теста O шага 5 и три теста шага 7 | с cfg их нет среди ignored; `CARGO_TARGET_DIR=target-timing RUSTFLAGS="--cfg timing_contract" cargo test --workspace` выполняет тесты O и утверждения Т |
 | И2 | три теста шага 2 | локальная мутация: перед последним `handle_task` отправить в канал клиента `Notification` — на базе `:570` падает `expected retry response` | после PR тесты проходят с той же мутацией и без неё |
 | И3 | тесты шага 3 и новый тест с паузой 1,1 с | на базе с той же паузой точное `records.len()` ложно | новый тест и тесты шага 3 проходят |
-| И4 | сканер A2 после PR | на базе 44 из 82 строк A2 (82 − 25 − 13) нет в Приложении Б с классом NEG/SYNC/PACE | каждая строка вывода есть в Приложении Б с классом NEG/SYNC/PACE |
+| И4 | сканеры A2 и A10 после PR; плюс `rg -n 'Duration::from_(secs\|millis)\(' ` по телам тестов с решением В — каждое найденное место либо строка Приложения Б, либо не срок ожидания | на базе 44 из 82 строк A2 (82 − 25 − 13) и 15 из 28 строк A10 нет в Приложении Б с допустимым классом | каждая строка вывода A2 и A10 есть в Приложении Б с допустимым классом; положительные ожидания тестов В используют константу потолка |
 | И5 | расширенный A1f после PR | на базе A1f = 93 строки, из них под `timing_contract` 0, и верхних границ < 10 с среди них больше нуля (например `build.rs:4041`) | вне `timing_contract` — только нижние границы, границы ≥ 10 с и строки Приложения Б без времени |
-| И6 | для каждого теста Н: локально удалить оставшиеся `sleep` и прогнать тест | на базе удаление `sleep(HOLD)` в `try_acquire_engine_queues_until_the_lock_frees` (`acquire.rs:534`) роняет `waited ≥ HOLD/2`: удаление `sleep` видно | после PR каждый тест Н проходит без `sleep` |
+| И6 | для каждого теста Н: локально удалить оставшиеся `sleep`, кроме помеченных как нижняя граница, и прогнать тест | на базе удаление `sleep(HOLD)` в `try_acquire_engine_queues_until_the_lock_frees` (`acquire.rs:534`) роняет `waited ≥ HOLD/2`: удаление `sleep` видно | после PR каждый тест Н проходит без `sleep` |
 | И7 | для каждого теста Б/2 — локальная мутация продукта, при которой код ждёт свой бюджет (например, sweeper не будится при shutdown) | мутация — сам контроль: без неё тест проходит, с ней обязан упасть | с мутацией тест падает на границе `B/2`; без мутации проходит |
 | И8 | `graph_data_requests_are_pool_only_under_held_lease` с потоком-имитатором heartbeat | на базе с тем же потоком `:564` падает `a resident descriptor needs no lease refresh` | после PR проходит |
-| И9 | четыре теста `graph` шага 6 с параллельно зарезервированной пробой | на базе — тот же текст паники, что в CI | после PR проходят |
+| И9 | четыре теста `graph` шага 6, каждый со своим входом из И9 | на базе — тот же текст паники, что в CI | после PR — как сказано в И9 |
 | И10 | тесты фикстуры `PayloadServer` | на базе с дедлайном 0 с — `payload fixture exceeded its watchdog` | после PR проходят; дедлайна в фикстуре нет |
 | И11 | новый тест помощника `walk` с исчезающей записью и тест с исчезающим источником | на базе первый падает `NotFound` на `:380` | после PR первый проходит, второй падает `source path disappeared` |
 | И12 | `cargo test --workspace -- --list 2>/dev/null \| grep -c ': test$'` до и после | число до | после ≥ до; `git diff` не удаляет ни одного `assert` шага 5 с пометкой «остаётся» |
@@ -726,6 +754,8 @@ SEEN (шаг 6) и g1 (шаг 2).
 - **A8**: `gh run list --status failure --limit 100`, затем
   `gh run view <id> --log-failed | grep -E '\.\.\. FAILED|panicked at|test result: FAILED'`
   по каждому run.
+- **A10** (`scan_deadline.py`): `(Instant::now()|now) + Duration::from_{millis,secs}(N)`
+  с N < 10 000 мс в тестовом коде → 28.
 - **A9**: строки A2 и A1f, у которых имя функции (третье поле вывода) не
   встречается в обратных кавычках в шагах 2–7 плана → 29 и 29.
 
@@ -780,3 +810,16 @@ SEEN (шаг 6) и g1 (шаг 2).
 | `mcp-server/tests/references.rs:1959`, `:2001` | — | размер вывода, не время |
 | `ide/tests/partitioned_baseline_scale.rs:206` | вне PR | `#[ignore]`, только push-only job (`ci.yml:798`), см. «Вне рамок» п. 6 |
 | `parser/tests/integration_tests.rs:858` | — | время только в тексте сообщения, утверждение — `result.is_ok()` |
+
+**A10: 13 из 28 строк, которые остаются**
+
+Остальные 15 строк A10 лежат в тестах и помощниках шагов 4 и 6 с решением В.
+
+| Строки | Класс | Почему вердикт не зависит от скорости |
+|---|---|---|
+| `bsl-analyzer/tests/diagnostics_baseline_lsp.rs:62`; `selective_diagnostics_baseline_lsp.rs:163`, `:297` | NEG | срок окна отсутствия сообщения |
+| `bsl-analyzer/tests/source_set_cli.rs:832`, `:840` | не ожидание | уборка процесса `stop_owned_daemon_after_timeout`: утверждения нет |
+| `mcp-server/src/tasks.rs:530` | не ожидание | срок — вход продукта: тест проверяет, что срок сработал, и медленность только откладывает это |
+| `mcp-server/src/graph/debt.rs:2986`, `:3285`, `:4401`, `:4717`; `state/overlay_backlog.rs:1227` | не ожидание | арифметика виртуального времени |
+| `mcp-server/src/state/overlay_backlog.rs:1591` | NEG | окно, в котором лок не должен браться |
+| `mcp-server/src/graph/watcher.rs:843` | не ожидание | ожидаемый срок для импликации шага 4 (`a_failed_graph_is_retried_when_its_backoff_runs_out`) |

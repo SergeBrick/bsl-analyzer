@@ -7932,7 +7932,16 @@ mod tests {
     /// On release the worker carries the debt, drops `acc` and stops on that second read,
     /// holding nothing; this thread waits for the old cursor to leave the map and raises a
     /// fresh window right there, with the worker still in the gap.
+    ///
+    /// The worker is placed past its first read by a pause: nothing it does between that read
+    /// and the accumulator shows outside the hub. A worker the pause has not moved that far
+    /// blocks on the lock this thread then takes, and the two wait on each other, so the stand
+    /// belongs to the timing profile.
     #[test]
+    #[cfg_attr(
+        not(timing_contract),
+        ignore = "timing contract: a pause places the worker past its first read"
+    )]
     fn resubscribing_captures_the_debt_it_carried_before_a_window_can_replace_it() {
         let dir = tempdir().unwrap();
         let hub = WorkspaceChangeHub::start(vec![dir.path().to_path_buf()]);
@@ -8718,7 +8727,11 @@ mod tests {
             batch.entries.iter().any(|entry| entry.raw.ends_with("New.bsl"))
         });
         assert!(delivered, "a change under the blind root never reached the cursor");
-        std::thread::sleep(Duration::from_millis(200));
+        // A reconcile no poll should raise is an absence. Only the timing profile waits a
+        // window out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
         assert_eq!(hub.rescan_request_count(), rescans, "polls raised reconciles of their own");
         hub.shutdown();
     }
@@ -9828,8 +9841,11 @@ mod tests {
             .recv_timeout(crate::change_hub::test_support::STATE_CEILING)
             .expect("the declaration was never asked for");
         // The reconcile is held at the barrier, so the join it would announce cannot come yet. A
-        // window can only hide such a join from this check, never invent one, so it is a window.
-        std::thread::sleep(Duration::from_secs(2));
+        // window can only hide such a join from this check, never invent one, so it is a window,
+        // and only the timing profile waits it out.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
         let joined_at_the_barrier = published_blind(&hub).contains(&c);
 
         barrier.release();

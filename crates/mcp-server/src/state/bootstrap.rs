@@ -4161,7 +4161,11 @@ mod tests {
         fs::create_dir_all(&sibling).unwrap();
         fs::write(sibling.join("Ignored.bsl"), "Процедура Sibling() КонецПроцедуры\n").unwrap();
         fs::write(sibling.join("writer.lease.lock"), "lock\n").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        // An event that should not come is an absence. Only the timing profile waits a window
+        // out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
 
         assert_eq!(
             hub.generation(),

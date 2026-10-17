@@ -2937,7 +2937,11 @@ mod tests {
         .expect("nobody else holds the replacement");
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // A build that should not start is an absence. Only the timing profile waits a window
+        // out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         assert_eq!(graph.full_builds_started.load(Ordering::SeqCst), 0, "nothing was built");
         assert!(!candidate.exists(), "the held replacement is left alone");
         drop(held);

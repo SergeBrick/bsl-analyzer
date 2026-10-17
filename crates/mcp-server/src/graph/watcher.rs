@@ -923,8 +923,11 @@ mod tests {
         // handful of turns in two is the difference being asserted.
         let settled = turns.load(std::sync::atomic::Ordering::SeqCst);
         // An absence can only be observed over a window. The window can hide a spurious turn
-        // from this check, never create one, so it is the one place a clock is read on purpose.
-        std::thread::sleep(Duration::from_secs(2));
+        // from this check, never create one, so it is the one place a clock is read on purpose —
+        // and only in the timing profile, which is where windows are waited out.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
         assert!(
             turns.load(std::sync::atomic::Ordering::SeqCst) <= settled + 2,
             "the owner turns over with nothing handed to it; the assertion above proves nothing",

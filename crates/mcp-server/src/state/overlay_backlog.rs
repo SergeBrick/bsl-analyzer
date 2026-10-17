@@ -1253,8 +1253,10 @@ mod tests {
             );
         }
         // The deadline cannot pass under a stalled observer, so this reading is the same
-        // whenever it is taken.
-        std::thread::sleep(Duration::from_millis(300));
+        // whenever it is taken; only the timing profile waits a window out before it.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             handle.probe.admissions.load(Ordering::SeqCst),
             attempts,
@@ -1283,7 +1285,9 @@ mod tests {
             eventually(|| handle.wakes_consumed() > taken),
             "the wake just before the deadline never reached the owner",
         );
-        std::thread::sleep(Duration::from_millis(300));
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             handle.probe.admissions.load(Ordering::SeqCst),
             attempts,
@@ -1691,8 +1695,11 @@ mod tests {
             );
         }
         // The deschedule this replaces, on purpose: the deadline cannot pass under a stalled
-        // observer, so the reading below is the same whenever it is taken.
-        std::thread::sleep(Duration::from_millis(300));
+        // observer, so the reading below is the same whenever it is taken; only the timing
+        // profile waits a window out before it.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             handle.probe.admissions.load(Ordering::SeqCst),
             attempts,

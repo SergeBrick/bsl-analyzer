@@ -986,7 +986,12 @@ mod tests {
         let held = shared.lock().unwrap();
         retry.start();
         assert!(wait_for(3_000, || stop.live() >= 1), "the driver never started");
-        std::thread::sleep(Duration::from_millis(200));
+        // Gives the driver time to block on the held engine. A stop that comes before it gets
+        // there is read on the way in and proves nothing, but fails nothing either; the pause
+        // that makes the race likely is the timing profile's.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
 
         // The waker runs to completion here: it takes the free state lock, notifies an empty
         // room and returns. Nothing is waiting to be woken.
@@ -1659,7 +1664,11 @@ mod tests {
         // The newer daemon exits cleanly; the old process remains terminally read-only.
         newer.release();
         retry.kick_fresh();
-        std::thread::sleep(Duration::from_millis(300));
+        // A pass that should never come is an absence. Only the timing profile waits a window
+        // out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
         assert_eq!(
             retry.pass_count(),
             terminal_passes,

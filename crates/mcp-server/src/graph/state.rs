@@ -5076,7 +5076,11 @@ mod tests {
 
         lease.release();
         assert!(graph.store.use_file().is_err(), "no use starts after the workspace is lost");
-        std::thread::sleep(Duration::from_millis(200));
+        // A release that should not happen yet is an absence. Only the timing profile waits a
+        // window out for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
         assert!(!graph.released(), "the file is still in use");
         drop(copying);
         wait_until(&graph, "the file to be let go", || graph.released());
@@ -5295,7 +5299,11 @@ mod tests {
         ));
         graph.nudge_rebuild();
         graph.spawn_reload();
-        std::thread::sleep(Duration::from_millis(20));
+        // A superseded graph declines the reload on the spot; a build it should never start is
+        // an absence, and only the timing profile waits a window out for it.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(matches!(graph.status(), GraphStatus::Idle));
         assert!(lock_recover(&graph.inner).published.is_none());
     }
@@ -6474,7 +6482,11 @@ mod tests {
                 lock_recover(&graph.inner).published.as_mut().unwrap().force_stale = true;
             })
         };
-        std::thread::sleep(Duration::from_millis(100));
+        // An install that should wait is an absence. Only the timing profile waits a window out
+        // for it; the reading itself holds at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         assert!(
             !installing.is_finished(),
             "a publication was installed while marks were being consumed against another",

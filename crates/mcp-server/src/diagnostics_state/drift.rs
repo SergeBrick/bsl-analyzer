@@ -5405,8 +5405,11 @@ mod tests {
         let never_written = ext.join("CommonModules/Призрак/Ext/Module.bsl");
 
         // A settle window: a negative observation needs time in which the event could
-        // have arrived and did not.
-        std::thread::sleep(Duration::from_millis(500));
+        // have arrived and did not. Only the timing profile waits it out; the readings
+        // themselves hold at any moment.
+        if cfg!(timing_contract) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
 
         let cursor = *lock_recover(&state.hub_cursor);
         assert_eq!(hub.health_for(cursor), Health::Healthy, "the hub is healthy and right");

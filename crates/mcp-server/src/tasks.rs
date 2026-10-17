@@ -871,8 +871,9 @@ mod tests {
     /// stretch before a deadline can be. A build that fails inside that stretch is a terminal
     /// answer — sticky, so nothing will move it — and a task that reports "still building"
     /// over it hands the caller a diagnosis that will never come true. Fails on a build whose
-    /// deadline arm answers on the spot instead of reading once more.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// deadline arm answers on the spot instead of reading once more. The clock is paused, so
+    /// the failure lands before the deadline however slowly the machine runs.
+    #[tokio::test(start_paused = true)]
     async fn a_deadline_does_not_speak_over_an_answered_lifecycle() {
         let diag = DiagnosticsState::for_workspace(std::env::temp_dir());
         let manager = TaskManager::new();

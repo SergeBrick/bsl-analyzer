@@ -7500,8 +7500,9 @@ mod tests {
                             max_active.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
                             // Answer only once two requests have been in flight together, so
                             // the overlap does not depend on how fast the second one arrives.
-                            // A sequential client never gets there and is answered at the
-                            // watchdog, which the concurrency assertion then rejects.
+                            // A sequential client never gets there: under `timing_contract` it
+                            // is answered at the watchdog and the concurrency assertion rejects
+                            // it, while an ordinary run waits for the second request and hangs.
                             let give_up = std::time::Instant::now() + HANG_WATCHDOG;
                             while max_active.load(std::sync::atomic::Ordering::SeqCst) < 2
                                 && std::time::Instant::now() < give_up

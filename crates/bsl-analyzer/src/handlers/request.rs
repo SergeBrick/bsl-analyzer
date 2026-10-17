@@ -4226,21 +4226,28 @@ mod tests {
     /// A `$/cancelRequest` against a reference walk over many files, through the real
     /// door: dispatcher, task pool, `handle_cancel`, response code. The walk is counted
     /// from the span `ide` emits per file, so the cancel is sent on observing the first
-    /// file rather than after a sleep.
+    /// file rather than after a sleep. Other tests of this binary walk references too —
+    /// rename, highlight, the plain handlers — so the count and the hold are claimed for
+    /// the walks under this stand's anchor, the one URI no other test uses.
     mod cancel_walk_tests {
         use super::*;
         use lsp_types::request::References;
         use std::time::Duration;
         use test_utils::walk_probe;
 
-        /// Serialises the tests of this binary that read the process-global walk
-        /// counter; see `test_utils::walk_probe`.
+        /// Serialises the tests below: they share the process-global hold and attribution
+        /// of `test_utils::walk_probe`.
         static WALK_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        /// A test that failed while holding the gate poisons it; the gate guards no
-        /// data, so the next test simply takes it.
-        fn serialised() -> std::sync::MutexGuard<'static, ()> {
-            WALK_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        /// The gate, then the probe claimed for this stand's walks with a zeroed count. A
+        /// test that failed while holding the gate poisons it; the gate guards no data, so
+        /// the next test simply takes it.
+        fn serialised() -> (std::sync::MutexGuard<'static, ()>, walk_probe::Attribution) {
+            let gate = WALK_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            walk_probe::install();
+            let attributed = walk_probe::attribute_to(ROOT);
+            walk_probe::reset();
+            (gate, attributed)
         }
 
         /// Callers of one exported procedure. Enough that an uncancelled walk takes
@@ -4325,7 +4332,8 @@ mod tests {
             client_receiver: &crossbeam_channel::Receiver<lsp_server::Message>,
             id: i32,
         ) -> lsp_server::Response {
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let deadline =
+                std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
             let task_receiver = state.task_pool.receiver.clone();
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4348,8 +4356,6 @@ mod tests {
         #[test]
         fn an_uncancelled_walk_enters_every_caller() {
             let _serialised = serialised();
-            walk_probe::install();
-            walk_probe::reset();
             let (mut state, client_receiver) = stand(None);
 
             dispatch_references(&mut state, 40);
@@ -4366,8 +4372,6 @@ mod tests {
         #[test]
         fn a_client_cancel_stops_the_walk_before_its_end() {
             let _serialised = serialised();
-            walk_probe::install();
-            walk_probe::reset();
             let (mut state, client_receiver) = stand(None);
 
             let held = walk_probe::hold_walk_start();
@@ -4390,8 +4394,6 @@ mod tests {
         #[test]
         fn a_cancelled_walk_hands_its_only_worker_to_the_next_request() {
             let _serialised = serialised();
-            walk_probe::install();
-            walk_probe::reset();
             let (mut state, client_receiver) = stand(Some(1));
 
             let held = walk_probe::hold_walk_start();

@@ -4,10 +4,13 @@
 //! gate can learn that a walk has started — and how many files it entered — without a
 //! `sleep` and without a counter in production code. The price is that the subscriber
 //! and the counter are process-global: every test in a binary that walks references
-//! adds to the same number. A test that reads it must therefore serialise against every
-//! other test in its binary that can move it — a gate mutex owned by that test crate —
-//! else [`await_walk_start`] returns on somebody else's file and the gate measures an
-//! interleaving instead of a cancellation.
+//! adds to the same number, and a held first span is whichever walk gets there first.
+//! A test whose walk runs under a span that names something only it uses — the URI of
+//! its own anchor, say — claims the count and the hold with [`attribute_to`], and walks
+//! of other tests then pass through untouched. A test that cannot name its walk must
+//! serialise against every other test in its binary that can move the counter — a gate
+//! mutex owned by that test crate — else [`await_walk_start`] returns on somebody
+//! else's file and the gate measures an interleaving instead of a cancellation.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -17,6 +20,31 @@ const WALK_SPAN: &str = "find_references_in_file";
 
 /// Files the walk has entered since the last [`reset`].
 static WALKED: AtomicUsize = AtomicUsize::new(0);
+
+/// The marker of the active [`attribute_to`], if any.
+static ATTRIBUTED_TO: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// Extension on a span whose fields mention the active marker; walk spans beneath it are
+/// the attributed walk's.
+struct Attributed;
+
+/// Whether any field of a span mentions `marker`.
+struct Mentions {
+    marker: &'static str,
+    found: bool,
+}
+
+impl tracing::field::Visit for Mentions {
+    fn record_str(&mut self, _: &tracing::field::Field, value: &str) {
+        self.found |= value.contains(self.marker);
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if !self.found {
+            self.found = format!("{value:?}").contains(self.marker);
+        }
+    }
+}
 
 struct FirstSpanGate {
     state: Mutex<FirstSpanState>,
@@ -38,14 +66,32 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct WalkCounter;
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WalkCounter {
+impl<S> tracing_subscriber::Layer<S> for WalkCounter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if attrs.metadata().name() == WALK_SPAN {
+        let marker = *lock_recover(&ATTRIBUTED_TO);
+        if attrs.metadata().name() != WALK_SPAN {
+            if let Some(marker) = marker {
+                let mut mentions = Mentions { marker, found: false };
+                attrs.record(&mut mentions);
+                if let Some(span) = mentions.found.then(|| ctx.span(id)).flatten() {
+                    span.extensions_mut().insert(Attributed);
+                }
+            }
+            return;
+        }
+        let ours = marker.is_none()
+            || ctx.span_scope(id).is_some_and(|mut scope| {
+                scope.any(|span| span.extensions().get::<Attributed>().is_some())
+            });
+        if ours {
             WALKED.fetch_add(1, Ordering::SeqCst);
             let gate = lock_recover(&FIRST_SPAN_GATE).clone();
             if let Some(gate) = gate {
@@ -84,6 +130,27 @@ pub fn install() {
 
 pub fn reset() {
     WALKED.store(0, Ordering::SeqCst);
+}
+
+/// Count and hold only the walks that run under a span whose fields mention `marker`, until
+/// the returned guard drops. Arm it before the walk starts: the span that carries the marker
+/// is recognised when it opens.
+pub fn attribute_to(marker: &'static str) -> Attribution {
+    let mut active = lock_recover(&ATTRIBUTED_TO);
+    assert!(active.is_none(), "a walk attribution is already active");
+    *active = Some(marker);
+    Attribution { _private: () }
+}
+
+/// RAII handle of [`attribute_to`]; on drop every walk counts again.
+pub struct Attribution {
+    _private: (),
+}
+
+impl Drop for Attribution {
+    fn drop(&mut self) {
+        *lock_recover(&ATTRIBUTED_TO) = None;
+    }
 }
 
 pub fn entered() -> usize {
@@ -195,4 +262,35 @@ pub fn await_walk_start() {
             entered() > 0
         });
     assert!(started, "the walk never started");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk_under(uri: &str) {
+        let _request = tracing::info_span!("handle_find_references", uri = %uri).entered();
+        let _file = tracing::debug_span!("find_references_in_file").entered();
+    }
+
+    /// The only test of this binary that walks, so the process-global probe is its own.
+    /// A foreign walk runs on this very thread while the hold is armed: claimed by mistake,
+    /// it would never return.
+    #[test]
+    fn an_attributed_hold_lets_a_foreign_walk_pass_and_holds_its_own() {
+        install();
+        let _attributed = attribute_to("ours/Module.bsl");
+        reset();
+        let held = hold_walk_start();
+
+        walk_under("file:///theirs/Module.bsl");
+        assert_eq!(entered(), 0, "a foreign walk was counted");
+
+        let ours = std::thread::spawn(|| walk_under("file:///ours/Module.bsl"));
+        let mut cancelled_while_held = false;
+        held.cancel_once_entered(|| cancelled_while_held = !ours.is_finished());
+        ours.join().expect("the attributed walk goes on once released");
+        assert!(cancelled_while_held, "the attributed walk was not held at its first file");
+        assert_eq!(entered(), 1, "the attributed walk was not counted");
+    }
 }

@@ -631,15 +631,47 @@ fn an_unfinished_field_does_not_stop_the_tokens_that_follow() {
     );
 }
 
-/// Observed failure, kept as written: after `Т.Цена +` the comma is not a recovery point,
-/// the next field's alias head is taken as the alias of the unfinished one and the rest of
-/// the query is left unparsed, so no later token reaches the source map.
 #[test]
-#[ignore = "fails on the current parser: an operator left dangling before a comma swallows the rest of the query"]
 fn unfinished_fields_with_operators_do_not_stop_the_tokens_that_follow() {
     assert_tokens_after_unfinished_fields(
         "ВЫБРАТЬ Т.Цена +, Т.Количество * , Т.Код КАК Артикул ИЗ Справочник.Товары КАК Т ГДЕ Т.Код > 0",
     );
+}
+
+#[test]
+fn totals_aliases_have_one_source_entry_and_are_not_column_references() {
+    for (input, aliases) in [
+        ("ВЫБРАТЬ А ИЗ Т ИТОГИ КОЛИЧЕСТВО(А) КАК К ПО А", vec!["К"]),
+        (
+            "SELECT A FROM T TOTALS SUM(A) + 1 Result, COUNT(A) AS Order BY A",
+            vec!["Result", "Order"],
+        ),
+    ] {
+        assert!(parser::parse_sdbl(input).errors().is_empty());
+        let package = lower(input);
+        for alias in aliases {
+            let expected = input.rfind(alias).unwrap();
+            let entries: Vec<_> =
+                package.source_map.all_tokens().filter(|(info, _)| info.text == alias).collect();
+            assert_eq!(entries.len(), 1, "{alias}: {entries:?}");
+            let (info, category) = entries[0];
+            assert_eq!(category, TokenCategory::FieldAlias);
+            assert_eq!(usize::from(info.range.start()), expected);
+            assert_eq!(slice(input, info.range), alias);
+            assert_eq!(package.source_map.token_at_range(info.range).unwrap().1, category);
+        }
+        assert!(!package
+            .source_map
+            .tokens_by_category(TokenCategory::FieldName)
+            .iter()
+            .any(|info| matches!(info.text.as_str(), "AS" | "КАК" | "Result" | "Order" | "К")));
+        let ranges: Vec<_> = package.source_map.all_tokens().map(|(info, _)| info.range).collect();
+        assert_eq!(ranges.iter().collect::<std::collections::HashSet<_>>().len(), ranges.len());
+        assert!(package.all_diagnostics().all(|diagnostic| !matches!(diagnostic,
+            sdbl_hir::SdblDiagnostic::UnknownField { field_name, .. }
+                if matches!(field_name.as_str(), "К" | "Result" | "Order" | "AS" | "КАК")
+        )));
+    }
 }
 
 #[test]

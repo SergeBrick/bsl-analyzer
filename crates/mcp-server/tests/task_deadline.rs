@@ -181,7 +181,7 @@ fn arm(ttl_ms: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     not(timing_contract),
-    ignore = "timing contract: the deadline must fall after a build the test cannot pin"
+    ignore = "необязательный тест: the deadline must fall after a build the test cannot pin; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
 )]
 async fn a_task_stopped_mid_answer_does_not_blame_the_index() {
     arm(LONG_WORK_TTL_MS);

@@ -211,7 +211,7 @@ fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
 #[test]
 #[cfg_attr(
     not(timing_contract),
-    ignore = "timing contract: the verdict depends on a producer keeping a real-time cadence"
+    ignore = "необязательный тест: the verdict depends on a producer keeping a real-time cadence; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
 )]
 fn a_continuous_unrelated_message_stream_cannot_extend_a_wait_past_its_ceiling() {
     let dir = project();

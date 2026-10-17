@@ -2702,7 +2702,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(timing_contract),
-        ignore = "timing contract: the stand must finish inside the installation wait"
+        ignore = "необязательный тест: the stand must finish inside the installation wait; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
     )]
     fn a_replacement_waits_for_a_held_read_then_serves_the_next_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -2766,7 +2766,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(timing_contract),
-        ignore = "timing contract: the stand must finish inside the installation wait"
+        ignore = "необязательный тест: the stand must finish inside the installation wait; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
     )]
     fn a_replacement_waits_for_four_concurrent_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -2809,7 +2809,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(timing_contract),
-        ignore = "timing contract: the stand must finish inside the installation wait"
+        ignore = "необязательный тест: the stand must finish inside the installation wait; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
     )]
     fn a_read_during_the_pause_is_refused_after_the_admission_wait() {
         let dir = tempfile::tempdir().unwrap();

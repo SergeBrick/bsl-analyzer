@@ -7940,7 +7940,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(timing_contract),
-        ignore = "timing contract: a pause places the worker past its first read"
+        ignore = "необязательный тест: a pause places the worker past its first read; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test --workspace"
     )]
     fn resubscribing_captures_the_debt_it_carried_before_a_window_can_replace_it() {
         let dir = tempdir().unwrap();

@@ -66,9 +66,17 @@ impl std::ops::Deref for Retired {
 
 impl Drop for Retired {
     fn drop(&mut self) {
-        self.0.shutdown_within(RETIRE_BUDGET);
+        // A test that is already failing reports only once it ends, so an owner that never
+        // stops must not keep it from ending; the bound decides nothing the test asserts.
+        let budget = if std::thread::panicking() { UNWIND_RETIRE_BUDGET } else { RETIRE_BUDGET };
+        self.0.shutdown_within(budget);
     }
 }
+
+/// Bound on an owner leaving while a failed test unwinds, in every profile. Not every binary
+/// that declares this module uses it, hence the allowance.
+#[allow(dead_code)]
+const UNWIND_RETIRE_BUDGET: Duration = Duration::from_secs(180);
 
 /// Bound on an owner leaving under `timing_contract`; none otherwise. An owner always leaves at
 /// its next wake, after at most the batch it has in hand, so this is reached only by an owner

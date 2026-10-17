@@ -1766,7 +1766,14 @@ mod tests {
         let mut session = connect(&server, root.path(), None).expect("attach");
         assert_eq!(session.suspended_at_attach(), [SERVER_TARGET]);
 
-        wait_for_reported_stop(&mut session);
+        // Until the server's stop is delivered the announcement is all there is to report, so
+        // the gate waits for that delivery — the stop queued — and only then asks: the first
+        // answer must be the stop, not the announcement it replaces.
+        absorb_events_until(&mut session, "the server's stop is delivered", |session| {
+            !session.unreported_stops.is_empty()
+        });
+        let stop = session.wait_for_stop(Duration::ZERO).unwrap().expect("the reported stop");
+        assert!(!matches!(stop.reason, StopReason::Suspended), "{:?}", stop.reason);
         // A second report would come from the announcement the session already holds, so the
         // answer is there at once; the timing profile also leaves the event stream a window.
         let window = if cfg!(timing_contract) { Duration::from_millis(50) } else { Duration::ZERO };

@@ -476,6 +476,7 @@ fn analyze_salsa(
     bsl_analyzer::features_state::apply_compatibility_mode_to_db(&mut db, Some(&project));
     bsl_analyzer::features_state::apply_ordinary_forms_setting_to_db(&mut db, Some(&project));
     bsl_analyzer::features_state::apply_ordinary_app_support_to_db(&mut db, Some(&project));
+    bsl_analyzer::features_state::apply_default_run_mode_to_db(&mut db, Some(&project));
 
     // Register the base + extension configuration roots (with their dependency
     // topology) so per-file resolution — and the `&ИзменениеИКонтроль` effective

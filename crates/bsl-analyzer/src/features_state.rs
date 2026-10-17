@@ -13,6 +13,7 @@ impl GlobalState {
         apply_compatibility_mode_to_db(db, self.project.as_ref());
         apply_ordinary_forms_setting_to_db(db, self.project.as_ref());
         apply_ordinary_app_support_to_db(db, self.project.as_ref());
+        apply_default_run_mode_to_db(db, self.project.as_ref());
         if let Some(project) = self.project.as_ref() {
             if let Some(warning) =
                 platform_help::source_change_warning(Some(&project.config), &project.root)
@@ -107,6 +108,26 @@ pub fn apply_ordinary_forms_setting_to_db(
     if options.ordinary_forms_in_managed_app != value {
         tracing::info!(ordinary_forms_in_managed_app = ?value, "updated ordinary-form environments");
         options.ordinary_forms_in_managed_app = value;
+        db.set_env_options(options);
+    }
+}
+
+/// `<DefaultRunMode>` of the main configuration of `project` into the environment
+/// options: whether the configuration runs as a managed application
+/// (`ManagedApplication` or `Auto`), so that the thick client of the managed
+/// application compiles its object and manager modules. Applied after
+/// [`apply_project_config_to_db`] and again when `Configuration.xml` changes, like
+/// [`apply_ordinary_forms_setting_to_db`].
+pub fn apply_default_run_mode_to_db(
+    db: &mut RootDatabaseImpl,
+    project: Option<&project_model::Project>,
+) {
+    let mode = project.and_then(project_model::Project::default_run_mode);
+    let value = mode.as_deref().is_some_and(|mode| mode != "OrdinaryApplication");
+    let mut options = db.env_options();
+    if options.managed_run_mode != value {
+        tracing::info!(managed_run_mode = value, default_run_mode = ?mode, "updated run mode");
+        options.managed_run_mode = value;
         db.set_env_options(options);
     }
 }
@@ -463,5 +484,48 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
         );
         apply(&mut db, &project);
         assert!(db.env_options().ordinary_app_support, "a checked legacy client is modelled");
+    }
+
+    /// `managed_run_mode` follows `<DefaultRunMode>` alone: `Auto` counts as the
+    /// managed application, `OrdinaryApplication` and an unknown mode do not, and no
+    /// `ordinaryAppSupport` setting changes it.
+    #[test]
+    fn default_run_mode_reaches_the_execution_model() {
+        use super::apply_default_run_mode_to_db;
+
+        fn run_mode_of(configuration: Option<&str>, toml: &str) -> bool {
+            let dir = tempdir().unwrap();
+            let cf = dir.path().join("src").join("cf");
+            fs::create_dir_all(&cf).unwrap();
+            if let Some(run_mode) = configuration {
+                fs::write(
+                    cf.join("Configuration.xml"),
+                    format!(
+                        "<MetaDataObject><Configuration><Properties><DefaultRunMode>{run_mode}\
+                         </DefaultRunMode></Properties></Configuration></MetaDataObject>"
+                    ),
+                )
+                .unwrap();
+            }
+            fs::write(dir.path().join("bsl-analyzer.toml"), toml).unwrap();
+            let project = Project::new(dir.path()).unwrap();
+            let mut db = RootDatabaseImpl::new();
+            apply_project_config_to_db(&mut db, &project.config);
+            apply_default_run_mode_to_db(&mut db, Some(&project));
+            db.env_options().managed_run_mode
+        }
+
+        assert!(run_mode_of(Some("ManagedApplication"), ""));
+        assert!(run_mode_of(Some("Auto"), ""));
+        assert!(!run_mode_of(Some("OrdinaryApplication"), ""));
+        assert!(!run_mode_of(None, ""), "no main configuration");
+        assert!(
+            run_mode_of(Some("ManagedApplication"), "[diagnostics]\nordinaryAppSupport = true\n"),
+            "the setting does not change the run mode"
+        );
+        assert!(!run_mode_of(
+            Some("OrdinaryApplication"),
+            "[diagnostics]\nordinaryAppSupport = false\n"
+        ));
     }
 }

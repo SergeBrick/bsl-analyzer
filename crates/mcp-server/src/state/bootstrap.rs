@@ -4258,14 +4258,16 @@ mod tests {
             super::super::types::EmbeddingPrefixes::default(),
         );
 
-        for _ in 0..600 {
-            match graph.status() {
-                crate::graph::GraphStatus::Ready { .. } => return,
+        let ready = test_utils::wait::poll_until(
+            std::time::Duration::from_secs(6),
+            std::time::Duration::from_millis(10),
+            || match graph.status() {
+                crate::graph::GraphStatus::Ready { .. } => true,
                 crate::graph::GraphStatus::Failed(msg) => panic!("graph load failed: {msg}"),
-                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
-        panic!("the boot left the graph at {:?}; it must not stay lazy", graph.status());
+                _ => false,
+            },
+        );
+        assert!(ready, "the boot left the graph at {:?}; it must not stay lazy", graph.status());
     }
 
     fn local_workspace_for_boot(dir: &std::path::Path) -> (PathBuf, DeferredBaselineRuntime) {

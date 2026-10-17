@@ -138,7 +138,7 @@ impl PlatformDataInner {
             mut methods,
             mut global_functions,
             mut constructors,
-            properties,
+            mut properties,
             method_docs,
             global_function_docs,
             constructor_docs,
@@ -188,6 +188,7 @@ impl PlatformDataInner {
 
         apply_docs_gap_method_overlay(&mut methods, &global_functions);
         apply_docs_gap_member_context_overlay(&mut methods, &mut global_functions, &types);
+        apply_docs_gap_property_context_overlay(&mut properties);
 
         let mut methods_by_name = FxHashMap::default();
         let mut methods_by_type: FxHashMap<SmolStr, Vec<usize>> = FxHashMap::default();
@@ -686,6 +687,42 @@ fn apply_docs_gap_member_context_overlay(
         {
             context.thin_client = true;
             context.thick_client = true;
+        }
+        if THIN_CLIENT_MEMBER_TYPES.contains(&method.type_name.as_str()) {
+            context.thin_client = true;
+        }
+    }
+}
+
+/// Types whose type page lists the thin client while every member page (8.3.17
+/// and 8.3.27 help alike) lists only the server, the thick client and the
+/// external connection. The members run in the thin client: a live run in the
+/// thin client on 8.3.17 and on 8.3.27 (with and without a compatibility mode)
+/// completes every call, while a method that is really missing from the thin
+/// client fails there with "Метод объекта не обнаружен". English type names.
+/// - `COMSafeArray`: all methods. The type itself has no web client, so the web
+///   client is left out.
+/// - `JobSchedule` (`РасписаниеРегламентногоЗадания`): all properties and
+///   `ТребуетсяВыполнение`; the web client is added for the properties only, see
+///   [`WEB_CLIENT_PROPERTY_TYPES`].
+const THIN_CLIENT_MEMBER_TYPES: &[&str] = &["COMSafeArray", "JobSchedule"];
+
+/// Types whose properties also run in the web client although their pages omit
+/// it: a live run in the web client (8.3.17 and 8.3.27) sets and reads every
+/// property. English type names.
+const WEB_CLIENT_PROPERTY_TYPES: &[&str] = &["JobSchedule"];
+
+/// Property counterpart of [`apply_docs_gap_member_context_overlay`] for the
+/// types listed in [`THIN_CLIENT_MEMBER_TYPES`] and [`WEB_CLIENT_PROPERTY_TYPES`].
+fn apply_docs_gap_property_context_overlay(properties: &mut [PlatformProperty]) {
+    for property in properties.iter_mut() {
+        let Some(context) = &mut property.context else { continue };
+        let type_name = property.type_name.as_str();
+        if THIN_CLIENT_MEMBER_TYPES.contains(&type_name) {
+            context.thin_client = true;
+        }
+        if WEB_CLIENT_PROPERTY_TYPES.contains(&type_name) {
+            context.web_client = true;
         }
     }
 }
@@ -1343,6 +1380,78 @@ mod tests {
         let ctx = control.context.as_ref().expect("control must carry availability");
         assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
         assert!(ctx.thick_client, "the control keeps the thick client");
+    }
+
+    #[test]
+    fn docs_gap_overlay_adds_thin_client_to_com_safe_array_and_job_schedule_members() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for name in [
+            "SetValue",
+            "GetValue",
+            "GetDimensions",
+            "GetLength",
+            "GetLowerBound",
+            "GetUpperBound",
+            "GetType",
+            "IsResizable",
+            "Resize",
+            "Выгрузить",
+        ] {
+            let method = data.get_method("COMSafeArray", name).expect("method must exist");
+            let ctx = method.context.as_ref().expect("method must carry availability");
+            assert!(ctx.thin_client, "COMSafeArray.{name} runs in the thin client");
+            assert!(ctx.thick_client && ctx.server, "COMSafeArray.{name} keeps its environments");
+            assert!(!ctx.web_client, "COMSafeArray.{name}: the type has no web client");
+        }
+
+        for name in [
+            "ДатаНачала",
+            "ВремяНачала",
+            "ИнтервалЗавершения",
+            "ВремяЗавершения",
+            "ДеньВМесяце",
+            "ПериодПовтораДней",
+            "ДатаКонца",
+            "ВремяКонца",
+            "Месяцы",
+            "ПаузаПовтора",
+            "ПериодПовтораВТечениеДня",
+            "ДеньНеделиВМесяце",
+            "ДниНедели",
+            "ПериодНедель",
+            "ДетальныеРасписанияДня",
+        ] {
+            let property = data
+                .get_property("РасписаниеРегламентногоЗадания", name)
+                .expect("property must exist");
+            let ctx = property.context.as_ref().expect("property must carry availability");
+            assert!(
+                ctx.thin_client && ctx.web_client,
+                "РасписаниеРегламентногоЗадания.{name} runs in the thin and web client"
+            );
+            assert!(ctx.server, "РасписаниеРегламентногоЗадания.{name} keeps the server");
+        }
+        let method = data
+            .get_method("РасписаниеРегламентногоЗадания", "ТребуетсяВыполнение")
+            .expect("method must exist");
+        let ctx = method.context.as_ref().expect("method must carry availability");
+        assert!(ctx.thin_client, "ТребуетсяВыполнение runs in the thin client");
+        assert!(!ctx.web_client, "ТребуетсяВыполнение: the web client stays as the help says");
+
+        // Narrow: a member that the thin client really lacks, and a property of a
+        // type absent from the web client, keep their markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        let control = data.get_property("ЧтениеXML", "Имя").expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.web_client, "ЧтениеXML.Имя stays unavailable in the web client");
     }
 
     #[test]

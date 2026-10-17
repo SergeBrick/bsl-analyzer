@@ -713,8 +713,8 @@ mod tests {
 
     /// Синхронные методы HTTPСоединение на клиенте с 8.3.21 устарели, но не
     /// недоступны: платформа выполняет их в тонком и толстом клиенте. Контроль в
-    /// той же ветке — метод, которого на клиенте действительно нет: он по-прежнему
-    /// отмечается, значит ветка действительно проверяется.
+    /// той же ветке — метод, которого в тонком клиенте действительно нет: он
+    /// по-прежнему отмечается, и только в тонком клиенте, значит ветка проверяется.
     #[test]
     fn sync_http_connection_methods_available_in_thin_and_thick_client() {
         let fixture = r#"
@@ -731,17 +731,15 @@ mod tests {
     Ответ = Соединение.Удалить(Запрос);
     Ответ = Соединение.ПолучитьЗаголовки(Запрос);
     Ответ = Соединение.ВызватьHTTPМетод("GET", Запрос);
-    Оповещения = СистемаВзаимодействия.ПолучитьОповещенияТекущегоПользователя();
+    Пользователи = СистемаВзаимодействия.ПолучитьПользователей();
     #КонецЕсли
 КонецПроцедуры
 "#;
         let diags = env_diags(fixture);
-        assert_eq!(diags.len(), 1, "only the server-only control may be flagged, got: {diags:?}");
-        assert!(
-            diags[0].0.starts_with("Метод 'ПолучитьОповещенияТекущегоПользователя' недоступен")
-                && diags[0].0.contains("Тонкий клиент"),
-            "the server-only control must still be flagged on the thin client: {}",
-            diags[0].0
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert_eq!(
+            diags[0].0, "Метод 'ПолучитьПользователей' недоступен [Тонкий клиент]",
+            "the control must still be flagged on the thin client only"
         );
     }
 
@@ -761,16 +759,16 @@ Procedure Send()
     Response = Connection.Delete(Request);
     Response = Connection.Head(Request);
     Response = Connection.CallHTTPMethod("GET", Request);
-    Notifications = CollaborationSystem.GetCurrentUserNotifications();
+    Users = CollaborationSystem.GetUsers();
     #EndIf
 EndProcedure
 "#;
         let diags = env_diags(fixture);
-        assert_eq!(diags.len(), 1, "only the server-only control may be flagged, got: {diags:?}");
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
         assert!(
-            diags[0].0.contains("GetCurrentUserNotifications")
-                || diags[0].0.contains("ПолучитьОповещенияТекущегоПользователя"),
-            "the server-only control must still be flagged: {}",
+            (diags[0].0.contains("GetUsers") || diags[0].0.contains("ПолучитьПользователей"))
+                && diags[0].0.ends_with("[Тонкий клиент]"),
+            "the control must still be flagged on the thin client only: {}",
             diags[0].0
         );
     }

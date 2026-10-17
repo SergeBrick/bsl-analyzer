@@ -1279,12 +1279,14 @@ mod tests {
             assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
         }
 
-        // Narrow: a server-only method of another type keeps its markup.
+        // Narrow: a synchronous collaboration-system method that the thin client
+        // really lacks keeps its markup.
         let control = data
-            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьОповещенияТекущегоПользователя")
-            .expect("server-only control must exist");
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
         let ctx = control.context.as_ref().expect("control must carry availability");
-        assert!(!ctx.thin_client && !ctx.thick_client, "the control stays server-only");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        assert!(ctx.thick_client, "the control keeps the thick client");
     }
 
     #[test]

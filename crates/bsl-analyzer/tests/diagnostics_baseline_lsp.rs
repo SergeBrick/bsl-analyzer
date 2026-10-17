@@ -173,11 +173,10 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
 /// will never meet the condition fails on the FIRST silent window, and says why. A
 /// wait that could only ever report "Timeout" after a minute could not tell this case
 /// from a server still working, which is what every timeout in this family looked like.
+///
+/// The server never meets the condition, so however long a loaded machine keeps it busy, the
+/// wait ends on the idle verdict; only how soon it ends is the timing profile's.
 #[test]
-#[cfg_attr(
-    not(timing_contract),
-    ignore = "timing contract: an idle verdict reads CPU use over a real silence window"
-)]
 fn a_wait_an_idle_server_will_never_satisfy_is_judged_lost_not_timed_out() {
     let dir = project();
     let lsp = Lsp::start(dir.path());

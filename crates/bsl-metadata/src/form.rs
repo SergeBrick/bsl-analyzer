@@ -169,6 +169,17 @@ pub const ORDINARY_FORM_DEFAULT_HANDLERS: &[(&str, &str)] = &[
     ("AfterRestoreValues", "AfterRestoreValues"),
 ];
 
+/// [`ORDINARY_FORM_DEFAULT_HANDLERS`] as event handlers.
+pub fn ordinary_form_default_handlers() -> Vec<FormEventHandler> {
+    ORDINARY_FORM_DEFAULT_HANDLERS
+        .iter()
+        .map(|&(event_type, handler_name)| FormEventHandler {
+            event_type: event_type.to_string(),
+            handler_name: handler_name.to_string(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Form {
     pub name: String,
@@ -178,6 +189,10 @@ pub struct Form {
     pub event_handlers: Vec<FormEventHandler>,
     pub command_handlers: Vec<String>,
     pub attributes: Vec<FormAttribute>,
+    /// An ORDINARY form whose dialog was read from its `Ext/Form/Form.json` sidecar:
+    /// `elements`, `attributes` and `event_handlers` are then the form's own, not
+    /// stand-ins. Always `false` for a managed form, whose dialog is `Ext/Form.xml`.
+    pub ordinary_dialog_known: bool,
 }
 
 impl Form {
@@ -190,6 +205,7 @@ impl Form {
             event_handlers: Vec::new(),
             command_handlers: Vec::new(),
             attributes: Vec::new(),
+            ordinary_dialog_known: false,
         }
     }
 
@@ -207,6 +223,7 @@ impl Form {
             event_handlers: Vec::new(),
             command_handlers: Vec::new(),
             attributes: Vec::new(),
+            ordinary_dialog_known: false,
         }
     }
 
@@ -226,6 +243,7 @@ impl Form {
             event_handlers,
             command_handlers,
             attributes: Vec::new(),
+            ordinary_dialog_known: false,
         }
     }
 
@@ -312,20 +330,15 @@ impl Form {
     }
 
     /// An ORDINARY form whose dialog cannot be read: it lives in the binary
-    /// `Ext/Form.bin`, not in `Ext/Form.xml`. Its bindings are unknown, so the form
+    /// `Ext/Form.bin`, not in `Ext/Form.xml`, and no usable `Ext/Form/Form.json`
+    /// sidecar describes it. Its bindings are unknown, so the form
     /// gets the configurator's default handler name for each of its own events
     /// ([`ORDINARY_FORM_DEFAULT_HANDLERS`]): a procedure named `ПередОткрытием` in
     /// such a module is almost certainly bound, and reporting it unused would be the
     /// louder mistake.
     pub fn ordinary_without_dialog(name: impl Into<String>) -> Self {
         let mut form = Self::new(name.into(), FormType::Ordinary, Uuid::nil());
-        form.event_handlers = ORDINARY_FORM_DEFAULT_HANDLERS
-            .iter()
-            .map(|&(event_type, handler_name)| FormEventHandler {
-                event_type: event_type.to_string(),
-                handler_name: handler_name.to_string(),
-            })
-            .collect();
+        form.event_handlers = ordinary_form_default_handlers();
         form
     }
 

@@ -5,6 +5,7 @@ use crate::form::{
 };
 use crate::metadata_object::AttributeType;
 
+use super::form_sidecar::read_ordinary_form_sidecar;
 use super::helpers::parse_uuid;
 use super::type_parser::parse_type_xml;
 
@@ -287,18 +288,49 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
 
     let mut form = match std::fs::read_to_string(&ext_form_xml_path) {
         Ok(ext_form_xml) => parse_form_xml(&ext_form_xml)?,
-        // An ORDINARY form has no `Ext/Form.xml`: its dialog is the binary
-        // `Ext/Form.bin`. The form's own descriptor still says `<FormType>Ordinary`,
-        // which is enough to stop analyzing the module as a managed one.
-        Err(_) if metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary) => {
-            Form::ordinary_without_dialog(form_name)
-        }
-        Err(e) => {
-            return Err(crate::error::MetadataError::InvalidFormat(format!(
-                "Cannot read form XML at {}: {}",
-                ext_form_xml_path.display(),
-                e
-            )));
+        // No `Ext/Form.xml`: an ORDINARY form keeps its dialog in the binary
+        // `Ext/Form.bin`. A tool that reads it may describe the dialog in
+        // `Ext/Form/Form.json` next to the module; without a usable one the form's
+        // own descriptor still says `<FormType>Ordinary`, which is enough to stop
+        // analyzing the module as a managed one.
+        Err(read_error) => {
+            let may_be_ordinary =
+                metadata.as_ref().is_none_or(|m| m.form_type == FormType::Ordinary);
+            let sidecar = bsl_path
+                .parent()
+                .filter(|_| may_be_ordinary)
+                .and_then(|dir| {
+                    bsl_conventions::find_child_ci(
+                        dir,
+                        bsl_conventions::ConventionalName::FormJson.canonical(),
+                    )
+                })
+                .and_then(|sidecar_path| {
+                    match read_ordinary_form_sidecar(&sidecar_path, form_name) {
+                        Ok(form) => Some(form),
+                        Err(rejection) => {
+                            tracing::warn!(
+                                path = %sidecar_path.display(),
+                                %rejection,
+                                "ordinary form sidecar ignored"
+                            );
+                            None
+                        }
+                    }
+                });
+            match sidecar {
+                Some(form) => form,
+                None if metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary) => {
+                    Form::ordinary_without_dialog(form_name)
+                }
+                None => {
+                    return Err(crate::error::MetadataError::InvalidFormat(format!(
+                        "Cannot read form XML at {}: {}",
+                        ext_form_xml_path.display(),
+                        read_error
+                    )));
+                }
+            }
         }
     };
 
@@ -894,6 +926,135 @@ mod tests {
         let form = parse_form_from_bsl_path(&module).unwrap();
         assert!(form.is_ordinary());
         assert_eq!(form.name(), "Ф");
+    }
+
+    /// An ordinary form `Ф` on disk: its descriptor, a binary dialog and the module.
+    /// Returns the module path; the sidecar goes next to it.
+    fn ordinary_form_on_disk(root: &std::path::Path) -> std::path::PathBuf {
+        let forms = root.join("Catalogs/Справочник/Forms");
+        let module = forms.join("Ф/Ext/Form/Module.bsl");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        std::fs::write(&module, "").unwrap();
+        std::fs::write(forms.join("Ф/Ext/Form.bin"), b"\x00").unwrap();
+        std::fs::write(
+            forms.join("Ф.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+	<Form uuid="0f0e0d0c-0b0a-4908-8706-050403020103">
+		<Properties>
+			<Name>Ф</Name>
+			<FormType>Ordinary</FormType>
+		</Properties>
+	</Form>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+        module
+    }
+
+    fn sidecar_json(schema: impl std::fmt::Display) -> String {
+        format!(
+            r#"{{"schema": {schema},
+ "form": {{"name": "Ф", "handlers": {{"ПриОткрытии": "ПриОткрытии"}}, "boundHandlers": ["КнопкаНажатие"]}},
+ "attributes": [{{"id": 1, "name": "Реквизит1"}}],
+ "controls": [{{"kind": "button", "id": 2, "name": "Кнопка1"}},
+              {{"kind": "input", "id": 3, "name": "Поле1", "handlers": {{"ПриИзменении": "Поле1ПриИзменении"}}}}]}}"#
+        )
+    }
+
+    fn set_mtime(path: &std::path::Path, time: std::time::SystemTime) {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(time).unwrap();
+    }
+
+    fn reads_dialog(form: &Form) -> bool {
+        form.find_element("Кнопка1").is_some()
+            && form.find_attribute("Реквизит1").is_some()
+            && form.is_handler("Поле1ПриИзменении")
+            && form.is_handler("КнопкаНажатие")
+    }
+
+    /// The descriptor-only stand-in: no controls, default event handler names.
+    fn is_descriptor_only(form: &Form) -> bool {
+        form.elements().is_empty()
+            && form.attributes().is_empty()
+            && form.is_handler("ПередОткрытием")
+            && !form.is_handler("Поле1ПриИзменении")
+    }
+
+    #[test]
+    fn ordinary_form_sidecar_supplies_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        std::fs::write(module.with_file_name("Form.json"), sidecar_json(2)).unwrap();
+
+        let form = parse_form_from_bsl_path(&module).unwrap();
+        assert!(form.is_ordinary());
+        // Name and uuid still come from the descriptor, as for any form.
+        assert_eq!(form.uuid().to_string(), "0f0e0d0c-0b0a-4908-8706-050403020103");
+        assert!(reads_dialog(&form), "{form:?}");
+        // The sidecar names the bindings: a default-named event it does not bind is unbound.
+        assert!(form.is_handler("ПриОткрытии"));
+        assert!(!form.is_handler("ПередОткрытием"));
+    }
+
+    #[test]
+    fn ordinary_form_without_sidecar_keeps_the_descriptor_only_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        let form = parse_form_from_bsl_path(&module).unwrap();
+        assert!(is_descriptor_only(&form), "{form:?}");
+    }
+
+    #[test]
+    fn a_sidecar_older_than_form_bin_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        let sidecar = module.with_file_name("Form.json");
+        let form_bin = module.parent().unwrap().parent().unwrap().join("Form.bin");
+        std::fs::write(&sidecar, sidecar_json(2)).unwrap();
+        let earlier =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let later = earlier + std::time::Duration::from_secs(60);
+
+        // The dialog changed after the sidecar was written: the sidecar may lie.
+        set_mtime(&sidecar, earlier);
+        set_mtime(&form_bin, later);
+        let stale = parse_form_from_bsl_path(&module).unwrap();
+        assert!(is_descriptor_only(&stale), "{stale:?}");
+
+        // Written in the same pass (equal times) or later: it describes the dialog.
+        set_mtime(&sidecar, later);
+        assert!(reads_dialog(&parse_form_from_bsl_path(&module).unwrap()));
+    }
+
+    #[test]
+    fn a_sidecar_of_an_invalid_version_or_shape_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        let sidecar = module.with_file_name("Form.json");
+
+        for invalid in ["0", "-1", "1.5", "\"2\""] {
+            std::fs::write(&sidecar, sidecar_json(invalid)).unwrap();
+            let form = parse_form_from_bsl_path(&module).unwrap();
+            assert!(is_descriptor_only(&form), "{invalid}: {form:?}");
+        }
+
+        std::fs::write(&sidecar, "{ not json").unwrap();
+        assert!(is_descriptor_only(&parse_form_from_bsl_path(&module).unwrap()));
+
+        std::fs::write(&sidecar, sidecar_json(2)).unwrap();
+        assert!(reads_dialog(&parse_form_from_bsl_path(&module).unwrap()));
+    }
+
+    /// The format only grows: a version the reader has never seen keeps the
+    /// meaning of the fields it reads.
+    #[test]
+    fn a_sidecar_of_a_future_version_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        std::fs::write(module.with_file_name("Form.json"), sidecar_json(99)).unwrap();
+        let form = parse_form_from_bsl_path(&module).unwrap();
+        assert!(reads_dialog(&form), "{form:?}");
     }
 
     #[test]

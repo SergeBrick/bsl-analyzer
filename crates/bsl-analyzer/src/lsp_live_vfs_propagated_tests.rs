@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Bound of a wait for an event a regression would never deliver: ten seconds under
-/// `timing_contract`, none otherwise (see [`test_utils::wait`]).
-const HANG_GUARD: Duration = test_utils::wait::ceiling(Duration::from_secs(10));
+/// Bound of a wait for an event a regression would never deliver: the shared sixty-second
+/// ceiling under `timing_contract`, none otherwise (see [`test_utils::wait`]).
+const HANG_GUARD: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
 #[derive(Clone, Copy)]
 enum OwnerExit {

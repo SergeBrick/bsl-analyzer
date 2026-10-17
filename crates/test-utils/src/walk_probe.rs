@@ -26,7 +26,9 @@ static ATTRIBUTED_TO: Mutex<Option<&'static str>> = Mutex::new(None);
 
 /// Extension on a span whose fields mention the active marker; walk spans beneath it are
 /// the attributed walk's.
-struct Attributed;
+struct Attributed {
+    marker: &'static str,
+}
 
 /// Whether any field of a span mentions `marker`.
 struct Mentions {
@@ -76,24 +78,33 @@ where
         id: &tracing::span::Id,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        let marker = *lock_recover(&ATTRIBUTED_TO);
+        let active = lock_recover(&ATTRIBUTED_TO);
+        let marker = *active;
         if attrs.metadata().name() != WALK_SPAN {
+            drop(active);
             if let Some(marker) = marker {
                 let mut mentions = Mentions { marker, found: false };
                 attrs.record(&mut mentions);
                 if let Some(span) = mentions.found.then(|| ctx.span(id)).flatten() {
-                    span.extensions_mut().insert(Attributed);
+                    span.extensions_mut().insert(Attributed { marker });
                 }
             }
             return;
         }
         let ours = marker.is_none()
             || ctx.span_scope(id).is_some_and(|mut scope| {
-                scope.any(|span| span.extensions().get::<Attributed>().is_some())
+                scope.any(|span| {
+                    span.extensions()
+                        .get::<Attributed>()
+                        .is_some_and(|claimed| Some(claimed.marker) == marker)
+                })
             });
         if ours {
+            // A callback that saw no attribution must finish claiming before a new
+            // attribution can reset the count and arm its own first-span gate.
             WALKED.fetch_add(1, Ordering::SeqCst);
             let gate = lock_recover(&FIRST_SPAN_GATE).clone();
+            drop(active);
             if let Some(gate) = gate {
                 let mut state = lock_recover(&gate.state);
                 if !state.claimed {
@@ -279,6 +290,21 @@ mod tests {
     #[test]
     fn an_attributed_hold_lets_a_foreign_walk_pass_and_holds_its_own() {
         install();
+        reset();
+        let selecting_gate = lock_recover(&FIRST_SPAN_GATE);
+        let entering = std::thread::spawn(|| walk_under("file:///unattributed/Module.bsl"));
+        while entered() == 0 {
+            std::thread::yield_now();
+        }
+        let attribution_is_locked =
+            matches!(ATTRIBUTED_TO.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+        drop(selecting_gate);
+        entering.join().expect("the counted walk finishes selecting its gate");
+        assert!(
+            attribution_is_locked,
+            "a counted walk released attribution before selecting its gate"
+        );
+
         let _attributed = attribute_to("ours/Module.bsl");
         reset();
         let held = hold_walk_start();
@@ -292,5 +318,17 @@ mod tests {
         ours.join().expect("the attributed walk goes on once released");
         assert!(cancelled_while_held, "the attributed walk was not held at its first file");
         assert_eq!(entered(), 1, "the attributed walk was not counted");
+
+        let old_parent = tracing::info_span!("request", uri = "file:///ours/Module.bsl");
+        drop(_attributed);
+        let _next = attribute_to("next/Module.bsl");
+        reset();
+        {
+            let _old = old_parent.enter();
+            walk_under("file:///theirs/Module.bsl");
+        }
+        assert_eq!(entered(), 0, "an old anchor leaked into a different attribution");
+        walk_under("file:///next/Module.bsl");
+        assert_eq!(entered(), 1, "the new anchor was not counted");
     }
 }

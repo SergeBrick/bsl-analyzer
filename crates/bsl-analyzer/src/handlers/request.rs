@@ -4239,15 +4239,15 @@ mod tests {
         /// of `test_utils::walk_probe`.
         static WALK_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        /// The gate, then the probe claimed for this stand's walks with a zeroed count. A
-        /// test that failed while holding the gate poisons it; the gate guards no data, so
-        /// the next test simply takes it.
-        fn serialised() -> (std::sync::MutexGuard<'static, ()>, walk_probe::Attribution) {
+        /// Attribution drops before exclusivity: an unlocked gate must not let another test
+        /// claim the probe while the preceding attribution is still active. The gate guards
+        /// no data, so a test that failed while holding it does not block the next one.
+        fn serialised() -> (walk_probe::Attribution, std::sync::MutexGuard<'static, ()>) {
             let gate = WALK_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             walk_probe::install();
             let attributed = walk_probe::attribute_to(ROOT);
             walk_probe::reset();
-            (gate, attributed)
+            (attributed, gate)
         }
 
         /// Callers of one exported procedure. Enough that an uncancelled walk takes
@@ -4347,6 +4347,36 @@ mod tests {
                     .expect("the references request never answered");
                 crate::server::handle_task(state, task)
                     .expect("production task handler must finish reference request");
+            }
+        }
+
+        /// A contender can wake between tuple-field destructors; an open exclusion gate
+        /// must mean that the preceding attribution is already gone.
+        #[test]
+        fn attribution_is_cleared_before_the_serialisation_gate_opens() {
+            let (first, second) = serialised();
+            drop(first);
+            let unlocked = match WALK_GATE.try_lock() {
+                Ok(gate) => {
+                    drop(gate);
+                    true
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    drop(poisoned.into_inner());
+                    true
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            if unlocked {
+                let contender = std::thread::spawn(|| {
+                    let _claimed = serialised();
+                });
+                let result = contender.join();
+                drop(second);
+                assert!(result.is_ok(), "an open gate exposed the preceding walk attribution");
+            } else {
+                drop(second);
+                let _claimed = serialised();
             }
         }
 

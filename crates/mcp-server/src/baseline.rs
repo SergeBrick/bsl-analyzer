@@ -2165,6 +2165,21 @@ mod tests {
     }
 
     #[test]
+    fn deferred_slot_shutdown_ends_a_pending_wait() {
+        // The waiter's budget runs out with the same `false` a wake produces, so it gets a budget
+        // no run reaches: a waiter that comes back at all was ended by the shutdown, whether it
+        // had parked before it or not.
+        let deferred = DeferredBaselineRuntime::pending_for_test();
+        let waiter = deferred.clone();
+        let handle = std::thread::spawn(move || waiter.wait_ready(test_utils::wait::NO_BOUND));
+
+        deferred.shutdown();
+
+        assert!(!handle.join().unwrap(), "a shut-down slot never becomes ready");
+    }
+
+    #[test]
+    #[ignore = "необязательный тест: the waiter must wake within a wall-clock bound; запуск: CARGO_TARGET_DIR=target-timing RUSTFLAGS='--cfg timing_contract' cargo test -p mcp-server --lib baseline::tests::deferred_slot_shutdown_wakes_a_pending_waiter -- --exact --ignored"]
     fn deferred_slot_shutdown_wakes_a_pending_waiter() {
         // The waiter's budget runs out with the same `false` a wake produces. An ordinary run
         // gives it a budget no run reaches, so a waiter that comes back at all was woken; under

@@ -711,6 +711,70 @@ mod tests {
         assert!(diags.is_empty(), "the guard leaves only server environments, got: {diags:?}");
     }
 
+    /// Синхронные методы HTTPСоединение на клиенте с 8.3.21 устарели, но не
+    /// недоступны: платформа выполняет их в тонком и толстом клиенте. Контроль в
+    /// той же ветке — метод, которого на клиенте действительно нет: он по-прежнему
+    /// отмечается, значит ветка действительно проверяется.
+    #[test]
+    fn sync_http_connection_methods_available_in_thin_and_thick_client() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&НаКлиенте
+Процедура Отправить()
+    #Если НЕ ВебКлиент Тогда
+    Соединение = Новый HTTPСоединение("example.com");
+    Запрос = Новый HTTPЗапрос("/");
+    Ответ = Соединение.Получить(Запрос);
+    Ответ = Соединение.ОтправитьДляОбработки(Запрос);
+    Ответ = Соединение.Записать(Запрос);
+    Ответ = Соединение.Изменить(Запрос);
+    Ответ = Соединение.Удалить(Запрос);
+    Ответ = Соединение.ПолучитьЗаголовки(Запрос);
+    Ответ = Соединение.ВызватьHTTPМетод("GET", Запрос);
+    Оповещения = СистемаВзаимодействия.ПолучитьОповещенияТекущегоПользователя();
+    #КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the server-only control may be flagged, got: {diags:?}");
+        assert!(
+            diags[0].0.starts_with("Метод 'ПолучитьОповещенияТекущегоПользователя' недоступен")
+                && diags[0].0.contains("Тонкий клиент"),
+            "the server-only control must still be flagged on the thin client: {}",
+            diags[0].0
+        );
+    }
+
+    #[test]
+    fn sync_http_connection_methods_available_in_client_english() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&AtClient
+Procedure Send()
+    #If NOT WebClient Then
+    Connection = New HTTPConnection("example.com");
+    Request = New HTTPRequest("/");
+    Response = Connection.Get(Request);
+    Response = Connection.Post(Request);
+    Response = Connection.Put(Request);
+    Response = Connection.Patch(Request);
+    Response = Connection.Delete(Request);
+    Response = Connection.Head(Request);
+    Response = Connection.CallHTTPMethod("GET", Request);
+    Notifications = CollaborationSystem.GetCurrentUserNotifications();
+    #EndIf
+EndProcedure
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the server-only control may be flagged, got: {diags:?}");
+        assert!(
+            diags[0].0.contains("GetCurrentUserNotifications")
+                || diags[0].0.contains("ПолучитьОповещенияТекущегоПользователя"),
+            "the server-only control must still be flagged: {}",
+            diags[0].0
+        );
+    }
+
     #[test]
     fn common_module_without_client_flag_not_checked_against_client() {
         // A server common module calling server API — no diagnostics.

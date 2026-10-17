@@ -773,6 +773,72 @@ EndProcedure
         );
     }
 
+    /// Справка не называет тонкий клиент у `ФорматированныйДокумент.УстановитьHTML`
+    /// (и толстый у него же), `ДокументPDF.ПреобразоватьВОттенкиСерого`,
+    /// `ДокументPDF.ДобавитьПодпись`, `ЗаписьPDF.ПреобразоватьВОттенкиСерого`, но
+    /// платформа выполняет их в тонком и толстом клиенте. Контроль в той же ветке —
+    /// синхронный метод системы взаимодействия, которого в тонком клиенте нет: он
+    /// по-прежнему отмечается, и только в тонком клиенте.
+    #[test]
+    fn client_executable_pdf_and_formatted_document_methods_available_in_client() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&НаКлиенте
+Процедура Обработать(ИмяФайла)
+    #Если НЕ ВебКлиент Тогда
+    Документ = Новый ФорматированныйДокумент;
+    Документ.УстановитьHTML("<p>x</p>", Новый Структура);
+    ДокументPDF = Новый ДокументPDF;
+    ДокументPDF.Прочитать(ИмяФайла);
+    ДокументPDF.ПреобразоватьВОттенкиСерого();
+    ДокументPDF.ДобавитьПодпись(Неопределено, Неопределено);
+    Запись = Новый ЗаписьPDF;
+    Запись.Открыть(ИмяФайла);
+    Запись.ПреобразоватьВОттенкиСерого();
+    Запись.Закрыть();
+    Пользователи = СистемаВзаимодействия.ПолучитьПользователей();
+    #КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert_eq!(
+            diags[0].0, "Метод 'ПолучитьПользователей' недоступен [Тонкий клиент]",
+            "the control must still be flagged on the thin client only"
+        );
+    }
+
+    #[test]
+    fn client_executable_pdf_and_formatted_document_methods_available_in_client_english() {
+        let fixture = r#"
+//- /Catalogs/Товары/Forms/ФормаЭлемента/Ext/Form/Module.bsl
+&AtClient
+Procedure Process(FileName)
+    #If NOT WebClient Then
+    Document = New FormattedDocument;
+    Document.SetHTML("<p>x</p>", New Structure);
+    PDF = New PDFDocument;
+    PDF.Read(FileName);
+    PDF.ConvertToGrayScale();
+    PDF.AddSignature(Undefined, Undefined);
+    Writer = New PDFWriter;
+    Writer.Open(FileName);
+    Writer.ConvertToGrayScale();
+    Writer.Close();
+    Users = CollaborationSystem.GetUsers();
+    #EndIf
+EndProcedure
+"#;
+        let diags = env_diags(fixture);
+        assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
+        assert!(
+            (diags[0].0.contains("GetUsers") || diags[0].0.contains("ПолучитьПользователей"))
+                && diags[0].0.ends_with("[Тонкий клиент]"),
+            "the control must still be flagged on the thin client only: {}",
+            diags[0].0
+        );
+    }
+
     #[test]
     fn common_module_without_client_flag_not_checked_against_client() {
         // A server common module calling server API — no diagnostics.

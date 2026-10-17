@@ -680,8 +680,31 @@ fn apply_docs_gap_member_context_overlay(
             context.thick_client = true;
             context.mobile_client = true;
         }
+        if CLIENT_EXECUTABLE_METHODS
+            .iter()
+            .any(|(ty, name)| method.type_name == *ty && method.english_name == *name)
+        {
+            context.thin_client = true;
+            context.thick_client = true;
+        }
     }
 }
+
+/// Methods whose pages (8.3.17 and 8.3.27 help alike) omit the thin client —
+/// and, for `ФорматированныйДокумент.УстановитьHTML`, the thick client too —
+/// although the platform executes them there: a live run in the thin client and
+/// in the thick client (managed application) on 8.3.17 and on 8.3.27 (with and
+/// without a compatibility mode) completes the call, while a method that is
+/// really missing from the thin client fails with "Метод объекта не обнаружен".
+/// The PDF methods appear in 8.3.18–8.3.22 and were checked on 8.3.27 only.
+/// The web and mobile clients were not checked and are left as the help says.
+/// Pairs: English type name, English method name.
+const CLIENT_EXECUTABLE_METHODS: &[(&str, &str)] = &[
+    ("FormattedDocument", "SetHTML"),
+    ("PDFDocument", "ConvertToGrayScale"),
+    ("PDFDocument", "AddSignature"),
+    ("PDFWriter", "ConvertToGrayScale"),
+];
 
 /// Synchronous `HTTPСоединение` methods whose pages, since the 8.3.21 help,
 /// list only server environments. The same pages say the call on the client is
@@ -1277,6 +1300,39 @@ mod tests {
             );
             assert!(ctx.server && ctx.external_connection, "{name} keeps its server contexts");
             assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
+        }
+
+        // Narrow: a synchronous collaboration-system method that the thin client
+        // really lacks keeps its markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        assert!(ctx.thick_client, "the control keeps the thick client");
+    }
+
+    #[test]
+    fn docs_gap_overlay_adds_client_contexts_of_client_executable_methods() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for (ty, name) in [
+            ("ФорматированныйДокумент", "УстановитьHTML"),
+            ("ДокументPDF", "ПреобразоватьВОттенкиСерого"),
+            ("ДокументPDF", "ДобавитьПодпись"),
+            ("ЗаписьPDF", "ПреобразоватьВОттенкиСерого"),
+        ] {
+            let method = data.get_method(ty, name).expect("method must exist");
+            let ctx = method.context.as_ref().expect("method must carry availability");
+            assert!(
+                ctx.thin_client && ctx.thick_client,
+                "{ty}.{name} runs in the thin and thick client"
+            );
+            assert!(ctx.server, "{ty}.{name} keeps the server");
+            assert!(!ctx.web_client, "{ty}.{name}: the web client was not checked and stays out");
         }
 
         // Narrow: a synchronous collaboration-system method that the thin client

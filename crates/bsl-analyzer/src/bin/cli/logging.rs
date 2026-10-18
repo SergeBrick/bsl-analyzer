@@ -16,7 +16,8 @@ pub const PID_PLACEHOLDER: &str = "{pid}";
 /// value (several editor windows, an LSP server next to an MCP server) overwrite one
 /// another's log and a crashed worker's trail is lost. The placeholder is an opt-in
 /// to one file per process; a value without it is returned unchanged and keeps the
-/// single truncate-on-start file.
+/// single truncate-on-start file. A pid is unique only among live processes, so the
+/// file of a finished process is truncated once the OS hands its pid to a new one.
 pub fn expand_log_file_path(path: PathBuf, pid: u32) -> PathBuf {
     match path.to_str() {
         Some(text) if text.contains(PID_PLACEHOLDER) => {

@@ -21,7 +21,8 @@ use crate::{
     ToolGate,
 };
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// A hang watchdog for every wait in this file, not a latency budget.
+const SHUTDOWN_TIMEOUT: Duration = crate::change_hub::test_support::STATE_CEILING;
 
 struct WorkspaceStreamCleanup {
     state: SharedState,

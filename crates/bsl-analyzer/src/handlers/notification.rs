@@ -19,8 +19,23 @@ fn is_handled_uri(uri: &Url) -> bool {
 
 /// Whether `uri` names a document the project's `[source].exclude` took out. Such a
 /// document stays in the editor's buffer set but is never analysed.
-fn is_excluded_document(state: &GlobalState, uri: &Url) -> bool {
-    uri.to_file_path().is_ok_and(|path| state.is_source_excluded_resolved(&path))
+pub(crate) fn is_excluded_document(state: &GlobalState, uri: &Url) -> bool {
+    let project = state.project.clone().or_else(|| {
+        state.analysis_host.owner().and_then(|owner| match owner.project() {
+            mcp_server::WorkspaceRead::Ready(project) => Some(project),
+            _ => None,
+        })
+    });
+    uri.to_file_path().is_ok_and(|path| match project {
+        Some(project) => project
+            .source_exclusions()
+            .respelled_under(&project.source_roots())
+            .is_excluded_resolved(&path),
+        None => {
+            state.analysis_host.owner().is_none()
+                && state.source_exclusions.is_excluded_resolved(&path)
+        }
+    })
 }
 
 /// Cancel whatever diagnostics work is pending for `uri` and clear what was published
@@ -84,6 +99,7 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
         Some(t) => t,
         None => return,
     };
+    let Some(version) = state.mem_docs.get_version(uri) else { return };
     let path = uri.to_file_path().ok();
     let workspace_root = state.workspace_root.clone();
     let diagnostics_baseline = Arc::clone(&state.diagnostics_baseline);
@@ -162,13 +178,20 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
                 Task::DiagnosticsReady {
                     uri,
                     diagnostics,
+                    version,
                     generation,
                     completed_at: Instant::now(),
                 }
             }
-            Err(_) => {
-                tracing::debug!(%uri, queue_wait_ms, compute_ms, "diagnostics cancelled");
-                Task::DiagnosticsCancelled { generation, completed_at: Instant::now() }
+            Err(kind) => {
+                tracing::debug!(%uri, ?kind, queue_wait_ms, compute_ms, "diagnostics cancelled");
+                Task::DiagnosticsCancelled {
+                    uri,
+                    version,
+                    generation,
+                    kind,
+                    completed_at: Instant::now(),
+                }
             }
         }
     });
@@ -180,6 +203,49 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
         state.diagnostics_tokens.remove(&retry_uri);
         state.enqueue_pending_diagnostics(retry_uri);
     }
+}
+
+/// Put an editor buffer into the shared session's view as an open document, the
+/// view's text for `file_id` from then on.
+pub(crate) fn open_shared_document(
+    state: &mut GlobalState,
+    uri: &Url,
+    file_id: vfs::FileId,
+    text: &str,
+) {
+    let Some(owner) = state.analysis_host.owner().cloned() else { return };
+    state.open_file_uri_ids.insert(uri.clone(), file_id);
+    let start_seed = state.analysis_host.view().is_none();
+    state.analysis_host.prepare_view_for_open();
+    if start_seed {
+        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
+        state.shared_view_seeded = false;
+        state.shared_seed_queued = true;
+    }
+    state.update_diagnostics_config();
+    state.update_features_config();
+    let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
+    state.open_files.insert(file_id);
+    if let Some(view) = state.analysis_host.view_mut() {
+        view.open(file_id, path.clone(), Arc::from(text));
+    }
+    state.mark_shared_view_changed();
+    state.schedule_shared_seed();
+    let vfs_path = vfs::VfsPath::new(path);
+    let mut vfs = state.vfs.write();
+    vfs.set_file_contents(vfs_path, Some(Arc::from(text)));
+    let _ = vfs.take_changes();
+    drop(vfs);
+    state.vfs_done = matches!(
+        owner.readiness(),
+        mcp_server::WorkspaceReadiness::Ready { .. }
+            | mcp_server::WorkspaceReadiness::Frozen { .. }
+    ) && state.shared_view_seeded;
+    state.clear_batch_push_for(uri);
+    if state.vfs_done {
+        preload_dependencies(state, file_id);
+    }
+    schedule_diagnostics(state, uri);
 }
 
 pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParams) -> Result<()> {
@@ -207,6 +273,10 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
     }
 
     let file_id = state.vfs_file_for_url(&uri)?;
+    if state.analysis_host.is_shared() {
+        open_shared_document(state, &uri, file_id, &text);
+        return Ok(());
+    }
     // Mark open BEFORE process_changes so the edit is stored as a resident
     // overlay (authoritative for unsaved content), not disk-backed.
     state.open_files.insert(file_id);
@@ -372,9 +442,12 @@ pub fn handle_did_change(
         params.content_changes.len()
     );
 
-    if let Err(err) =
-        state.mem_docs.update_with_encoding(&uri, params.content_changes, state.position_encoding)
-    {
+    if let Err(err) = state.mem_docs.update_versioned(
+        &uri,
+        params.content_changes,
+        state.position_encoding,
+        version,
+    ) {
         tracing::error!(%uri, error = %err, encoding = ?state.position_encoding, "didChange edit rejected");
         return Ok(());
     }
@@ -389,6 +462,21 @@ pub fn handle_did_change(
         .mem_docs
         .get(&uri)
         .ok_or_else(|| anyhow::anyhow!("Document not in MemDocs: {}", uri))?;
+
+    if state.analysis_host.is_shared() {
+        let file_id = state.vfs_file_for_url(&uri)?;
+        if let Some(view) = state.analysis_host.view_mut() {
+            view.change(file_id, Arc::from(text.as_str()));
+        }
+        state.mark_shared_view_changed();
+        let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
+        let mut vfs = state.vfs.write();
+        vfs.set_file_contents(vfs::VfsPath::new(path), Some(Arc::from(text.as_str())));
+        let _ = vfs.take_changes();
+        drop(vfs);
+        state.enqueue_pending_diagnostics(uri);
+        return Ok(());
+    }
 
     {
         let vfs_path = vfs::VfsPath::new(
@@ -416,8 +504,85 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
 
     if is_excluded_document(state, &uri) {
         state.scope_dirty_docs.remove(&uri);
-        state.mem_docs.remove(&uri);
         withdraw_document_diagnostics(state, &uri);
+        state.mem_docs.remove(&uri);
+        state.open_file_uri_ids.remove(&uri);
+        return Ok(());
+    }
+
+    if let Some(owner) = state.analysis_host.owner().cloned() {
+        if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
+            let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
+            if let Some(token) = state.preload_tokens.remove(&file_id) {
+                token.cancel();
+            }
+            state.open_files.remove(&file_id);
+            let accepted = match owner.refresh_saved_path(&path) {
+                mcp_server::WorkspaceRead::Ready(snapshot) => {
+                    state.analysis_host.catch_up();
+                    state.shared_view_seeded
+                        && state
+                            .analysis_host
+                            .view()
+                            .is_some_and(|view| view.generation() >= snapshot.generation)
+                }
+                _ => false,
+            };
+            if accepted {
+                if let Some(view) = state.analysis_host.view_mut() {
+                    view.close(file_id);
+                }
+            } else {
+                // A close must not expose a disk revision captured before the save.
+                state.analysis_host.take_view();
+                state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
+                state.shared_view_seeded = false;
+                state.shared_seed_queued = !state.open_files.is_empty();
+                state.vfs_done = false;
+                if !state.open_files.is_empty() {
+                    state.analysis_host.prepare_view_for_open();
+                    for uri in state.opened_document_uris() {
+                        let Ok(remaining) = crate::lsp::file_id(state, &uri) else { continue };
+                        if !state.open_files.contains(&remaining) {
+                            continue;
+                        }
+                        let path = state.vfs.read().file_path(remaining).as_path().to_path_buf();
+                        if let Some(text) = state.mem_docs.get(&uri) {
+                            if let Some(view) = state.analysis_host.view_mut() {
+                                view.open(remaining, path, Arc::from(text.as_str()));
+                            }
+                        }
+                    }
+                }
+                owner.request_update();
+            }
+            let mut vfs = state.vfs.write();
+            vfs.set_file_contents(vfs::VfsPath::new(path), None);
+            let _ = vfs.take_changes();
+        }
+        state.scope_dirty_docs.remove(&uri);
+        state.mem_docs.remove(&uri);
+        state.open_file_uri_ids.remove(&uri);
+        state.mark_shared_view_changed();
+        if state.open_files.is_empty() {
+            state.analysis_host.take_view();
+            state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
+            state.shared_view_seeded = false;
+            state.shared_seed_queued = false;
+            state.vfs_done = state.analysis_host.owner().is_some_and(|owner| {
+                matches!(
+                    owner.readiness(),
+                    mcp_server::WorkspaceReadiness::Ready { .. }
+                        | mcp_server::WorkspaceReadiness::Frozen { .. }
+                )
+            });
+        }
+        state.schedule_shared_seed();
+        let notification = Notification::new(
+            "textDocument/publishDiagnostics".to_string(),
+            PublishDiagnosticsParams { uri: uri.clone(), diagnostics: vec![], version: None },
+        );
+        state.sender.send(notification.into())?;
         return Ok(());
     }
 
@@ -480,6 +645,7 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
     }
 
     state.mem_docs.remove(&uri);
+    state.open_file_uri_ids.remove(&uri);
 
     let params = PublishDiagnosticsParams { uri: uri.clone(), diagnostics: vec![], version: None };
 
@@ -500,6 +666,25 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
     let _p = tracing::info_span!("handle_did_save", uri = %params.text_document.uri).entered();
 
     let uri = params.text_document.uri;
+
+    if let Some(owner) = state.analysis_host.owner().cloned() {
+        let refreshed = uri.to_file_path().ok().is_some_and(|path| {
+            let notified = owner.notify_changed_path(&path);
+            if project_model::is_bsl_source_path(&path) {
+                matches!(owner.refresh_saved_path(&path), mcp_server::WorkspaceRead::Ready(_))
+            } else {
+                notified
+            }
+        });
+        if !refreshed {
+            owner.request_update();
+        }
+        if state.analysis_host.catch_up() {
+            state.mark_shared_view_changed();
+        }
+        state.scope_dirty_docs.remove(&uri);
+        return Ok(());
+    }
 
     tracing::debug!("Document saved: {}", uri);
 
@@ -554,6 +739,7 @@ pub fn handle_cancel(state: &mut GlobalState, params: lsp_types::CancelParams) -
                 .pending_latency_retries
                 .retain(|pending| pending.id != id || pending.generation != generation);
             state.request_lifecycles.remove(&id);
+            state.shared_request_stamps.remove(&id);
             if state
                 .request_token_owners
                 .get(&id)
@@ -596,6 +782,7 @@ pub fn handle_did_change_watched_files(
 ) -> Result<()> {
     let roots = state.project.as_ref().map(|project| project.source_roots()).unwrap_or_default();
     let workspace_root = state.workspace_root.as_deref();
+    let owner = state.analysis_host.owner().cloned();
     let mut invalidated = 0usize;
     let mut rejected = 0usize;
 
@@ -638,8 +825,16 @@ pub fn handle_did_change_watched_files(
             state.mem_docs.invalidate_identity(&event.uri);
         }
 
-        state.loader.invalidate(abs_path);
-        invalidated += 1;
+        if let Some(owner) = &owner {
+            if owner.notify_changed_path(std_path) {
+                invalidated += 1;
+            } else {
+                rejected += 1;
+            }
+        } else {
+            state.loader.invalidate(abs_path);
+            invalidated += 1;
+        }
     }
 
     tracing::info!(invalidated, rejected, "processed client watched-file events");
@@ -1352,7 +1547,10 @@ mod tests {
         let uri = crate::test_uri::file_uri("mod.bsl");
 
         // The deferred batch had pushed diagnostics for this (then closed) file.
-        state.batch_pushed.insert(uri.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
 
         handle_did_open(
             &mut state,
@@ -1373,6 +1571,44 @@ mod tests {
             !state.batch_pushed.contains_key(&uri),
             "opening a batch-pushed file must clear its batch entry"
         );
+    }
+
+    /// The batch may have published a file under another spelling than the one the editor
+    /// opens it with; the file it resolved to when published still hands it off, and an
+    /// entry for another file stays.
+    #[test]
+    fn did_open_hands_off_a_batch_push_made_under_another_spelling() {
+        let (mut state, _receiver) = create_test_state();
+        let uri = crate::test_uri::file_uri("mod.bsl");
+        let file_id = state.vfs_file_for_url(&uri).unwrap();
+        let other_id = state.vfs_file_for_url(&crate::test_uri::file_uri("other.bsl")).unwrap();
+        let alias = crate::test_uri::file_uri("alias-of-mod.bsl");
+        let unrelated = crate::test_uri::file_uri("unrelated.bsl");
+        for (published, file_id) in [(&alias, file_id), (&unrelated, other_id)] {
+            state.batch_pushed.insert(
+                published.clone(),
+                crate::global_state::BatchPush {
+                    result_id: "h1".to_string(),
+                    file_id: Some(file_id),
+                },
+            );
+        }
+
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri,
+                    language_id: "bsl".to_string(),
+                    version: 1,
+                    text: "Процедура Тест() КонецПроцедуры".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(!state.batch_pushed.contains_key(&alias), "the same file's entry is cleared");
+        assert!(state.batch_pushed.contains_key(&unrelated), "another file's entry stays");
     }
 
     #[test]

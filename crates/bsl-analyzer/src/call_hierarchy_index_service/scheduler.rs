@@ -72,9 +72,9 @@ impl GlobalState {
                 "call hierarchy compact index metadata capture started"
             );
             let frozen = {
-                let db = self.analysis_host.raw_database();
+                let analysis = self.analysis_host.analysis();
                 CallHierarchyIndexFrozenSnapshot::capture(
-                    db,
+                    analysis.database(),
                     source_root,
                     &self.mem_docs.freeze(),
                     generation,

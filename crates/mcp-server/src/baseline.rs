@@ -22,6 +22,34 @@ use std::sync::RwLock as StdRwLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Answer a local test connection with a valid PostgreSQL startup error instead of
+/// leaving the client waiting on a peer that only accepted TCP.
+#[cfg(test)]
+pub(crate) fn reject_postgres_startup_for_test(
+    stream: &mut std::net::TcpStream,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Read, Write};
+
+    // Accepted sockets inherit the listener's nonblocking mode on Windows.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut length = [0; 4];
+    stream.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if !(8..=64 * 1024).contains(&length) {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid PostgreSQL startup length"));
+    }
+    let mut startup = vec![0; length - 4];
+    stream.read_exact(&mut startup)?;
+
+    let fields = b"SFATAL\0C08006\0Msynthetic PostgreSQL test endpoint\0\0";
+    stream.write_all(b"E")?;
+    stream.write_all(&((fields.len() + 4) as u32).to_be_bytes())?;
+    stream.write_all(fields)?;
+    stream.flush()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineResolutionSummary {
     pub backend: String,
@@ -49,13 +77,10 @@ pub(crate) struct BaselineRuntime {
     pub external_baseline: Option<Arc<ExternalBaselineService>>,
 }
 
-/// The outcome of the cheap, local part of baseline resolution.
-///
-/// Everything decidable from config, env, and the credential helper subprocess stays
-/// synchronous (milliseconds), so misconfiguration is still reported instantly and with
-/// today's exact semantics. Only the network part — building the PG source and probing
-/// snapshot support, seconds against a remote server — is deferred behind `Connect`, so
-/// a serve path can move it off the startup critical path.
+/// The outcome of baseline resolution. Ordinary entrypoints keep resolving the configured
+/// credential helper synchronously; shared disk-only owners may instead retain a captured
+/// credential plan until a search consumer activates. The PostgreSQL source/connect work
+/// remains deferred behind `Connect` in either case.
 // No `Debug`: `Connect` carries the resolved connection URL, credentials included —
 // a stray `{:?}` in a log line must not be able to print it.
 pub(crate) enum BaselineBootstrap {
@@ -64,12 +89,18 @@ pub(crate) enum BaselineBootstrap {
     Immediate(BaselineRuntime),
     /// Credentials resolved; connecting to the baseline still requires network work.
     Connect(Box<BaselineConnectPlan>),
+    /// Configuration and selection are captured, but the credential helper has not run.
+    /// Used only by lazy shared-workspace consumers; ordinary entrypoints keep using
+    /// `Immediate`/`Connect` and their historical synchronous credential resolution.
+    ResolveCredentials(Box<BaselineCredentialPlan>),
 }
 
 impl BaselineBootstrap {
     pub(crate) fn with_token_layout_claim(mut self, claim: Option<String>) -> Self {
-        if let Self::Connect(plan) = &mut self {
-            plan.context.token_layout_claim = claim;
+        match &mut self {
+            Self::Connect(plan) => plan.context.token_layout_claim = claim,
+            Self::ResolveCredentials(plan) => plan.context.token_layout_claim = claim,
+            Self::Immediate(_) => {}
         }
         self
     }
@@ -79,6 +110,7 @@ impl BaselineBootstrap {
         match self {
             Self::Immediate(runtime) => runtime,
             Self::Connect(plan) => plan.connect(),
+            Self::ResolveCredentials(plan) => plan.resolve(),
         }
     }
 }
@@ -138,9 +170,14 @@ impl DeferredBaselineRuntime {
         }
     }
 
+    /// A pending slot that does not start the deferred network work.
+    pub(crate) fn pending() -> Self {
+        Self::with_slot(BaselineSlot::Pending)
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_for_test() -> Self {
-        Self::with_slot(BaselineSlot::Pending)
+        Self::pending()
     }
 
     /// Run the plan's network connect on a background thread and publish the outcome.
@@ -151,15 +188,28 @@ impl DeferredBaselineRuntime {
     /// outlives the owning state unmanaged — joining would add a shutdown stall for
     /// no extra safety.
     pub(crate) fn spawn(plan: BaselineConnectPlan) -> Self {
-        let deferred = Self::with_slot(BaselineSlot::Pending);
-        let publish_into = deferred.clone();
+        let deferred = Self::pending();
+        deferred.start(plan);
+        deferred
+    }
+
+    /// Start a previously pending slot's one-shot network initialization.
+    ///
+    /// This lets disk-only workspace attachment preserve a resolved connection plan
+    /// until an MCP search service actually activates. Publication and shutdown use
+    /// the same close-flag handshake as [`Self::spawn`].
+    pub(crate) fn start(&self, plan: BaselineConnectPlan) {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let publish_into = self.clone();
         let spawned = std::thread::Builder::new()
             .name("bsl-baseline-init".to_owned())
             .spawn(move || publish_into.publish(plan.connect()));
         if let Err(e) = spawned {
             // No thread — resolve the slot immediately so waiters cannot hang forever.
             tracing::warn!("could not spawn baseline connect thread: {e}");
-            deferred.publish(BaselineRuntime {
+            self.publish(BaselineRuntime {
                 configured_baseline: ConfiguredBaselineStatus {
                     backend: "postgres",
                     selection: "shared baseline".to_owned(),
@@ -169,7 +219,38 @@ impl DeferredBaselineRuntime {
                 external_baseline: None,
             });
         }
-        deferred
+    }
+
+    /// Start credential resolution and the resulting baseline connection off-thread.
+    /// The worker rechecks closure before launching the external helper; publication
+    /// retains the same close handshake as `start`/`spawn`.
+    pub(crate) fn start_resolution(&self, plan: BaselineCredentialPlan) {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let publish_into = self.clone();
+        let spawned =
+            std::thread::Builder::new().name("bsl-baseline-init".to_owned()).spawn(move || {
+                if publish_into.inner.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                publish_into.publish(plan.resolve());
+            });
+        if let Err(error) = spawned {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return;
+            }
+            tracing::warn!("could not spawn baseline credential resolver: {error}");
+            self.publish(BaselineRuntime {
+                configured_baseline: ConfiguredBaselineStatus {
+                    backend: "postgres",
+                    selection: "shared baseline".to_owned(),
+                    issue: Some(format!("could not spawn baseline credential resolver: {error}")),
+                    support: None,
+                },
+                external_baseline: None,
+            });
+        }
     }
 
     fn publish(&self, runtime: BaselineRuntime) {
@@ -268,6 +349,52 @@ pub(crate) struct BaselineConnectPlan {
     selection: String,
     project_root: Option<PathBuf>,
     policy: SearchBaselinePolicyConfig,
+}
+
+/// A captured PostgreSQL configuration and selected corpus, waiting to invoke the
+/// configured credential helper. Deliberately has no `Debug`: postgres config args
+/// and the resolved connection may contain private credentials.
+pub(crate) struct BaselineCredentialPlan {
+    corpus: CorpusId,
+    project_root: Option<PathBuf>,
+    postgres: SearchPostgresConfig,
+    schema: Option<String>,
+    context: RefreshContext,
+    selection: String,
+    policy: SearchBaselinePolicyConfig,
+}
+
+impl BaselineCredentialPlan {
+    pub(crate) fn corpus(&self) -> &CorpusId {
+        &self.corpus
+    }
+
+    fn resolve(self) -> BaselineRuntime {
+        let Self { corpus, project_root, postgres, schema, context, selection, policy } = self;
+        match resolve_postgres_url(&postgres, PostgresAccessMode::Reader) {
+            Ok(resolved) => BaselineConnectPlan {
+                corpus,
+                connection: resolved.url,
+                schema,
+                context,
+                selection,
+                project_root,
+                policy,
+            }
+            .connect(),
+            Err(error) => BaselineRuntime {
+                configured_baseline: ConfiguredBaselineStatus {
+                    backend: "postgres",
+                    selection,
+                    issue: Some(format!(
+                        "failed to resolve PostgreSQL reader credentials: {error}"
+                    )),
+                    support: None,
+                },
+                external_baseline: None,
+            },
+        }
+    }
 }
 
 impl BaselineConnectPlan {
@@ -470,6 +597,23 @@ impl BaselineRuntime {
         project_root: Option<&Path>,
         project_config: &ProjectConfig,
     ) -> BaselineBootstrap {
+        Self::workspace_bootstrap_with_resolution(project_root, project_config, false)
+    }
+
+    /// Capture a workspace baseline plan without invoking its external credential helper.
+    /// The shared disk-only owner starts this plan only when MCP workspace services activate.
+    pub(crate) fn workspace_bootstrap_deferred(
+        project_root: Option<&Path>,
+        project_config: &ProjectConfig,
+    ) -> BaselineBootstrap {
+        Self::workspace_bootstrap_with_resolution(project_root, project_config, true)
+    }
+
+    fn workspace_bootstrap_with_resolution(
+        project_root: Option<&Path>,
+        project_config: &ProjectConfig,
+        defer_credentials: bool,
+    ) -> BaselineBootstrap {
         Self::bootstrap_for_corpus(
             CorpusId::WorkspaceCode,
             project_root,
@@ -477,6 +621,7 @@ impl BaselineRuntime {
             "BSL_SEARCH_BASELINE",
             &["BSL_SEARCH_BASELINE_PG_SCHEMA"],
             false,
+            defer_credentials,
         )
     }
 
@@ -485,6 +630,21 @@ impl BaselineRuntime {
     }
 
     pub(crate) fn reference_bootstrap(project_config: Option<&ProjectConfig>) -> BaselineBootstrap {
+        Self::reference_bootstrap_with_resolution(project_config, false)
+    }
+
+    /// Capture the reference baseline without running credentials; shared workspaces call
+    /// this from the reference search's existing lazy activation path.
+    pub(crate) fn reference_bootstrap_deferred(
+        project_config: Option<&ProjectConfig>,
+    ) -> BaselineBootstrap {
+        Self::reference_bootstrap_with_resolution(project_config, true)
+    }
+
+    fn reference_bootstrap_with_resolution(
+        project_config: Option<&ProjectConfig>,
+        defer_credentials: bool,
+    ) -> BaselineBootstrap {
         Self::bootstrap_for_corpus(
             CorpusId::Reference,
             None,
@@ -492,6 +652,7 @@ impl BaselineRuntime {
             "BSL_SEARCH_REFERENCE",
             &["BSL_SEARCH_REFERENCE_PG_SCHEMA", "BSL_SEARCH_BASELINE_PG_SCHEMA"],
             project_config.is_none(),
+            defer_credentials,
         )
     }
 
@@ -503,6 +664,7 @@ impl BaselineRuntime {
         selection_prefix: &str,
         schema_keys: &[&str],
         allow_env_backend_without_config: bool,
+        defer_credentials: bool,
     ) -> BaselineBootstrap {
         let configured_backend = project_config.map(|config| config.backend.clone());
         let use_postgres = matches!(configured_backend, Some(SearchBaselineBackend::Postgres));
@@ -566,25 +728,7 @@ impl BaselineRuntime {
             });
         }
 
-        let connection = match resolve_postgres_url(postgres, PostgresAccessMode::Reader) {
-            Ok(resolved) => resolved.url,
-            Err(error) => {
-                return BaselineBootstrap::Immediate(BaselineRuntime {
-                    configured_baseline: ConfiguredBaselineStatus {
-                        backend: "postgres",
-                        selection,
-                        issue: Some(format!(
-                            "failed to resolve PostgreSQL reader credentials: {error}"
-                        )),
-                        support: None,
-                    },
-                    external_baseline: None,
-                });
-            }
-        };
-
         let schema = resolve_schema(schema_keys, postgres);
-
         let context = RefreshContext {
             token_layout_claim: None,
             postgres: postgres.clone(),
@@ -593,15 +737,41 @@ impl BaselineRuntime {
             schema_keys: schema_keys.iter().map(|s| s.to_string()).collect(),
         };
 
-        BaselineBootstrap::Connect(Box::new(BaselineConnectPlan {
+        let credential_plan = BaselineCredentialPlan {
             corpus,
-            connection,
+            project_root: project_root.map(Path::to_path_buf),
+            postgres: postgres.clone(),
             schema,
             context,
             selection,
-            project_root: project_root.map(Path::to_path_buf),
             policy: baseline_target.policy.clone(),
-        }))
+        };
+        if defer_credentials {
+            BaselineBootstrap::ResolveCredentials(Box::new(credential_plan))
+        } else {
+            match resolve_postgres_url(&credential_plan.postgres, PostgresAccessMode::Reader) {
+                Ok(resolved) => BaselineBootstrap::Connect(Box::new(BaselineConnectPlan {
+                    corpus: credential_plan.corpus,
+                    connection: resolved.url,
+                    schema: credential_plan.schema,
+                    context: credential_plan.context,
+                    selection: credential_plan.selection,
+                    project_root: credential_plan.project_root,
+                    policy: credential_plan.policy,
+                })),
+                Err(error) => BaselineBootstrap::Immediate(BaselineRuntime {
+                    configured_baseline: ConfiguredBaselineStatus {
+                        backend: "postgres",
+                        selection: credential_plan.selection,
+                        issue: Some(format!(
+                            "failed to resolve PostgreSQL reader credentials: {error}"
+                        )),
+                        support: None,
+                    },
+                    external_baseline: None,
+                }),
+            }
+        }
     }
 
     fn summary(&self) -> BaselineResolutionSummary {
@@ -2051,12 +2221,14 @@ fn platform_reference_documents() -> Vec<Document> {
 #[cfg(test)]
 mod tests {
     use super::{
-        baseline_description, resolve_project_baseline_diagnostics, uncancellable,
-        BaselineBootstrap, BaselineRequestKind, BaselineRuntime, BaselineServiceRequest,
+        baseline_description, reject_postgres_startup_for_test,
+        resolve_project_baseline_diagnostics, uncancellable, BaselineBootstrap,
+        BaselineConnectPlan, BaselineRequestKind, BaselineRuntime, BaselineServiceRequest,
         BaselineSlot, BaselineStatusProbe, ConfiguredBaselineStatus, DeferredBaselineRuntime,
         ExternalBaselineService, ExternalBaselineSource, ExternalBaselineState,
-        ExternalBaselineStatus, RefreshOrTerminalError, RefreshableExternalBaselineSource,
-        ResolvedSnapshot, StatusProbeState, SNAPSHOT_CACHE_TTL,
+        ExternalBaselineStatus, RefreshContext, RefreshOrTerminalError,
+        RefreshableExternalBaselineSource, ResolvedSnapshot, SearchBaselinePolicyConfig,
+        StatusProbeState, SNAPSHOT_CACHE_TTL,
     };
     use bsl_search::{BaselineRef, CorpusId, ExternalBaselineConfig, SearchError};
     use project_model::{
@@ -2112,6 +2284,79 @@ mod tests {
         };
         assert!(matches!(plan.corpus(), CorpusId::WorkspaceCode));
         assert_eq!(plan.context.token_layout_claim.as_deref(), Some("profile-v1:token-layout"));
+    }
+
+    #[test]
+    fn pending_baseline_connects_only_after_start() {
+        use std::io::ErrorKind;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let deferred = DeferredBaselineRuntime::pending();
+        assert!(deferred.view().pending);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
+
+        let baseline = BaselineRef {
+            corpus: CorpusId::WorkspaceCode,
+            snapshot_id: None,
+            branch: Some("main".to_owned()),
+            commit: None,
+        };
+        let plan = BaselineConnectPlan {
+            corpus: CorpusId::WorkspaceCode,
+            connection: format!("postgres://test:test@{address}/bsl_test?connect_timeout=1"),
+            schema: Some("bsl_search".to_owned()),
+            context: RefreshContext {
+                token_layout_claim: None,
+                postgres: SearchPostgresConfig::default(),
+                baselines: vec![baseline],
+                selection: "branch main".to_owned(),
+                schema_keys: vec![],
+            },
+            selection: "branch main".to_owned(),
+            project_root: None,
+            policy: SearchBaselinePolicyConfig {
+                publish_branches: vec!["main".to_owned()],
+                ..SearchBaselinePolicyConfig::default()
+            },
+        };
+
+        deferred.start(plan);
+
+        // The adapter's r2d2 pool retries failed connects until its 5s connection_timeout;
+        // allow that configured bound plus worker scheduling, not an arbitrary longer wait.
+        let deadline =
+            std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(8));
+        let mut accepted = 0;
+        let mut protocol_error = None;
+        while std::time::Instant::now() < deadline && deferred.view().pending {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    accepted += 1;
+                    if let Err(error) = reject_postgres_startup_for_test(&mut stream) {
+                        protocol_error = Some(error.to_string());
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                }
+                Err(error) => {
+                    protocol_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let ready = !deferred.view().pending;
+        deferred.shutdown();
+        assert!(accepted > 0, "activation should reach only the local PostgreSQL mock");
+        assert!(protocol_error.is_none(), "test PostgreSQL peer failed: {protocol_error:?}");
+        assert!(ready, "the bounded PostgreSQL refusal should publish a terminal baseline result");
     }
 
     #[test]

@@ -193,25 +193,25 @@ fn wait_lsp_target(
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(!remaining.is_zero(), "LSP never resolved {needle}");
+        assert!(!remaining.is_zero(), "LSP never resolved {needle} to {target_uri}");
         let response = lsp_definition(lsp, id, uri, needle, remaining);
         if response["error"]["code"] == -32801 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "LSP definition remained ContentModified for {needle}: {response}"
+                "LSP definition remained ContentModified for {needle} targeting {target_uri}: {response}"
             );
             id += 1;
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
-        assert!(response["error"].is_null(), "LSP definition failed: {response}");
-        if response["result"].to_string().contains(target_uri.as_str()) {
+        assert!(response["error"].is_null(), "LSP definition failed for {target_uri}: {response}");
+        if common::definition_targets_file(&response["result"], target_uri) {
             return;
         }
         assert!(
             response["result"].is_null()
                 || response["result"].as_array().is_some_and(Vec::is_empty),
-            "definition resolved to an unexpected source-set target: {response}"
+            "definition did not resolve to expected source-set target {target_uri}: {response}"
         );
         assert!(std::time::Instant::now() < deadline, "LSP never resolved {needle}");
         id += 1;

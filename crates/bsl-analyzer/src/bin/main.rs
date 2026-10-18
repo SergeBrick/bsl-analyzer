@@ -176,7 +176,7 @@ enum Commands {
         check: bool,
     },
 
-    Lsp,
+    Lsp(cli::lsp::LspArgs),
 
     Mcp {
         #[command(subcommand)]
@@ -424,7 +424,8 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             run_smoke(source_dir, scenarios, budgets, json)
         }
         Some(Commands::Bench { command }) => run_bench(command),
-        Some(Commands::Lsp) | None => run_lsp_server(),
+        Some(Commands::Lsp(args)) => run_lsp_server(args),
+        None => run_lsp_server(cli::lsp::LspArgs::default()),
     }
 }
 
@@ -615,6 +616,7 @@ mod contract_surface {
                 spaces
                 write (-w) !check
               lsp
+                mode = auto | stdio
               mcp
                 serve
                   allowed_hosts !config

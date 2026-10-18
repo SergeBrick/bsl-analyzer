@@ -422,8 +422,8 @@ async fn extension_dependency_exclusion_and_duplicate_names_match_across_protoco
     let provider_target = definition(&mut lsp, 3, &consumer_uri, "ДатьСтроку");
     assert!(provider_target["error"].is_null(), "LSP definition failed: {provider_target}");
     assert!(
-        provider_target["result"].to_string().contains(provider_uri.as_str()),
-        "LSP definition comes from the declared dependency: {provider_target}"
+        common::definition_targets_file(&provider_target["result"], &provider_uri),
+        "LSP definition comes from the declared dependency at {provider_uri}: {provider_target}"
     );
 
     let base_call = wait_mcp_call_type(&client, &consumer_path, "Спорный", "Число", false).await;
@@ -446,8 +446,8 @@ async fn extension_dependency_exclusion_and_duplicate_names_match_across_protoco
     let base_target = definition(&mut lsp, 5, &consumer_uri, "Спорный");
     assert!(base_target["error"].is_null(), "LSP definition failed: {base_target}");
     assert!(
-        base_target["result"].to_string().contains(base_uri.as_str()),
-        "LSP definition uses the base configuration body: {base_target}"
+        common::definition_targets_file(&base_target["result"], &base_uri),
+        "LSP definition uses the base configuration body at {base_uri}: {base_target}"
     );
 
     let excluded = symbol_status(&client, "СкрытыйМодуль.СекретныйМетод").await;
@@ -644,8 +644,8 @@ async fn effective_settings_compatibility_and_execution_context_match_live_adapt
     let provider_definition = definition(&mut lsp, 3, &consumer_uri, "ДатьСтроку");
     assert!(provider_definition["error"].is_null(), "LSP definition failed: {provider_definition}");
     assert!(
-        provider_definition["result"].to_string().contains(provider_uri.as_str()),
-        "provider target: {provider_definition}"
+        common::definition_targets_file(&provider_definition["result"], &provider_uri),
+        "provider target {provider_uri}: {provider_definition}"
     );
 
     let disabled_config = analysis_config(&original_config, Some("Version8_2_13"), false);
@@ -692,8 +692,8 @@ async fn effective_settings_compatibility_and_execution_context_match_live_adapt
         "LSP definition failed after rule toggle: {retained_definition}"
     );
     assert!(
-        retained_definition["result"].to_string().contains(provider_uri.as_str()),
-        "provider target survives the rule toggle: {retained_definition}"
+        common::definition_targets_file(&retained_definition["result"], &provider_uri),
+        "provider target {provider_uri} survives the rule toggle: {retained_definition}"
     );
 
     let restored_config = analysis_config(&original_config, Some("Version8_2_13"), true);
@@ -763,8 +763,8 @@ async fn effective_settings_compatibility_and_execution_context_match_live_adapt
         "LSP definition failed after XML fallback: {fallback_definition}"
     );
     assert!(
-        fallback_definition["result"].to_string().contains(provider_uri.as_str()),
-        "XML compatibility fallback preserves LSP provider target: {fallback_definition}"
+        common::definition_targets_file(&fallback_definition["result"], &provider_uri),
+        "XML compatibility fallback preserves LSP provider target {provider_uri}: {fallback_definition}"
     );
 
     assert_eq!(source_section(&xml_fallback), source_section(&original_config));

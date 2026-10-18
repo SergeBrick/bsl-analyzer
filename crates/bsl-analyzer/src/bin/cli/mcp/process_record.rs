@@ -57,10 +57,14 @@ impl ProcessRecordGuard {
             if let Some(root) =
                 mcp_server::WorkspaceCacheLayout::overlapping_source_root(&project, &path)?
             {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
-                    "automatic MCP process record {} overlaps source root {}; choose another source/cache layout",
-                    path.display(), root.display()
-                )));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "automatic MCP process record {} overlaps source root {}; choose another source/cache layout",
+                        path.display(),
+                        root.display()
+                    ),
+                ));
             }
         }
         let parent = path.parent().ok_or_else(|| {

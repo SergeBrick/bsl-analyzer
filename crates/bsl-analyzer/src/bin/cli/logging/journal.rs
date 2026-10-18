@@ -1,7 +1,9 @@
 //! Scoped, best-effort JSONL journal. All disk work belongs to the single worker.
 use crossbeam_channel::{bounded, Receiver, Sender};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
@@ -355,19 +357,20 @@ fn current_uid() -> u32 {
 }
 
 fn file(path: &Path, create: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path)?;
+    let file = windows::private_file(path, create)?;
+
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(create);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options.open(path)?
+    };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(invalid());
@@ -623,6 +626,29 @@ mod tests {
         #[cfg(windows)]
         {
             windows::verify_private(&path).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_journal_files_are_private_and_existing_unsafe_files_are_preserved() {
+        let directory = private_temp();
+        let created = directory.path().join("0.jsonl");
+        let created_file = file(&created, true).unwrap();
+        windows::verify_private(&created).unwrap();
+        drop(created_file);
+
+        let unsafe_existing = directory.path().join("unsafe.jsonl");
+        fs::write(&unsafe_existing, b"preserve-me").unwrap();
+        // On the service token used by Windows acceptance, ordinary creation
+        // assigns Administrators as owner even beneath a private directory.
+        // Only exercise the unsafe-file path when this fixture has that unsafe
+        // owner; ordinary desktop tokens may assign the current SID instead.
+        if windows::verify_private(&unsafe_existing).is_err() {
+            for create in [false, true] {
+                assert!(file(&unsafe_existing, create).is_err());
+            }
+            assert_eq!(fs::read(&unsafe_existing).unwrap(), b"preserve-me");
         }
     }
 

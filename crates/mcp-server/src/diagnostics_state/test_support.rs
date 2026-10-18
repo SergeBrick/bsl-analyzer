@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::change_hub::{SinkCursor, WorkspaceChangeHub};
 
-use super::lifecycle::{lock_recover, DiagnosticsState};
+use super::lifecycle::{lock_inner, lock_recover, DiagnosticsState};
 use super::types::{DiagnosticsStatus, ResidentOutcome};
 
 /// A private copy of the checked-in metadata fixture, so derived caches never land in the
@@ -348,7 +348,7 @@ pub(super) fn discard_until_quiet(
 }
 
 pub(super) fn raw_generation(state: &DiagnosticsState) -> u64 {
-    lock_recover(&state.inner).generation
+    lock_inner(&state.inner).generation
 }
 
 pub(super) fn wait_for_apply(state: &DiagnosticsState, generation: u64, what: &str) {

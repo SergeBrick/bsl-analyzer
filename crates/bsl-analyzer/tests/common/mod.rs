@@ -30,6 +30,25 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_SHUTDOWN_TIMEOUT: Duration = test_utils::wait::ceiling(Duration::from_secs(10));
 
+/// Match a closed LSP definition by the file it names, not by its serialized URI spelling.
+/// The result may be a `Location`, an array of `Location`s, or `LocationLink`s.
+pub fn definition_targets_file(result: &Value, expected_uri: &lsp_types::Url) -> bool {
+    let Ok(expected_path) = expected_uri.to_file_path() else { return false };
+    let Ok(expected_path) = expected_path.canonicalize() else { return false };
+    let locations = result.as_array().map_or_else(|| std::slice::from_ref(result), Vec::as_slice);
+
+    locations.iter().any(|location| {
+        let Some(uri) =
+            location.get("uri").or_else(|| location.get("targetUri")).and_then(Value::as_str)
+        else {
+            return false;
+        };
+        let Ok(uri) = lsp_types::Url::parse(uri) else { return false };
+        let Ok(path) = uri.to_file_path() else { return false };
+        path.canonicalize().is_ok_and(|actual| actual == expected_path)
+    })
+}
+
 pub fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -82,6 +101,8 @@ pub struct Lsp {
     pub child: Child,
     pub stdin: ChildStdin,
     pub messages: Receiver<Value>,
+    pub initialize_response: Value,
+    stderr_output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     /// Server notifications sent during initialize are valid LSP traffic too; keep
     /// them for the test that owns the channel instead of eating them while waiting
     /// for the initialize response.
@@ -100,16 +121,50 @@ impl Lsp {
     /// same document a real editor sends in `initialize`. An empty object is the
     /// capability-less client `start` has always used.
     pub fn start_with_capabilities(root: &Path, capabilities: Value) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"))
-            .arg("lsp")
+        Self::start_with_mode_and_capabilities(root, None, capabilities)
+    }
+
+    pub fn start_stdio(root: &Path) -> Self {
+        Self::start_with_mode_and_capabilities(root, Some("stdio"), json!({}))
+    }
+
+    fn start_with_mode_and_capabilities(
+        root: &Path,
+        mode: Option<&str>,
+        capabilities: Value,
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+        command.arg("lsp");
+        if let Some(mode) = mode {
+            command.args(["--mode", mode]);
+        }
+        let mut child = command
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_capture = std::sync::Arc::clone(&stderr_output);
+        std::thread::spawn(move || {
+            let mut reader = stderr;
+            let mut buffer = [0; 2048];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                let mut output = stderr_capture.lock().unwrap();
+                output.extend_from_slice(&buffer[..read]);
+                if output.len() > 64 * 1024 {
+                    let excess = output.len() - 64 * 1024;
+                    output.drain(..excess);
+                }
+            }
+        });
         let (tx, messages) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -143,6 +198,8 @@ impl Lsp {
             child,
             stdin,
             messages,
+            initialize_response: Value::Null,
+            stderr_output,
             pending: Default::default(),
             recent: Default::default(),
         };
@@ -174,7 +231,8 @@ impl Lsp {
                 ),
             };
             lsp.note_seen(&message);
-            if message["id"] == 1 {
+            if message["id"] == 1 && message["method"].is_null() {
+                lsp.initialize_response = message.clone();
                 break;
             }
             lsp.pending.lock().unwrap().push_back(message);
@@ -187,6 +245,10 @@ impl Lsp {
         let body = message.to_string();
         write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
         self.stdin.flush().unwrap();
+    }
+
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr_output.lock().unwrap()).into_owned()
     }
 
     /// Wait for a message, telling a server that is busy from one that is done.
@@ -248,9 +310,9 @@ impl Lsp {
             };
             assert!(
                 worked,
-                "waiting at {caller} for {waited:?}: the server answered nothing for \
-                 {silence:?} and used no CPU in that time, so it is not working towards \
-                 an answer — the awaited condition is one it will not meet. Last messages \
+                "waiting at {caller} for {waited:?}: LSP child answered nothing for \
+                 {silence:?} and used no CPU in that time; auto mode can run analysis in \
+                 a separate backend, whose activity is not measured here. Last messages \
                  seen from LSP child {}: {}",
                 self.child.id(),
                 self.recent_methods(),
@@ -258,8 +320,8 @@ impl Lsp {
         }
     }
 
-    /// CPU time the server process has used so far, in scheduler ticks: whether it is
-    /// working, not how hard. Linux only; elsewhere there is no reading.
+    /// CPU time of the child (a proxy in auto mode), in scheduler ticks.
+    /// This does not measure the shared backend. Linux only.
     fn server_cpu_ticks(&self) -> Option<u64> {
         if !cfg!(target_os = "linux") {
             return None;
@@ -328,8 +390,9 @@ impl Lsp {
                 Err(mpsc::RecvTimeoutError::Timeout) => return None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!(
-                        "LSP child {pid} phase message wait at {caller}: output closed before matching a message; recent messages: {}",
-                        self.recent_methods()
+                        "LSP child {pid} phase message wait at {caller}: output closed before matching a message; recent messages: {}; stderr: {}",
+                        self.recent_methods(),
+                        self.stderr_text()
                     )
                 }
             };

@@ -206,7 +206,9 @@ async fn relay_lsp(
                     cancel_pending(&connection.sender, &mut pending);
                     if !initialized || shutdown_requested { break Err(anyhow::anyhow!("workspace retired during initialization or shutdown")); }
                     if awaiting_rebind_ready { break Err(anyhow::anyhow!("workspace retired again before the rebound session became ready")); }
-                    awaiting_rebind_ready = true;
+                    // Only a replayed document can confirm the rebound session: with none
+                    // open there is nothing to confirm, and nothing a later rebind could lose.
+                    awaiting_rebind_ready = !documents.is_empty();
                     pending_rebind_refresh.clear();
                     for id in pending_server.drain() {
                         connection.sender.send(Message::Notification(lsp_server::Notification::new(
@@ -293,7 +295,7 @@ async fn relay_lsp(
                             shutdown_requested |= request.method == "shutdown";
                             pending.insert(request.id.clone(), request.method.clone());
                         },
-                        Message::Notification(notification) => mirror_document(&mut documents, notification, encoding)?,
+                        Message::Notification(notification) => mirror_document(&mut documents, notification, encoding),
                         Message::Response(response) => {
                             if !pending_server.remove(&response.id) { continue; }
                             if rebind_refresh_completed(response, &mut pending_rebind_refresh) {
@@ -387,19 +389,38 @@ fn mirror_document(
     documents: &mut bsl_analyzer::mem_docs::MemDocs,
     notification: &lsp_server::Notification,
     encoding: bsl_analyzer::lsp::PositionEncoding,
-) -> Result<()> {
+) {
+    // Like the standalone dispatcher, a notification whose params do not parse is logged
+    // and skipped: it must not end the session.
+    fn params<P: serde::de::DeserializeOwned>(
+        notification: &lsp_server::Notification,
+    ) -> Option<P> {
+        serde_json::from_value(notification.params.clone())
+            .inspect_err(|error| {
+                tracing::error!(
+                    method = notification.method,
+                    %error,
+                    "failed to parse notification params"
+                );
+            })
+            .ok()
+    }
+
     match notification.method.as_str() {
         "textDocument/didOpen" => {
-            let params: lsp_types::DidOpenTextDocumentParams =
-                serde_json::from_value(notification.params.clone())?;
+            let Some(params) = params::<lsp_types::DidOpenTextDocumentParams>(notification) else {
+                return;
+            };
             let doc = params.text_document;
             if doc.uri.to_file_path().is_ok_and(|path| project_model::is_bsl_source_path(&path)) {
                 documents.insert(doc.uri, doc.text, doc.version);
             }
         }
         "textDocument/didChange" => {
-            let params: lsp_types::DidChangeTextDocumentParams =
-                serde_json::from_value(notification.params.clone())?;
+            let Some(params) = params::<lsp_types::DidChangeTextDocumentParams>(notification)
+            else {
+                return;
+            };
             let uri = params.text_document.uri;
             let _ = documents.update_versioned(
                 &uri,
@@ -409,13 +430,13 @@ fn mirror_document(
             );
         }
         "textDocument/didClose" => {
-            let params: lsp_types::DidCloseTextDocumentParams =
-                serde_json::from_value(notification.params.clone())?;
+            let Some(params) = params::<lsp_types::DidCloseTextDocumentParams>(notification) else {
+                return;
+            };
             documents.remove(&params.text_document.uri);
         }
         _ => {}
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -465,10 +486,22 @@ mod tests {
         let uri = lsp_types::Url::from_file_path(root.path().join("Модуль.bsl")).unwrap();
         let mut docs = bsl_analyzer::mem_docs::MemDocs::new();
         let encoding = bsl_analyzer::lsp::PositionEncoding::negotiate(&Default::default());
-        mirror_document(&mut docs, &lsp_server::Notification::new("textDocument/didOpen".into(),
-            serde_json::json!({"textDocument": {"uri": uri, "languageId":"bsl", "version":17, "text":"Диск"}})), encoding).unwrap();
-        mirror_document(&mut docs, &lsp_server::Notification::new("textDocument/didChange".into(),
-            serde_json::json!({"textDocument": {"uri": uri, "version":22}, "contentChanges":[{"text":"Несохранённый буфер"}]})), encoding).unwrap();
+        mirror_document(
+            &mut docs,
+            &lsp_server::Notification::new(
+                "textDocument/didOpen".into(),
+                serde_json::json!({"textDocument": {"uri": uri, "languageId":"bsl", "version":17, "text":"Диск"}}),
+            ),
+            encoding,
+        );
+        mirror_document(
+            &mut docs,
+            &lsp_server::Notification::new(
+                "textDocument/didChange".into(),
+                serde_json::json!({"textDocument": {"uri": uri, "version":22}, "contentChanges":[{"text":"Несохранённый буфер"}]}),
+            ),
+            encoding,
+        );
         assert_eq!(docs.get(&uri).as_deref(), Some("Несохранённый буфер"));
         assert_eq!(docs.get_version(&uri), Some(22));
         mirror_document(
@@ -478,9 +511,37 @@ mod tests {
                 serde_json::json!({"textDocument": {"uri": uri}}),
             ),
             encoding,
-        )
-        .unwrap();
+        );
         assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn unparsable_document_notifications_are_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let uri = lsp_types::Url::from_file_path(root.path().join("Модуль.bsl")).unwrap();
+        let mut docs = bsl_analyzer::mem_docs::MemDocs::new();
+        let encoding = bsl_analyzer::lsp::PositionEncoding::negotiate(&Default::default());
+        mirror_document(
+            &mut docs,
+            &lsp_server::Notification::new(
+                "textDocument/didOpen".into(),
+                serde_json::json!({"textDocument": {"uri": uri, "languageId":"bsl", "version":1, "text":"Буфер"}}),
+            ),
+            encoding,
+        );
+        for (method, params) in [
+            ("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": uri}})),
+            (
+                "textDocument/didChange",
+                serde_json::json!({"textDocument": {"uri": uri, "version": 2}}),
+            ),
+            ("textDocument/didClose", serde_json::json!({})),
+        ] {
+            let notification = lsp_server::Notification::new(method.into(), params);
+            mirror_document(&mut docs, &notification, encoding);
+        }
+        assert_eq!(docs.get(&uri).as_deref(), Some("Буфер"));
+        assert_eq!(docs.get_version(&uri), Some(1));
     }
 
     #[test]

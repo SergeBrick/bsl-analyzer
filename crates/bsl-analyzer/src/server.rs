@@ -1218,17 +1218,10 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 state.shared_view_seeded = true;
             }
             let first_ready_generation = refresh_shared_readiness(state);
-            if first_ready_generation {
-                state.request_semantic_tokens_refresh();
-            }
             if changed && state.vfs_done {
-                for uri in state.opened_document_uris() {
-                    crate::handlers::schedule_diagnostics(state, &uri);
-                }
-                if !first_ready_generation {
-                    state.request_semantic_tokens_refresh();
-                }
-                state.request_workspace_diagnostic_refresh();
+                crate::handlers::notification::refresh_after_shared_catch_up(state);
+            } else if first_ready_generation {
+                state.request_semantic_tokens_refresh();
             }
         }
         Task::SharedWorkspaceSeedReady { epoch } => {
@@ -1515,8 +1508,7 @@ fn handle_latency_request_finished(
             )
         }
         LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::PendingWrite, revision } => {
-            let current_revision =
-                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            let current_revision = state.analysis_host.request_revision();
             match queue_latency_retry(
                 state,
                 &key,
@@ -6943,5 +6935,140 @@ mod tests {
         drop(state);
         drop(owner);
         drop(backend);
+    }
+
+    /// Saving or closing a document catches the view up with whatever the owner
+    /// published since the last workspace change, so the `SharedWorkspaceChanged` queued
+    /// for that publication later finds the view current. The other open documents must
+    /// be rescheduled by the event that applied it: the input is an owner publication
+    /// from a closed file that lands before the event on an unrelated open document,
+    /// with no diagnostics in flight.
+    fn assert_owner_publication_reschedules_open_documents(
+        apply: impl FnOnce(&mut GlobalState, lsp_types::Url),
+    ) {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .expect("write project config");
+        let closed = root.path().join("Closed.bsl");
+        std::fs::write(&closed, "Процедура Было() Экспорт КонецПроцедуры\n").expect("write source");
+        let watched = root.path().join("Watched.bsl");
+        let touched = root.path().join("Touched.bsl");
+        let watched_text = "Процедура Смотрим() КонецПроцедуры\n";
+        let touched_text = "Процедура Трогаем() КонецПроцедуры\n";
+        std::fs::write(&watched, watched_text).expect("write source");
+        std::fs::write(&touched, touched_text).expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
+        while !matches!(owner.readiness(), mcp_server::WorkspaceReadiness::Ready { .. }) {
+            assert!(std::time::Instant::now() < deadline, "shared owner did not become ready");
+            std::thread::yield_now();
+        }
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
+            let uri = lsp_types::Url::from_file_path(path).unwrap();
+            crate::handlers::notification::handle_did_open(
+                state,
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "bsl".to_owned(),
+                        version: 1,
+                        text: text.to_owned(),
+                    },
+                },
+            )
+            .expect("open the document");
+            uri
+        };
+        let watched_uri = open(&mut state, &watched, watched_text);
+        let touched_uri = open(&mut state, &touched, touched_text);
+        while !state.shared_view_seeded {
+            let task = state
+                .task_pool
+                .receiver
+                .recv_timeout(test_utils::wait::ceiling(std::time::Duration::from_secs(20)))
+                .expect("the editor view is seeded");
+            handle_task(&mut state, task).unwrap();
+        }
+        assert!(state.vfs_done, "a seeded view over a ready owner finishes loading");
+        // The diagnostics scheduled so far have been published.
+        state.diagnostics_tokens.clear();
+        state.pending_diagnostics_uris.clear();
+
+        let seeded = state.analysis_host.view().expect("open editor view").generation();
+        std::fs::write(&closed, "Процедура Стало() Экспорт КонецПроцедуры\n")
+            .expect("rewrite the closed source");
+        let mcp_server::WorkspaceRead::Ready(published) = owner.refresh_saved_path(&closed) else {
+            panic!("the owner publishes the closed file's new text");
+        };
+        assert!(published.generation > seeded, "the owner is ahead of the view");
+
+        apply(&mut state, touched_uri);
+        assert_eq!(
+            state.analysis_host.view().expect("open editor view").generation(),
+            published.generation,
+            "the event applies the owner's publication"
+        );
+        handle_task(
+            &mut state,
+            crate::global_state::Task::SharedWorkspaceChanged { generation: published.generation },
+        )
+        .unwrap();
+
+        assert!(
+            state.diagnostics_tokens.contains_key(&watched_uri)
+                || state.pending_diagnostics_uris.contains(&watched_uri),
+            "the open document is rescheduled against the owner's new text"
+        );
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    #[test]
+    fn a_save_that_applies_owner_changes_reschedules_open_documents() {
+        assert_owner_publication_reschedules_open_documents(|state, uri| {
+            crate::handlers::handle_did_save(
+                state,
+                lsp_types::DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    text: None,
+                },
+            )
+            .expect("save the open document");
+        });
+    }
+
+    #[test]
+    fn a_close_that_applies_owner_changes_reschedules_open_documents() {
+        assert_owner_publication_reschedules_open_documents(|state, uri| {
+            crate::handlers::notification::handle_did_close(
+                state,
+                lsp_types::DidCloseTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                },
+            )
+            .expect("close the open document");
+        });
     }
 }

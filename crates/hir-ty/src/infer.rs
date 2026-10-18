@@ -2148,8 +2148,9 @@ impl<'db> InferenceContext<'db> {
         receiver_expr: ExprId,
         field: &hir_def::Name,
     ) -> bool {
-        self.miss_holds_on_every_path(receiver_expr, field, |ty| {
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
             crate::field_lookup::is_closed_metadata_description(self.db, ty)
+                && self.lacks_field(ty, field)
         })
     }
 
@@ -2160,12 +2161,28 @@ impl<'db> InferenceContext<'db> {
     /// The attested surface answers for the type the walk saw, and the walk saw one path only:
     /// a local written with a structure before an `Если` and with a range inside it reads as
     /// the range after `КонецЕсли`, although the structure path may well own the member.
-    fn platform_miss_holds_on_every_path(
+    fn platform_field_miss_holds_on_every_path(
         &self,
         receiver_expr: ExprId,
         field: &hir_def::Name,
     ) -> bool {
-        self.miss_holds_on_every_path(receiver_expr, field, |ty| self.is_closed_platform_object(ty))
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
+            self.is_closed_platform_object(ty) && self.lacks_field(ty, field)
+        })
+    }
+
+    /// The method counterpart of [`Self::platform_field_miss_holds_on_every_path`]: a
+    /// parameter written with a range on one path still holds the caller's value on the
+    /// other, and that value may well have the method.
+    fn platform_method_miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        method: &hir_def::Name,
+    ) -> bool {
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
+            self.is_closed_platform_object(ty)
+                && crate::method_lookup::lookup_method(self.db, ty, method).is_none()
+        })
     }
 
     /// A platform object whose extracted member surface is attested as complete for the
@@ -2180,28 +2197,26 @@ impl<'db> InferenceContext<'db> {
             && !platform.is_ambiguous_type_name(&facet.name)
     }
 
-    /// True when every type `receiver_expr` can hold on the paths reaching it is `closed` and
-    /// lacks `field`; false when that set cannot be vouched for.
+    /// True when every type `receiver_expr` can hold on the paths reaching it is a closed
+    /// receiver lacking the member; false when that set cannot be vouched for.
     fn miss_holds_on_every_path(
         &self,
         receiver_expr: ExprId,
-        field: &hir_def::Name,
-        closed: impl Fn(TypeId) -> bool,
+        closed_without_member: impl Fn(TypeId) -> bool,
     ) -> bool {
         let Some(types) = self.types_on_every_path(receiver_expr, &mut PathWalk::default()) else {
             return false;
         };
-        if types.is_empty() {
-            return false;
-        }
+        !types.is_empty() && types.iter().all(|ty| closed_without_member(*ty))
+    }
+
+    /// Whether neither the fields nor the manager members of `ty` answer to `field`.
+    fn lacks_field(&self, ty: TypeId, field: &hir_def::Name) -> bool {
         let obj_resolver =
             crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
-        types.iter().all(|ty| {
-            closed(*ty)
-                && crate::field_lookup::lookup_field(self.db, &obj_resolver, *ty, field).is_none()
-                && crate::manager_lookup::lookup_manager_field(self.db, &obj_resolver, *ty, field)
-                    .is_none()
-        })
+        crate::field_lookup::lookup_field(self.db, &obj_resolver, ty, field).is_none()
+            && crate::manager_lookup::lookup_manager_field(self.db, &obj_resolver, ty, field)
+                .is_none()
     }
 
     /// Every type `expr` can hold on the paths reaching it, or `None` when that set cannot be
@@ -3036,7 +3051,7 @@ impl<'db> InferenceContext<'db> {
                     // read, not only on the one the walk saw last.
                     let base_id = ExprId::from_idx(*base);
                     let closed_platform_object = self.is_closed_platform_object(base_ty)
-                        && self.platform_miss_holds_on_every_path(base_id, field);
+                        && self.platform_field_miss_holds_on_every_path(base_id, field);
                     let closed_receiver = (matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
@@ -4022,21 +4037,23 @@ impl<'db> InferenceContext<'db> {
                         // A platform type whose member surface is attested as
                         // complete is a closed receiver: the extract lists every
                         // method it has, so a miss is the platform's own answer
-                        // and not a gap in the corpus. The name is the receiver
-                        // to the reader — the platform type in the spelling the
-                        // corpus uses.
-                        let platform = bsl_platform::PlatformData::instance();
-                        if platform.platform_type_member_surface_verified(&platform_type)
-                            && !platform.is_ambiguous_type_name(&platform_type)
-                        {
-                            self.push_inference_diagnostic(
-                                InferenceDiagnostic::UnresolvedMethodCall {
-                                    expr: callee,
-                                    receiver_name: hir_def::Name::new(&platform_type),
-                                    method_name: method_name.clone(),
-                                    kind: UnresolvedMethodKind::MethodNotFound,
-                                },
-                            );
+                        // and not a gap in the corpus — provided the receiver
+                        // holds such a type on every path reaching the call, not
+                        // only on the one the walk saw last. The name is the
+                        // receiver to the reader — the platform type in the
+                        // spelling the corpus uses.
+                        if self.is_closed_platform_object(receiver_ty) {
+                            if self.platform_method_miss_holds_on_every_path(base_id, &method_name)
+                            {
+                                self.push_inference_diagnostic(
+                                    InferenceDiagnostic::UnresolvedMethodCall {
+                                        expr: callee,
+                                        receiver_name: hir_def::Name::new(&platform_type),
+                                        method_name: method_name.clone(),
+                                        kind: UnresolvedMethodKind::MethodNotFound,
+                                    },
+                                );
+                            }
                         } else {
                             let base_expr = self.body.expr(base_id).clone();
                             if let Expr::Path(receiver_path_name) = base_expr {

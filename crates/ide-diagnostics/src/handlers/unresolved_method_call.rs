@@ -753,4 +753,32 @@ mod tests {
         );
         assert!(undefined_receiver.is_empty(), "Неопределено stays soft: {undefined_receiver:?}");
     }
+
+    /// The walk types a local by its textually latest write, so after a write made on one
+    /// path only the attested type is that path's view: on the other path the local may hold
+    /// a value that does have the method, and nothing proves the call wrong.
+    #[test]
+    fn a_platform_miss_on_one_path_only_stays_silent() {
+        if !crate::test_utils::built_in_facts_are_served() {
+            return;
+        }
+        let parameter = platform_umc(
+            "Процедура Тест(Обл, Условие)\n    ТабДок = Новый ТабличныйДокумент;\n    Если Условие Тогда\n        Обл = ТабДок.ТекущаяОбласть;\n    КонецЕсли;\n    Обл.Вставить(\"К\", 1);\nКонецПроцедуры",
+        );
+        assert!(parameter.is_empty(), "the parameter path may hold a structure: {parameter:?}");
+
+        let writer = platform_umc(
+            "Процедура Тест(Пишущий, Условие)\n    Если Условие Тогда\n        Пишущий = Новый ЗаписьJSON;\n    КонецЕсли;\n    Пишущий.ЗаписатьНачалоТаблицы();\nКонецПроцедуры",
+        );
+        assert!(writer.is_empty(), "the parameter path may hold anything: {writer:?}");
+
+        let every_path = platform_umc(
+            "Процедура Тест(Условие)\n    Если Условие Тогда\n        Пишущий = Новый ЗаписьJSON;\n    Иначе\n        Пишущий = Новый ЗаписьJSON;\n    КонецЕсли;\n    Пишущий.ЗаписатьНачалоТаблицы();\nКонецПроцедуры",
+        );
+        assert_eq!(
+            every_path.len(),
+            1,
+            "a writer on every path lacks the method on every path: {every_path:?}"
+        );
+    }
 }

@@ -206,7 +206,9 @@ async fn relay_lsp(
                     cancel_pending(&connection.sender, &mut pending);
                     if !initialized || shutdown_requested { break Err(anyhow::anyhow!("workspace retired during initialization or shutdown")); }
                     if awaiting_rebind_ready { break Err(anyhow::anyhow!("workspace retired again before the rebound session became ready")); }
-                    awaiting_rebind_ready = true;
+                    // Only a replayed document can confirm the rebound session: with none
+                    // open there is nothing to confirm, and nothing a later rebind could lose.
+                    awaiting_rebind_ready = !documents.is_empty();
                     pending_rebind_refresh.clear();
                     for id in pending_server.drain() {
                         connection.sender.send(Message::Notification(lsp_server::Notification::new(

@@ -1150,6 +1150,35 @@ fn refresh_shared_readiness(state: &mut GlobalState) -> bool {
     first_ready_generation && state.vfs_done && state.shared_owner_generation.is_some()
 }
 
+/// Adopt the project the owner accepted, and bring the open documents in line with its
+/// exclusions: the ones it now covers leave the view, the ones it no longer covers return.
+fn apply_shared_project(
+    state: &mut GlobalState,
+    root: std::path::PathBuf,
+    project: project_model::Project,
+) {
+    state.adopt_shared_project(root, project);
+    let excluded: Vec<_> = state
+        .opened_document_uris()
+        .into_iter()
+        .filter(|uri| crate::handlers::notification::is_excluded_document(state, uri))
+        .collect();
+    for uri in excluded {
+        if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
+            if let Some(view) = state.analysis_host.view_mut() {
+                view.close(file_id);
+            }
+            state.open_files.remove(&file_id);
+        }
+        crate::handlers::notification::withdraw_document_diagnostics(state, &uri);
+    }
+    readmit_shared_documents(state);
+    if state.open_files.is_empty() {
+        state.analysis_host.take_view();
+        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
+    }
+}
+
 /// Put back into the view the open documents the exclusions no longer cover, with the
 /// editor's buffer as their text: one taken out by an earlier exclusion and one opened while
 /// it was in force alike. Only didOpen otherwise puts a document into the view.
@@ -1184,28 +1213,7 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 (state.analysis_host.owner().cloned(), state.workspace_root.clone())
             {
                 if let mcp_server::WorkspaceRead::Ready(project) = owner.project() {
-                    state.adopt_shared_project(root, project);
-                    let excluded: Vec<_> = state
-                        .opened_document_uris()
-                        .into_iter()
-                        .filter(|uri| {
-                            crate::handlers::notification::is_excluded_document(state, uri)
-                        })
-                        .collect();
-                    for uri in excluded {
-                        if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
-                            if let Some(view) = state.analysis_host.view_mut() {
-                                view.close(file_id);
-                            }
-                            state.open_files.remove(&file_id);
-                        }
-                        crate::handlers::notification::withdraw_document_diagnostics(state, &uri);
-                    }
-                    readmit_shared_documents(state);
-                    if state.open_files.is_empty() {
-                        state.analysis_host.take_view();
-                        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
-                    }
+                    apply_shared_project(state, root, project);
                 }
             }
             let changed = state.analysis_host.catch_up();
@@ -6838,42 +6846,11 @@ mod tests {
         assert!(state.workspace_batch_plan.is_none(), "the sweep must finalize on the last chunk");
     }
 
-    /// Rewrites the project config and waits until the owner has adopted it on a reconcile
-    /// pass, so that its accepted project does (or no longer does) exclude `path`. The owner
-    /// admits a change notice only while it is ready, so the notice is repeated until taken.
-    fn edit_owner_config(
-        owner: &mcp_server::WorkspaceHandle,
-        config: &std::path::Path,
-        text: &str,
-        path: &std::path::Path,
-        excluded: bool,
-    ) {
-        std::fs::write(config, text).expect("write project config");
-        let deadline = std::time::Instant::now()
-            + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
-        let mut noticed = false;
-        loop {
-            if !noticed {
-                noticed = matches!(owner.request_analysis(), mcp_server::WorkspaceRead::Ready(_))
-                    && owner.notify_changed_path(config);
-            }
-            if let mcp_server::WorkspaceRead::Ready(project) = owner.project() {
-                let covers = project
-                    .source_exclusions()
-                    .respelled_under(&project.source_roots())
-                    .is_excluded_resolved(path);
-                if noticed && covers == excluded {
-                    return;
-                }
-            }
-            assert!(std::time::Instant::now() < deadline, "owner did not adopt the config edit");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
     /// Lifting `[source].exclude` while a document stays open puts the editor's buffer
     /// back into the view, both for a document open before the exclusion and for one
-    /// opened while it was in force: edits made after that reach analysis.
+    /// opened while it was in force: edits made after that reach analysis. Each config
+    /// edit is applied the way a shared workspace change applies the project the owner
+    /// accepted, with the project read straight from the edited file.
     #[test]
     fn shared_reload_readmits_open_documents_the_exclusion_no_longer_covers() {
         let root = tempfile::tempdir().expect("create shared workspace");
@@ -6895,27 +6872,23 @@ mod tests {
             None,
         )
         .expect("create explicit disposable cache");
-        // Nothing in this session reads the owner's diagnostics, so a config edit is taken up
-        // only by its periodic reconcile; the shortest one the owner allows keeps the wait
-        // short. The interval is read once, when the owner is built.
-        let reconcile = std::env::var_os("BSL_MCP_RECONCILE_SECS");
-        std::env::set_var("BSL_MCP_RECONCILE_SECS", "5");
         let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
             root.path().to_path_buf(),
             cache,
             None,
-        );
-        match reconcile {
-            Some(value) => std::env::set_var("BSL_MCP_RECONCILE_SECS", value),
-            None => std::env::remove_var("BSL_MCP_RECONCILE_SECS"),
-        }
-        let backend = backend.expect("create disk-only owner for test workspace");
+        )
+        .expect("create disk-only owner for test workspace");
         let owner = backend.workspace_handle();
 
         let (sender, _receiver) = crossbeam_channel::unbounded();
         let mut state = GlobalState::new_shared(sender, owner.clone());
         state.vfs_done = true;
-        state.adopt_shared_project(root.path().to_path_buf(), project);
+        let edit_config = |state: &mut GlobalState, text: &str| {
+            std::fs::write(&config, text).expect("write project config");
+            let project = mcp_server::project::at(root.path()).expect("load the edited project");
+            apply_shared_project(state, root.path().to_path_buf(), project);
+        };
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
         let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
             let uri = lsp_types::Url::from_file_path(path).unwrap();
             crate::handlers::notification::handle_did_open(
@@ -6938,14 +6911,11 @@ mod tests {
         let before_id = crate::lsp::file_id(&state, &before_uri).expect("resolve the open URI");
         assert!(state.open_files.contains(&before_id));
 
-        let excluding = "[source]\nroot = \".\"\nexclude = [\"Hidden\"]\n";
-        edit_owner_config(&owner, &config, excluding, &before, true);
-        handle_task(&mut state, Task::SharedWorkspaceChanged { generation: 0 }).unwrap();
+        edit_config(&mut state, "[source]\nroot = \".\"\nexclude = [\"Hidden\"]\n");
         assert!(!state.open_files.contains(&before_id), "the exclusion takes the document out");
         let during_uri = open(&mut state, &during, during_buffer);
 
-        edit_owner_config(&owner, &config, "[source]\nroot = \".\"\n", &before, false);
-        handle_task(&mut state, Task::SharedWorkspaceChanged { generation: 0 }).unwrap();
+        edit_config(&mut state, "[source]\nroot = \".\"\n");
 
         for (uri, buffer) in [(&before_uri, before_buffer), (&during_uri, during_buffer)] {
             let file_id = crate::lsp::file_id(&state, uri).expect("resolve the readmitted URI");

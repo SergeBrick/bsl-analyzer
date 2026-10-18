@@ -5,7 +5,7 @@ use syntax::{TextRange, TextSize};
 
 use crate::{
     body::{Body, ManagerType},
-    hir::{Expr, ExprIdx, Literal},
+    hir::{Expr, ExprIdx, Literal, Stmt},
     item_tree::{AnnotationKind, ItemTree},
     name::Name,
     MethodId, MethodKey, ModuleBodies, ModuleId,
@@ -29,6 +29,52 @@ pub struct ModuleCallSummary {
     /// Sorted and deduplicated.
     pub name_literal_refs: Vec<MethodKey>,
     pub form_entries: Vec<FormEventEntry>,
+}
+
+/// A handler name a module binds by string to ANOTHER object's handler slot -
+/// `Форма.ПодключитьОбработчикОжидания("Имя", …)`,
+/// `Форма.Элементы.Поле.УстановитьДействие("ПриИзменении", "Имя")` - where the receiver
+/// is not the current module (see [`collect_foreign_handler_bindings`]). The handler
+/// lives in a different file, so only the source-root fold ([`ForeignHandlerBindings`])
+/// lets that file see it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ForeignHandlerBinding {
+    pub handler_name: Name,
+    /// First segment of the receiver chain that is not the current module — the
+    /// variable or parameter holding the bound object (`Форма` in
+    /// `Форма.Элементы.Поле.УстановитьДействие`). Lets the fold drop bindings whose
+    /// receiver is a common module, whose handlers are exported methods anyway.
+    /// `None` when the receiver is a call's result, which is never a common module.
+    pub receiver_root: Option<Name>,
+}
+
+/// Every procedure name bound by string to a handler slot of another module's object
+/// anywhere in a source root - the fold of every module's [`ForeignHandlerBinding`]s,
+/// minus bindings received by a common module. Which object the binding targets is not
+/// resolved: a name in the set answers "some module binds a handler of this name
+/// dynamically".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForeignHandlerBindings {
+    names: FxHashSet<NormName>,
+}
+
+impl ForeignHandlerBindings {
+    pub fn new(names: FxHashSet<NormName>) -> Self {
+        Self { names }
+    }
+
+    /// Case-insensitive, the way the platform resolves the handler name.
+    pub fn is_bound(&self, name: &str) -> bool {
+        self.names.contains(&NormName::intern(name))
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 impl ModuleCallSummary {
@@ -760,6 +806,108 @@ pub fn extract_call_summary(
         name_literal_refs,
         form_entries,
     }
+}
+
+/// Collects [`ForeignHandlerBinding`]s of one body: identifier-shaped handler names
+/// handed by string to a handler slot of an object that is not the current module.
+///
+/// - `<получатель>.ПодключитьОбработчикОжидания("Имя", …)` (first argument);
+/// - `<получатель>.ПодключитьОбработчикИзмененияДанных(Данные, "Имя", …)` (second argument);
+/// - `<получатель>.<…>.УстановитьДействие("Событие", "Имя")` (second argument) - only
+///   through an access chain (`Форма.Элементы.Поле`): a bare variable receiver holds an
+///   element whose form cannot be told apart from the current one.
+///
+/// The receiver is foreign when its chain, after an optional leading `ЭтаФорма` /
+/// `ЭтотОбъект`, does not start at the current form's items (`Элементы`,
+/// `ЭлементыФормы`) - `Форма.…`, `ВладелецФормы.…`, `ЭтаФорма.ВладелецФормы.…`,
+/// `Форма.ПолучитьФорму().…`. A bare `Элементы` that is a parameter or local of the body
+/// holds some other form's items. Bindings to the current module are already covered by
+/// the same-module summary facts.
+pub fn collect_foreign_handler_bindings(body: &Body, out: &mut Vec<ForeignHandlerBinding>) {
+    for (_, expr) in body.exprs_iter() {
+        let Expr::Call { callee, args } = expr else { continue };
+        let Expr::Field { base, field } = body.expr_idx(*callee) else { continue };
+        let method = field.as_str().fold_lower();
+        let handler_arg = if is_attach_idle_handler(&method) {
+            0
+        } else if is_attach_data_change_handler(&method)
+            || (is_set_action(&method) && !matches!(body.expr_idx(*base), Expr::Path(_)))
+        {
+            1
+        } else {
+            continue;
+        };
+        let Some(name) = args.get(handler_arg).and_then(|&arg| extract_string_literal(body, arg))
+        else {
+            continue;
+        };
+        if !is_identifier_like(&name) {
+            continue;
+        }
+        if let Some(receiver_root) = foreign_receiver_root(body, *base) {
+            out.push(ForeignHandlerBinding { handler_name: Name::new(&name), receiver_root });
+        }
+    }
+}
+
+/// Whether `receiver` denotes an object other than the current module, and if so the
+/// root to report as [`ForeignHandlerBinding::receiver_root`]. `None` when the chain
+/// stays in the current module (`ЭтаФорма`, `Элементы.Поле`, `ЭтотОбъект.ЭлементыФормы.Поле`,
+/// `Элементы.Найти("Поле")`) or is not rooted at a name (a literal, `Новый …`).
+fn foreign_receiver_root(body: &Body, receiver: ExprIdx) -> Option<Option<Name>> {
+    let mut chain = Vec::new();
+    let mut through_call = false;
+    let mut cursor = receiver;
+    loop {
+        match body.expr_idx(cursor) {
+            Expr::Path(name) => {
+                chain.push(name);
+                break;
+            }
+            Expr::Field { base, field } => {
+                chain.push(field);
+                cursor = *base;
+            }
+            Expr::Index { base, .. } => cursor = *base,
+            Expr::Call { callee, .. } => {
+                through_call = true;
+                cursor = *callee;
+            }
+            _ => return None,
+        }
+    }
+    chain.reverse();
+    let mut segments = chain.into_iter();
+    let mut first = segments.next()?;
+    let qualified = is_this_receiver(&first.as_str().fold_lower());
+    if qualified {
+        first = segments.next()?;
+    }
+    if is_current_form_items(&first.as_str().fold_lower())
+        && (qualified || !is_body_local(body, first))
+    {
+        return None;
+    }
+    Some((!through_call).then(|| first.clone()))
+}
+
+fn is_current_form_items(name_lower: &str) -> bool {
+    matches!(name_lower, "элементы" | "items" | "элементыформы" | "controls")
+}
+
+/// Whether `name` is a parameter, a declared variable or an assigned local of `body` -
+/// a binding that shadows a context property of the same name.
+fn is_body_local(body: &Body, name: &Name) -> bool {
+    let lower = name.as_str().fold_lower();
+    body.bindings_iter().any(|(_, binding)| binding.name.as_str().fold_lower() == lower)
+        || body.stmts_iter().any(|(_, stmt)| {
+            matches!(stmt, Stmt::Assign { target, .. }
+                if matches!(body.expr_idx(*target), Expr::Path(target) if target.as_str().fold_lower() == lower))
+        })
+}
+
+fn is_attach_data_change_handler(name_lower: &str) -> bool {
+    name_lower == "подключитьобработчикизмененияданных" || name_lower == "attachdatachangehandler"
 }
 
 // One &mut accumulator per output list (call edges + the three string-named dispatch
@@ -1510,6 +1658,62 @@ mod tests {
         assert_eq!(summary.form_entries[0].event_type, "OnCreateAtServer");
         assert_eq!(summary.form_entries[0].handler_name, Name::new("ПриСозданииНаСервере"));
         assert_eq!(summary.form_entries[1].event_type, "OnActivateRow");
+    }
+
+    #[test]
+    fn foreign_handler_bindings_keep_only_receivers_outside_the_module() {
+        let parse = parser::parse(
+            r#"
+Процедура Подключить(Форма, Элемент) Экспорт
+    Форма.ПодключитьОбработчикОжидания("ОбработчикОжидания1", 0.1, Истина);
+    Форма.ОтключитьОбработчикОжидания("ОбработчикОжидания2");
+    Форма.ПолучитьФорму().ПодключитьОбработчикОжидания("ОбработчикРезультата", 1);
+    Элементы.Найти("Поле3").УстановитьДействие("ПриИзменении", "СвойОбработчик5");
+    ЭтаФорма.ВладелецФормы.ПодключитьОбработчикОжидания("ОбработчикВладельца", 1);
+    Форма.Элементы.Поле1.УстановитьДействие("ПриИзменении", "Поле1ПриИзменении");
+    Форма.ПодключитьОбработчикИзмененияДанных("Реквизит1", "ОбработчикИзмененияДанных", Ложь);
+    ПодключитьОбработчикОжидания("СвойОбработчик", 1);
+    ЭтаФорма.ПодключитьОбработчикОжидания("СвойОбработчик2", 1);
+    Элементы.Поле2.УстановитьДействие("ПриИзменении", "СвойОбработчик3");
+    Элемент.УстановитьДействие("ПриИзменении", "НеясныйПолучатель");
+    Оповещение = Новый ОписаниеОповещения("СвойОбработчик4", ЭтотОбъект);
+    Форма.ПодключитьОбработчикОжидания("не идентификатор", 1);
+    Форма.ПодключитьОбработчикОжидания(Элемент.Имя, 1);
+    Сообщить("ПростоСтрока");
+КонецПроцедуры
+"#,
+        );
+        let module_bodies = ModuleBodies::from_parse(&parse);
+        let mut found = Vec::new();
+        for (_, body) in module_bodies.iter_bodies() {
+            collect_foreign_handler_bindings(body, &mut found);
+        }
+        found.sort();
+        found.dedup();
+        let bindings: Vec<(&str, Option<&str>)> = found
+            .iter()
+            .map(|b| (b.handler_name.as_str(), b.receiver_root.as_ref().map(Name::as_str)))
+            .collect();
+        assert_eq!(
+            bindings,
+            vec![
+                ("ОбработчикВладельца", Some("ВладелецФормы")),
+                ("ОбработчикИзмененияДанных", Some("Форма")),
+                ("ОбработчикОжидания1", Some("Форма")),
+                ("ОбработчикРезультата", None),
+                ("Поле1ПриИзменении", Some("Форма")),
+            ]
+        );
+    }
+
+    #[test]
+    fn foreign_handler_bindings_match_case_insensitively() {
+        let mut names = FxHashSet::default();
+        names.insert(NormName::intern("ОбработчикЗавершения"));
+        let bindings = ForeignHandlerBindings::new(names);
+        assert!(bindings.is_bound("обработчикзавершения"));
+        assert!(bindings.is_bound("ОБРАБОТЧИКЗАВЕРШЕНИЯ"));
+        assert!(!bindings.is_bound("ОбработчикЗавершения2"));
     }
 
     fn parse_and_extract(code: &str) -> ModuleCallSummary {

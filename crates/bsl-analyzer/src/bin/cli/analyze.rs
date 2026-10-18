@@ -120,7 +120,7 @@ fn collect_bsl_files_in_scope(
                         &mut resolved,
                     )
                 } else {
-                    !exclusions.excludes_walked_file(entry.path())
+                    !exclusions.excludes_walked_file(entry.path(), &mut resolved)
                 }
             });
         for entry in walk {

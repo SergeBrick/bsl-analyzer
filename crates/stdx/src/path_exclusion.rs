@@ -102,7 +102,8 @@ impl ExcludedPaths {
         Self { entries, patterns: None }
     }
 
-    /// Adds glob patterns matched against paths relative to the absolute `base`.
+    /// Sets the glob patterns, matched against paths relative to the absolute `base`; a
+    /// non-empty list replaces the patterns set before, since one set has one base.
     ///
     /// The syntax is `globset`'s with `/` as the separator: `*` and `?` stay within one
     /// path component, `**` crosses any number of them. A pattern without a `/` matches
@@ -191,8 +192,29 @@ impl ExcludedPaths {
     /// Whether a file a walk reached, inside directories it did not prune, is taken out
     /// by a pattern. Directories are pruned by [`Self::prunes_walked_dir`], so only the
     /// patterns are asked here; without patterns this costs nothing.
-    pub fn excludes_walked_file(&self, path: &Path) -> bool {
-        self.patterns.as_ref().is_some_and(|patterns| patterns.matches_any_spelling(path))
+    ///
+    /// The file is asked about under its walked spelling and under its parent's resolved
+    /// one, taken from `resolved` (or resolved once and kept there), so a directory
+    /// symlink does not carry a matched file back in under a name no pattern carries.
+    pub fn excludes_walked_file(&self, path: &Path, resolved: &mut ResolvedDirs) -> bool {
+        let Some(patterns) = &self.patterns else { return false };
+        if patterns.matches_any_spelling(path) {
+            return true;
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        let canonical = match resolved.0.get(parent) {
+            Some(parent) => parent.join(name),
+            None => {
+                let canonical_parent =
+                    resolve_as_far_as_it_goes(parent).unwrap_or_else(|| parent.to_path_buf());
+                let canonical = canonical_parent.join(name);
+                resolved.0.insert(parent.to_path_buf(), canonical_parent);
+                canonical
+            }
+        };
+        patterns.matches_any_spelling(&canonical)
     }
 
     /// The excluded directories as they were declared (after lexical normalisation).
@@ -246,7 +268,7 @@ impl ExcludedPaths {
         if self.any_spelling(|spelling| is_within(path, spelling)) {
             return true;
         }
-        if self.excludes_walked_file(path) {
+        if self.patterns.as_ref().is_some_and(|patterns| patterns.matches_any_spelling(path)) {
             return true;
         }
         has_dot_components(path) && {
@@ -446,8 +468,13 @@ impl Patterns {
     }
 }
 
+/// Adds an anchor unless the same pair is already there. One prefix may stand for
+/// several base-relative paths — a root aliased onto the base — and each is matched.
 fn push_anchor(anchors: &mut Vec<(PathBuf, PathBuf)>, prefix: PathBuf, relative: PathBuf) {
-    if !anchors.iter().any(|(existing, _)| *existing == prefix) {
+    if !anchors
+        .iter()
+        .any(|(existing, existing_relative)| *existing == prefix && *existing_relative == relative)
+    {
         anchors.push((prefix, relative));
     }
 }
@@ -636,7 +663,10 @@ mod tests {
             "./src/../temp/Module.bsl",
         ] {
             assert!(excluded.is_excluded(&base.join(hidden)), "{hidden} must be excluded");
-            assert!(excluded.excludes_walked_file(&base.join(hidden)), "{hidden} (walk)");
+            assert!(
+                excluded.excludes_walked_file(&base.join(hidden), &mut ResolvedDirs::default()),
+                "{hidden} (walk)"
+            );
         }
         for visible in [
             "temporary/Module.bsl",
@@ -751,7 +781,8 @@ mod tests {
 
         assert_eq!(plain, with_none);
         assert!(with_none.patterns().next().is_none());
-        assert!(!with_none.excludes_walked_file(&base.join("temp/Module.bsl")));
+        assert!(!with_none
+            .excludes_walked_file(&base.join("temp/Module.bsl"), &mut ResolvedDirs::default()));
         assert!(ExcludedPaths::default().with_patterns(&base, [""; 0]).unwrap().is_empty());
         assert_ne!(plain, plain.clone().with_patterns(&base, ["temp"]).unwrap());
     }
@@ -806,5 +837,52 @@ mod tests {
         assert!(!declared_through_alias.is_excluded_resolved(&real.join(".tmp2/Module.bsl")));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pattern_follows_a_file_reached_through_a_directory_symlink() {
+        let base = absolute("pattern-alias");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/Ext")).unwrap();
+        std::fs::write(base.join("real/Ext/Template.bsl"), "").unwrap();
+        std::fs::write(base.join("real/Kept.bsl"), "").unwrap();
+        std::os::unix::fs::symlink(base.join("real/Ext"), base.join("alias")).unwrap();
+        let excluded = with_patterns(&base, &["real/Ext/*.bsl"]);
+
+        let mut walked = crate::fs::parallel_walk_paths(
+            &[base.as_path()],
+            &crate::fs::WalkConfig {
+                extensions: &["bsl"],
+                excludes: &[],
+                excluded: Some(&excluded),
+                follow_links: true,
+            },
+        )
+        .into_vec();
+        walked.sort();
+        assert_eq!(walked, [base.join("real/Kept.bsl")]);
+
+        let mut resolved = ResolvedDirs::default();
+        assert!(excluded.excludes_walked_file(&base.join("alias/Template.bsl"), &mut resolved));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_respelled_onto_the_base_keeps_its_own_anchor() {
+        let base = absolute("respelled-onto-base");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(&base, base.join("x")).unwrap();
+        let excluded = with_patterns(&base, &["x/temp"])
+            .respelled_under(std::slice::from_ref(&base.join("x")));
+
+        assert!(excluded.is_excluded(&base.join("x/temp/Module.bsl")));
+        assert!(excluded.is_excluded(&base.join("temp/Module.bsl")));
+        assert!(!excluded.is_excluded(&base.join("kept/Module.bsl")));
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

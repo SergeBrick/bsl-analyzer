@@ -1734,7 +1734,7 @@ fn collect_subtree_noting(
         if entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink() {
             !user_excluded.prunes_walked_dir(entry.path(), entry.path_is_symlink(), &mut pruned)
         } else {
-            !user_excluded.excludes_walked_file(entry.path())
+            !user_excluded.excludes_walked_file(entry.path(), &mut pruned)
         }
     });
     for entry in walk {

@@ -179,7 +179,7 @@ fn partition_root(
             if entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink() {
                 !scope.prunes_dir(entry.path(), entry.path_is_symlink(), &mut resolved)
             } else {
-                !scope.exclusions().excludes_walked_file(entry.path())
+                !scope.exclusions().excludes_walked_file(entry.path(), &mut resolved)
             }
         });
     for entry in shallow {

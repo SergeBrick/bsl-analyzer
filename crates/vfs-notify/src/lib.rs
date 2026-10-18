@@ -564,7 +564,9 @@ impl NotifyActor {
                                         &mut resolved,
                                     );
                                 }
-                                return !dirs.hard_exclude.excludes_walked_file(path);
+                                return !dirs
+                                    .hard_exclude
+                                    .excludes_walked_file(path, &mut resolved);
                             }
 
                             if entry.path_is_symlink() && symlink_might_be_cyclic(path) {
@@ -941,7 +943,7 @@ impl NotifyActor {
                     return !self
                         .watched_dir_entries
                         .iter()
-                        .any(|dirs| dirs.hard_exclude.excludes_walked_file(path));
+                        .any(|dirs| dirs.hard_exclude.excludes_walked_file(path, &mut resolved));
                 }
                 if entry.path_is_symlink() && is_dir && symlink_might_be_cyclic(path) {
                     return false;

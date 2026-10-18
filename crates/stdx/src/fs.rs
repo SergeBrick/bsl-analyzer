@@ -44,7 +44,7 @@ fn skips(config: &WalkConfig<'_>, entry: &ignore::DirEntry, resolved: &mut Resol
     if is_dir || entry.depth() == 0 || entry.path_is_symlink() {
         excluded.prunes_walked_dir(path, entry.path_is_symlink(), resolved)
     } else {
-        excluded.excludes_walked_file(path)
+        excluded.excludes_walked_file(path, resolved)
     }
 }
 

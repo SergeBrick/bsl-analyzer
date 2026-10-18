@@ -106,8 +106,9 @@ impl ExcludedPaths {
     ///
     /// The syntax is `globset`'s with `/` as the separator: `*` and `?` stay within one
     /// path component, `**` crosses any number of them. A pattern without a `/` matches
-    /// a name at any depth (`*.tmp` is `**/*.tmp`). An empty pattern, an absolute one, a
-    /// negation (`!x`, which a hard exclusion cannot honour) and one the glob parser
+    /// a name at any depth (`*.tmp` is `**/*.tmp`); `.` and empty segments are dropped. An
+    /// empty pattern, an absolute one, one with a `..` segment or naming the base itself,
+    /// a negation (`!x`, which a hard exclusion cannot honour) and one the glob parser
     /// rejects are refused rather than dropped: a dropped exclusion silently puts back
     /// the tree it was meant to hide. On Windows matching ignores case, like the rest of
     /// this set. An empty list leaves the set exactly as it was.
@@ -138,11 +139,19 @@ impl ExcludedPaths {
                 return Err(invalid("must be relative to the config file".to_owned()));
             }
             let normalized = normalized.trim_end_matches('/');
-            // Decided before `./` is dropped: `./temp` names the base's own `temp`.
+            // Decided before `.` segments are dropped: `./temp` names the base's own `temp`.
             let has_separator = normalized.contains('/');
-            let normalized = normalized.trim_start_matches("./");
-            let anchored =
-                if has_separator { normalized.to_owned() } else { format!("**/{normalized}") };
+            // Matching sees only the names below the base, so `.` and empty segments are
+            // dropped and `..` — which could only leave the base — is refused.
+            let segments: Vec<&str> =
+                normalized.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+            if segments.is_empty() || segments.contains(&"..") {
+                return Err(invalid(
+                    "must name a path inside the config directory, without `..`".to_owned(),
+                ));
+            }
+            let normalized = segments.join("/");
+            let anchored = if has_separator { normalized } else { format!("**/{normalized}") };
             let glob = globset::GlobBuilder::new(&anchored)
                 .literal_separator(true)
                 .case_insensitive(cfg!(windows))
@@ -667,6 +676,16 @@ mod tests {
         assert!(!excluded.is_excluded(&base.join("src/temp/Module.bsl")));
     }
 
+    #[test]
+    fn dot_and_empty_segments_are_dropped_from_a_pattern() {
+        let base = absolute("dot-segments");
+        for pattern in ["src/./gen", "src//gen", ".//src/gen", "./src/./gen/"] {
+            let excluded = with_patterns(&base, &[pattern]);
+            assert!(excluded.is_excluded(&base.join("src/gen/Module.bsl")), "{pattern}");
+            assert!(!excluded.is_excluded(&base.join("other/src/gen/Module.bsl")), "{pattern}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn patterns_ignore_case_on_windows() {
@@ -710,6 +729,11 @@ mod tests {
             ("!temp", "negation"),
             ("/temp", "relative"),
             ("a[", "not a valid glob"),
+            ("../shared", "inside the config directory"),
+            ("src/../../x", "inside the config directory"),
+            ("a/../temp", "inside the config directory"),
+            (".", "inside the config directory"),
+            ("./", "inside the config directory"),
         ] {
             let error = ExcludedPaths::default().with_patterns(&base, [pattern]).unwrap_err();
             assert_eq!(error.pattern, pattern);

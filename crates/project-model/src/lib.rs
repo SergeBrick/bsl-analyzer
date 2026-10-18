@@ -5930,7 +5930,7 @@ extensions = [{ name = "T" }]
         fs::write(&path, "[source]\nexclude_globs = \"temp\"\n").unwrap();
         assert!(ProjectConfig::load_from_file(&path).is_err(), "a string is not the list contract");
 
-        for pattern in ["", "!temp", "/temp", "a["] {
+        for pattern in ["", "!temp", "/temp", "a[", "../shared"] {
             fs::write(&path, format!("[source]\nexclude_globs = [{pattern:?}]\n")).unwrap();
             let error = ProjectConfig::load_from_file(&path)
                 .expect_err(&format!("{pattern:?} was accepted"))

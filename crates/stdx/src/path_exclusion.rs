@@ -137,12 +137,12 @@ impl ExcludedPaths {
             if normalized.starts_with('/') || path.is_absolute() || prefixed {
                 return Err(invalid("must be relative to the config file".to_owned()));
             }
-            let normalized = normalized.trim_end_matches('/').trim_start_matches("./");
-            let anchored = if normalized.contains('/') {
-                normalized.to_owned()
-            } else {
-                format!("**/{normalized}")
-            };
+            let normalized = normalized.trim_end_matches('/');
+            // Decided before `./` is dropped: `./temp` names the base's own `temp`.
+            let has_separator = normalized.contains('/');
+            let normalized = normalized.trim_start_matches("./");
+            let anchored =
+                if has_separator { normalized.to_owned() } else { format!("**/{normalized}") };
             let glob = globset::GlobBuilder::new(&anchored)
                 .literal_separator(true)
                 .case_insensitive(cfg!(windows))
@@ -656,6 +656,15 @@ mod tests {
 
         assert!(excluded.is_excluded(&base.join("src/Module.bsl")));
         assert!(!excluded.is_excluded(&base.join("src/nested/Module.bsl")));
+    }
+
+    #[test]
+    fn a_leading_dot_slash_anchors_the_pattern_to_the_base() {
+        let base = absolute("dot-slash");
+        let excluded = with_patterns(&base, &["./temp"]);
+
+        assert!(excluded.is_excluded(&base.join("temp/Module.bsl")));
+        assert!(!excluded.is_excluded(&base.join("src/temp/Module.bsl")));
     }
 
     #[cfg(windows)]

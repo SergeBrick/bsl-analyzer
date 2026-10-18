@@ -662,4 +662,59 @@ mod tests {
             unresolved_fields(undefined_receiver)
         );
     }
+
+    /// The walk types a local by its textually latest write, so at a read reached from a
+    /// path where the local holds something else the attested type is one branch's view
+    /// only. The member exists on that other path, and nothing proves it missing here.
+    #[test]
+    fn a_platform_miss_on_one_path_only_stays_silent() {
+        if !crate::test_utils::built_in_facts_are_served() {
+            return;
+        }
+        let merged = r#"Процедура Тест(Условие)
+    ТабДок = Новый ТабличныйДокумент;
+    Обл = Новый Структура("Ключ", 1);
+    Если Условие Тогда
+        Обл = ТабДок.ТекущаяОбласть;
+    КонецЕсли;
+    Х = Обл.Ключ;
+КонецПроцедуры"#;
+        assert!(
+            unresolved_fields(merged).is_empty(),
+            "the structure path owns the key: {:?}",
+            unresolved_fields(merged)
+        );
+
+        let sibling = r#"Процедура Тест(Условие)
+    ТабДок = Новый ТабличныйДокумент;
+    Пишущий = Новый ЗаписьJSON;
+    Если Условие Тогда
+        Пишущий = ТабДок.ТекущаяОбласть;
+    Иначе
+        Х = Пишущий.ПроверятьСтруктуру;
+    КонецЕсли;
+КонецПроцедуры"#;
+        assert!(
+            unresolved_fields(sibling).is_empty(),
+            "the sibling branch holds the writer: {:?}",
+            unresolved_fields(sibling)
+        );
+
+        let every_path = r#"Процедура Тест(Условие)
+    ТабДок = Новый ТабличныйДокумент;
+    Другой = Новый ТабличныйДокумент;
+    Если Условие Тогда
+        Обл = ТабДок.ТекущаяОбласть;
+    Иначе
+        Обл = Другой.ТекущаяОбласть;
+    КонецЕсли;
+    Х = Обл.ТекущаяОбласть;
+КонецПроцедуры"#;
+        let unresolved = unresolved_fields(every_path);
+        assert_eq!(
+            unresolved.len(),
+            1,
+            "a range on every path lacks the member on every path: {unresolved:?}"
+        );
+    }
 }

@@ -296,6 +296,10 @@ fn process_identity(pid: u32) -> io::Result<Option<(u32, u64)>> {
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process stat"))?;
     let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // An exited server waiting to be reaped holds neither the display nor its socket.
+    if matches!(fields.first(), Some(&"Z") | Some(&"X")) {
+        return Ok(None);
+    }
     let pgid = fields
         .get(2)
         .and_then(|value| value.parse().ok())
@@ -547,6 +551,47 @@ mod tests {
         assert!(socket.exists());
         assert!(owner.record.exists());
         drop(listener);
+    }
+
+    #[test]
+    fn cleanup_treats_an_unreaped_zombie_owner_as_gone() {
+        let temp = private_test_root();
+        let root = temp.path().to_owned();
+        let job = temp.path().join("job");
+        fs::create_dir(root.join(".X11-unix")).unwrap();
+        fs::create_dir(&job).unwrap();
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        let pid = child.id();
+        // WNOWAIT blocks until the child exits and leaves it unreaped, so it stays a zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(waited, 0);
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..].split_whitespace().collect();
+        assert_eq!(fields[0], "Z");
+        let record = job.join(".native-check-x11-384.owner");
+        fs::write(&record, b"").unwrap();
+        let owner = Ownership {
+            root,
+            record: record.clone(),
+            identity: Identity {
+                display: 384,
+                uid: effective_uid(),
+                pid,
+                start: fields[19].parse().unwrap(),
+                pgid: pid,
+                lock_dev: 0,
+                lock_ino: 1,
+                socket_dev: 0,
+                socket_ino: 1,
+            },
+        };
+
+        let cleaned = owner.cleanup();
+        child.wait().unwrap();
+        cleaned.unwrap();
+        assert!(!record.exists());
     }
 
     fn lock_content_pid(path: &Path) -> Option<u32> {

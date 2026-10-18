@@ -87,10 +87,14 @@ applying an entry are those of method parameter overrides.
 Adds a standard property the help extract omits or files under a misleading name
 — for example the managed-form `РежимОткрытияОкна`, whose help page ships under
 its enum type `FormWindowOpeningMode`. `canonical_type` must be a known platform
-type; the (type, name) pair must not already exist (that is a correction, not an
-addition, and is rejected). `is_readonly` defaults to `false` and `min_version`
-is optional. The property receives a synthetic id so documentation lookups do
-not alias an existing property.
+type. Names match case-insensitively. When exactly one property of that type
+carries both names, the addition is skipped and the archive record, with its
+metadata and documentation, takes precedence: 8.5 archives file
+`РежимОткрытияОкна` on the form itself. A property that shares only one of the
+names, or several properties that each carry both, are rejected: the shared name
+index would hold ambiguous entries. `is_readonly` defaults to `false` and
+`min_version` is optional. When the property is added it receives a synthetic id
+so documentation lookups do not alias an existing property.
 
 ## Method-local scope
 

@@ -321,8 +321,52 @@ fn rejects_russian_canonical_type() {
 }
 
 #[test]
-fn rejects_addition_that_already_exists() {
+fn skips_addition_the_extracted_data_already_carries() {
+    // 8.5 archives file РежимОткрытияОкна on the form itself: the archive's
+    // record, which has documentation, stays and the addition is dropped.
     let mut data = property_data();
+    data["properties"][0]["documentation"] = json!({"description": "Заголовок формы."});
+    let before = data["properties"].clone();
+    let mut entry = window_mode_addition();
+    entry["russian_name"] = Value::String("заголовок".to_owned());
+    entry["english_name"] = Value::String("Title".to_owned());
+
+    apply_type_property_additions(&mut data, &property_addition_overlay(entry)).unwrap();
+
+    assert_eq!(data["properties"], before);
+}
+
+#[test]
+fn rejects_full_match_alongside_a_property_sharing_one_alias() {
+    // Заголовок/Title is a full match; Подпись/Title shares only the English
+    // alias, so the name index would hold two entries for "Title". The verdict
+    // must not depend on which comes first.
+    let full = json!({"id": 7, "type_name": "ClientApplicationForm", "name": "Заголовок", "english_name": "Title"});
+    let partial = json!({"id": 9, "type_name": "ClientApplicationForm", "name": "Подпись", "english_name": "Title"});
+    let mut entry = window_mode_addition();
+    entry["russian_name"] = Value::String("Заголовок".to_owned());
+    entry["english_name"] = Value::String("Title".to_owned());
+
+    for properties in [json!([full, partial]), json!([partial, full])] {
+        let mut data = property_data();
+        data["properties"] = properties;
+
+        let error =
+            apply_type_property_additions(&mut data, &property_addition_overlay(entry.clone()))
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "type property addition ClientApplicationForm.Title already exists in the extracted data"
+        );
+    }
+}
+
+#[test]
+fn rejects_several_full_matches() {
+    let mut data = property_data();
+    let duplicate = json!({"id": 9, "type_name": "ClientApplicationForm", "name": "Заголовок", "english_name": "Title"});
+    data["properties"].as_array_mut().unwrap().push(duplicate);
     let mut entry = window_mode_addition();
     entry["russian_name"] = Value::String("Заголовок".to_owned());
     entry["english_name"] = Value::String("Title".to_owned());
@@ -333,6 +377,45 @@ fn rejects_addition_that_already_exists() {
     assert_eq!(
         error.to_string(),
         "type property addition ClientApplicationForm.Title already exists in the extracted data"
+    );
+}
+
+#[test]
+fn adds_after_skipping_a_present_addition_at_its_enumerate_offset() {
+    // The skipped first addition still consumes offset 0, so the second takes
+    // base_id (max existing id 7, plus 1) plus 1.
+    let mut data = property_data();
+    let mut present = window_mode_addition();
+    present["russian_name"] = Value::String("Заголовок".to_owned());
+    present["english_name"] = Value::String("Title".to_owned());
+    let overlay = json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "type_property_additions": [present, window_mode_addition()]
+    })
+    .to_string();
+
+    apply_type_property_additions(&mut data, &overlay).unwrap();
+
+    let properties = data["properties"].as_array().unwrap();
+    assert_eq!(properties.len(), 2);
+    assert_eq!(properties[1]["english_name"], "WindowOpeningMode");
+    assert_eq!(properties[1]["id"], 9);
+}
+
+#[test]
+fn rejects_addition_sharing_one_name_with_an_existing_property() {
+    let mut data = property_data();
+    let mut entry = window_mode_addition();
+    entry["russian_name"] = Value::String("Заголовок".to_owned());
+    entry["english_name"] = Value::String("Caption".to_owned());
+
+    let error =
+        apply_type_property_additions(&mut data, &property_addition_overlay(entry)).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "type property addition ClientApplicationForm.Caption already exists in the extracted data"
     );
 }
 

@@ -2529,6 +2529,7 @@ dependencies = [
  "salsa",
  "serde_json",
  "tempfile",
+ "test-utils",
  "tracing",
  "vfs",
 ]

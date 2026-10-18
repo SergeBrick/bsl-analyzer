@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::lifecycle::{lock_recover, DiagnosticsState};
+use super::lifecycle::{lock_inner, DiagnosticsState};
 use super::types::DiagnosticsStatus;
 
 /// The outcome of one [`DiagnosticsState::try_snapshot_once`] pass.
@@ -134,7 +134,7 @@ impl DiagnosticsState {
     /// transient cancellation/revision race the caller retries once.
     fn try_snapshot_once(&self, path: &Path) -> SnapshotAttempt {
         let (analysis, file_id) = {
-            let inner = lock_recover(&self.inner);
+            let inner = lock_inner(&self.inner);
             if !matches!(inner.status, DiagnosticsStatus::Ready { .. }) {
                 return SnapshotAttempt::Unavailable;
             }

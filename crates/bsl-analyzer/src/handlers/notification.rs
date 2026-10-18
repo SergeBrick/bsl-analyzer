@@ -205,6 +205,21 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     }
 }
 
+/// Refresh what the client derives from analysis after the view caught up with changes
+/// the owner published. Whichever event applied them, the `SharedWorkspaceChanged`
+/// queued for that publication later finds the view current, so the event that applied
+/// them is the only one left to tell open documents.
+pub(crate) fn refresh_after_shared_catch_up(state: &mut GlobalState) {
+    if !state.vfs_done {
+        return;
+    }
+    for uri in state.opened_document_uris() {
+        schedule_diagnostics(state, &uri);
+    }
+    state.request_semantic_tokens_refresh();
+    state.request_workspace_diagnostic_refresh();
+}
+
 /// Put an editor buffer into the shared session's view as an open document, the
 /// view's text for `file_id` from then on.
 pub(crate) fn open_shared_document(
@@ -511,6 +526,7 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
     }
 
     if let Some(owner) = state.analysis_host.owner().cloned() {
+        let mut caught_up = false;
         if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
             let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
             if let Some(token) = state.preload_tokens.remove(&file_id) {
@@ -519,7 +535,7 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
             state.open_files.remove(&file_id);
             let accepted = match owner.refresh_saved_path(&path) {
                 mcp_server::WorkspaceRead::Ready(snapshot) => {
-                    state.analysis_host.catch_up();
+                    caught_up = state.analysis_host.catch_up();
                     state.shared_view_seeded
                         && state
                             .analysis_host
@@ -564,6 +580,9 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
         state.mem_docs.remove(&uri);
         state.open_file_uri_ids.remove(&uri);
         state.mark_shared_view_changed();
+        if caught_up {
+            refresh_after_shared_catch_up(state);
+        }
         if state.open_files.is_empty() {
             state.analysis_host.take_view();
             state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
@@ -681,6 +700,7 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
         }
         if state.analysis_host.catch_up() {
             state.mark_shared_view_changed();
+            refresh_after_shared_catch_up(state);
         }
         state.scope_dirty_docs.remove(&uri);
         return Ok(());

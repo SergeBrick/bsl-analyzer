@@ -3979,6 +3979,7 @@ mod graph_supersession_contract {
         "bsl-graph-first-build",
         "bsl-search-init",
         "bsl-search-overlay-watch",
+        "bsl-search-embed",
         "bsl-overlay-backlog",
         "bsl-embed-retry",
         "bsl-change-hub",

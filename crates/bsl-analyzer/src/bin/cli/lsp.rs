@@ -31,8 +31,13 @@ pub fn run_lsp_server(args: LspArgs) -> Result<(), Box<dyn Error + Send + Sync>>
         LspMode::Stdio => bsl_analyzer::main_loop(connection),
         LspMode::Auto => run_auto(connection),
     };
-    if result.is_ok() {
-        io_threads.join().ok();
+    match &result {
+        Ok(()) => {
+            io_threads.join().ok();
+        }
+        // Termination prints the error to stderr only; the log file is where an editor
+        // session's failure is looked for afterwards.
+        Err(error) => tracing::error!(error = format!("{error:#}"), "LSP session failed"),
     }
     result.map_err(Into::into)
 }

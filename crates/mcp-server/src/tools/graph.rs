@@ -558,6 +558,8 @@ mod tests {
         // Settled, not merely ready: the publish pass checks ownership too, and one still
         // running when the verdict is dropped below would pause admission on its own.
         crate::graph::test_support::wait_settled(&graph);
+        // Populate the idle pool before timing reads with lease I/O blocked.
+        drop(crate::graph::test_support::hold_every_handle(&graph));
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
         lease.invalidate_verdict_for_test();

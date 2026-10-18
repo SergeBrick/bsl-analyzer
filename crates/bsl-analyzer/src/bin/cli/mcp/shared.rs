@@ -45,7 +45,7 @@ pub(crate) fn identity(
     let project = mcp_server::project::at(source)?;
     cache.verify_project(&project)?;
     let config = &project.config;
-    // Explicit allow-list: credential helper arguments and endpoint URLs can carry
+    // Explicit allow-list: credential helper arguments and URL userinfo can carry
     // secrets, so never put them into a shared backend identity.
     let settings = safe_config_fingerprint(config);
     let embedding = resolve_embedding_prefixes(Some(source)).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -79,7 +79,8 @@ fn safe_config_fingerprint(config: &project_model::ProjectConfig) -> Vec<u8> {
 
     let embedding = &config.search.baseline.embedding;
     let postgres = &config.search.baseline.postgres;
-    let embedding_url = embedding.url.as_deref().map(bsl_platform::redact_url);
+    let embedding_url =
+        embedding.url.as_deref().map(mcp_server::broker::embedding_endpoint_identity);
     let safe = json!({
         "diagnostics": config.diagnostics.rules_json(),
         "diagnostics_baseline": format!("{:?}", config.diagnostics.baseline),
@@ -735,20 +736,20 @@ mod tests {
     }
 
     #[test]
-    fn safe_config_identity_excludes_credentials_and_redacts_embedding_url_secrets() {
+    fn safe_config_identity_excludes_credentials_and_embedding_url_userinfo() {
         let first_dir = tempfile::tempdir().unwrap();
         let second_dir = tempfile::tempdir().unwrap();
         let first = first_dir.path().join("bsl-analyzer.toml");
         let second = second_dir.path().join("bsl-analyzer.toml");
         std::fs::write(
             &first,
-            "[search.baseline.embedding]\nurl = \"https://user:pw@example.test/v1?token=one\"\n\
+            "[search.baseline.embedding]\nurl = \"https://user:one@example.test/v1?api-version=1\"\n\
              [search.baseline.postgres.credential_helper]\nprogram = \"vault\"\nargs = [\"--token\", \"one\"]\n",
         )
         .unwrap();
         std::fs::write(
             &second,
-            "[search.baseline.embedding]\nurl = \"https://other:pw@example.test/v1?token=two\"\n\
+            "[search.baseline.embedding]\nurl = \"https://other:two@example.test/v1?api-version=1#part\"\n\
              [search.baseline.postgres.credential_helper]\nprogram = \"vault\"\nargs = [\"--token\", \"two\"]\n",
         )
         .unwrap();
@@ -756,6 +757,28 @@ mod tests {
         let second = project_model::ProjectConfig::load_from_file(&second).unwrap();
 
         assert_eq!(safe_config_fingerprint(&first), safe_config_fingerprint(&second));
+    }
+
+    #[test]
+    fn embedding_url_query_forks_the_identity() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = first_dir.path().join("bsl-analyzer.toml");
+        let second = second_dir.path().join("bsl-analyzer.toml");
+        std::fs::write(
+            &first,
+            "[search.baseline.embedding]\nurl = \"https://emb.example.test/v1/embed?api-version=2024-02-01\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "[search.baseline.embedding]\nurl = \"https://emb.example.test/v1/embed?api-version=2025-01-01\"\n",
+        )
+        .unwrap();
+        let first = project_model::ProjectConfig::load_from_file(&first).unwrap();
+        let second = project_model::ProjectConfig::load_from_file(&second).unwrap();
+
+        assert_ne!(safe_config_fingerprint(&first), safe_config_fingerprint(&second));
     }
 
     #[test]

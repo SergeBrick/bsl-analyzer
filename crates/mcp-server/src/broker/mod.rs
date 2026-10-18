@@ -15,7 +15,7 @@ pub mod transport;
 
 pub use name::{
     backend_name, embedding_config_fingerprint, embedding_config_fingerprint_with_prefixes,
-    process_epoch, workspace_topology_fingerprint, BackendKey, EMBEDDING_DOCUMENT_PREFIX_ENV,
+    embedding_endpoint_identity, process_epoch, workspace_topology_fingerprint, BackendKey, EMBEDDING_DOCUMENT_PREFIX_ENV,
     EMBEDDING_MAX_INPUT_TOKENS_ENV, EMBEDDING_QUERY_PREFIX_ENV, EMBEDDING_TOKENIZER_FILE_ENV,
     EMBEDDING_TOKENIZER_SHA256_ENV, TOPOLOGY_FP_ENV,
 };

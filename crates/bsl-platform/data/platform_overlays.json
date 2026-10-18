@@ -234,6 +234,62 @@
       "is_readonly": true,
       "evidence_source": "ISSUE #230: a runtime probe on platform 8.3.27.2214 — `Область = ТабДок.ТекущаяОбласть; Область.Значение = 5;` is refused at run time with «Поле объекта недоступно для записи (Значение)». The extracted record of ОбластьЯчеекТабличногоДокумента.Значение (property id 12748) carries `is_readonly: false`; the same flag is false in the legacy `platform_data.json` of releases before v0.3.0 (the file left the tree with #312), so this is a data gap and not a regression of the dump.",
       "rationale": "The help page of ОбластьЯчеекТабличногоДокумента.Значение omits the read-only mark the runtime enforces, so every `Обл.Значение = …` on a range is accepted silently by the analyzer although the assignment can never succeed — the value of a range belongs to the document that computed it. ReadOnlyPropertyAssignment has to answer for this property as it does for Запрос.Параметры."
+    },
+    {
+      "type": "FormButton",
+      "name": "СочетаниеКлавиш",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Кнопка.СочетаниеКлавиш = Новый СочетаниеКлавиш(Клавиша.F7)` (client and server, a button from the form description and one added by `Элементы.Добавить`) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. The help itself says the shortcut runs the button's command; setting it at run time is the usual way to give a generated button a key."
+    },
+    {
+      "type": "FormTable",
+      "name": "АвтоОтметкаНезаполненного",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Элементы.Таблица.АвтоОтметкаНезаполненного = Истина` (client and server) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. Forms toggle it by state, e.g. once a document is marked ready."
+    },
+    {
+      "type": "ColorChooseDialog",
+      "name": "Цвет",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Диалог.Цвет = WebЦвета.Красный` (thin client) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. The help describes it as the colour set when the dialog opens, which only an assignment can do."
+    },
+    {
+      "type": "PlannerItem",
+      "name": "ЗначенияИзмерений",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Элемент.ЗначенияИзмерений = Новый ФиксированноеСоответствие(...)` on an item of `Планировщик.Элементы.Добавить` (client and server) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. An item added to a planner gets its dimension values only through this assignment."
+    },
+    {
+      "type": "TableBox",
+      "name": "РежимВыделенияСтроки",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `ТабличноеПоле.РежимВыделенияСтроки = РежимВыделенияСтрокиТабличногоПоля.Ячейка` (thick client, ordinary application; a form table box and one added by `ЭлементыФормы.Добавить`) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. Ordinary forms switch the selection mode of a table box at run time."
+    },
+    {
+      "type": "ConfigurationExtension",
+      "name": "ЗащитаОтОпасныхДействий",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Расширение.ЗащитаОтОпасныхДействий = Новый ОписаниеЗащитыОтОпасныхДействий` on `РасширенияКонфигурации.Создать()` (server) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. An extension is configured before `Записать()`; a property that could not be set would make the documented object useless."
+    },
+    {
+      "type": "ConfigurationExtension",
+      "name": "ИспользоватьОсновныеРолиДляВсехПользователей",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Расширение.ИспользоватьОсновныеРолиДляВсехПользователей = Ложь` on `РасширенияКонфигурации.Создать()` (server) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. Same as the other settings of a new extension; the control `Расширение.УникальныйИдентификатор = ...` is refused."
+    },
+    {
+      "type": "DeliverableNotification",
+      "name": "ЗвуковоеОповещение",
+      "is_readonly": false,
+      "evidence_source": "Run on platforms 8.3.17.1549 and 8.3.27.2214 (file infobase, compatibility mode 8.3.17 and none): `Уведомление.ЗвуковоеОповещение = ЗвуковоеОповещение.Нет` on `Новый ДоставляемоеУведомление` (server) is accepted and the new value is read back; a control assignment to a read-only property in the same run fails with «Поле объекта недоступно для записи».",
+      "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. A notification object is built property by property before it is sent."
     }
   ],
   "type_member_surface_attestations": [

@@ -137,6 +137,12 @@ because that addition creates the record). At least one of `is_readonly` and
 are two entries for one property. The record keeps its id, its other fields and
 its documentation link: a correction is applied in place.
 
+The mark can be wrong the other way as well: the help marks some writable
+properties «Только чтение» (the button shortcut, the colour of the colour
+dialog), and `ReadOnlyPropertyAssignment` then reports code the platform runs.
+`"is_readonly": false` lifts such a mark; its evidence is a run of the
+assignment on the platform, not the help text.
+
 Unlike an addition, a correction never declares a property. The overlay serves
 every corpus, and a corpus of another platform release may lack the target
 (older than the property, or an external corpus from another vendor's dump); the

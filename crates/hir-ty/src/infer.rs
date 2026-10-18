@@ -2500,6 +2500,25 @@ impl<'db> InferenceContext<'db> {
         )
     }
 
+    /// A `&НаСервереБезКонтекста` / `&НаКлиентеНаСервереБезКонтекста` method has no
+    /// form in scope: there a bare `Элементы = …` or `Параметры = …` declares a local,
+    /// as the platform runs it, instead of writing the form's property.
+    fn in_method_without_form_context(&self) -> bool {
+        let DefWithBodyId::Method(local_id) = self.owner else {
+            return false;
+        };
+        let module = hir_def::ModuleId::new(self.context_file_id);
+        self.db.interface_method(hir_def::MethodId { module, local_id }).is_some_and(|method| {
+            method.directives.iter().any(|directive| {
+                matches!(
+                    directive,
+                    hir_def::item_tree::AnnotationKind::AtServerNoContext
+                        | hir_def::item_tree::AnnotationKind::AtClientAtServerNoContext
+                )
+            })
+        })
+    }
+
     /// Gives a parameter the fields its doc-comment declares, for use inside the method's own body.
     ///
     /// The materialised signature serves calls from the outside; within the body a parameter is a
@@ -2640,7 +2659,9 @@ impl<'db> InferenceContext<'db> {
                             Some(hir_def::resolver::Resolution::Method(_))
                                 | Some(hir_def::resolver::Resolution::Variable(_))
                         ) || self.body_declares_binding(name);
-                        let form_self_resolution = if user_shadows {
+                        let form_self_resolution = if user_shadows
+                            || self.in_method_without_form_context()
+                        {
                             None
                         } else {
                             crate::form_self::resolve_form_self_property(self.db, &resolver, name)

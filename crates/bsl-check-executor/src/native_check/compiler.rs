@@ -3,7 +3,6 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -14,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::NativeProfile;
 
-static STOP_GRACE_MS: AtomicU64 = AtomicU64::new(2_000);
+/// Cleanup grace for stop clocks taken outside a request's scope.
+const DEFAULT_STOP_GRACE_MS: u64 = 2_000;
 
 tokio::task_local! {
     static STOP_CLOCK: StopClock;
@@ -27,11 +27,8 @@ pub(crate) struct StopClock {
 }
 
 impl StopClock {
-    fn new() -> Self {
-        Self {
-            started: Arc::new(Mutex::new(None)),
-            budget: cleanup_budget(STOP_GRACE_MS.load(Ordering::Relaxed)),
-        }
+    fn new(stop_grace_ms: u64) -> Self {
+        Self { started: Arc::new(Mutex::new(None)), budget: cleanup_budget(stop_grace_ms) }
     }
 
     pub(crate) fn mark(&self) -> Instant {
@@ -53,7 +50,7 @@ impl StopClock {
 }
 
 pub(crate) fn current_stop_clock() -> StopClock {
-    STOP_CLOCK.try_with(Clone::clone).unwrap_or_else(|_| StopClock::new())
+    STOP_CLOCK.try_with(Clone::clone).unwrap_or_else(|_| StopClock::new(DEFAULT_STOP_GRACE_MS))
 }
 
 struct StopWatch {
@@ -76,9 +73,10 @@ impl Drop for StopWatch {
 pub(crate) async fn with_stop_clock<F: Future>(
     cancel: CancellationToken,
     deadline: Instant,
+    stop_grace_ms: u64,
     future: F,
 ) -> F::Output {
-    let clock = StopClock::new();
+    let clock = StopClock::new(stop_grace_ms);
     let watcher_cancel = CancellationToken::new();
     let watcher_stop = watcher_cancel.clone();
     let watcher_clock = clock.clone();
@@ -93,10 +91,6 @@ pub(crate) async fn with_stop_clock<F: Future>(
     let output = STOP_CLOCK.scope(watcher.clock.clone(), future).await;
     watcher.complete = true;
     output
-}
-
-pub(super) fn configure_stop_grace(milliseconds: u64) {
-    STOP_GRACE_MS.store(milliseconds, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1201,9 +1195,24 @@ mod tests {
         assert_eq!(cleanup_budget(500), Duration::from_millis(375));
     }
 
+    #[tokio::test]
+    async fn each_stop_clock_scope_keeps_its_own_grace() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (outer, inner) = with_stop_clock(CancellationToken::new(), deadline, 500, async {
+            let inner = with_stop_clock(CancellationToken::new(), deadline, 900_000, async {
+                current_stop_clock().budget
+            })
+            .await;
+            (current_stop_clock().budget, inner)
+        })
+        .await;
+        assert_eq!(outer, cleanup_budget(500));
+        assert_eq!(inner, cleanup_budget(900_000));
+    }
+
     #[test]
     fn repeated_stop_observations_keep_the_original_cleanup_deadline() {
-        let clock = StopClock::new();
+        let clock = StopClock::new(DEFAULT_STOP_GRACE_MS);
         let first = clock.mark();
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(clock.mark(), first);

@@ -34,8 +34,9 @@ pub async fn check_wire(
     if let Err(error) = profile.validate() {
         return failure(&request, "profile_invalid", &error.to_string());
     }
-    crate::native_check::configure_stop_grace(request.limits.stop_grace_ms);
-    let result = check(client, &profile, &internal, &request.code, cancel).await;
+    let result =
+        check(client, &profile, &internal, &request.code, request.limits.stop_grace_ms, cancel)
+            .await;
     bounded(response(&request, result), request.limits.max_response_bytes as usize)
 }
 

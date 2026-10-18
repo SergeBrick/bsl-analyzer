@@ -304,12 +304,14 @@ impl NativeProfile {
         client: &onec_client::Client,
         request: &super::types::CheckRequest,
         code: &str,
+        stop_grace_ms: u64,
         cancel: tokio_util::sync::CancellationToken,
         deadline: std::time::Instant,
     ) -> super::types::CheckResult {
         super::compiler::with_stop_clock(
             cancel.clone(),
             deadline,
+            stop_grace_ms,
             self.run_scoped(client, request, code, cancel, deadline),
         )
         .await

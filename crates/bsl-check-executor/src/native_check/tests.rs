@@ -47,7 +47,7 @@ async fn cancelling_a_queued_check_does_not_take_the_active_slot() {
     let waiter_cancel = cancel.clone();
     let task = tokio::spawn(async move {
         let client = onec_client::Client::new("http://localhost", "", "");
-        check(&client, &profile(), &CheckRequest::default(), "x = 1;", waiter_cancel).await
+        check(&client, &profile(), &CheckRequest::default(), "x = 1;", 2_000, waiter_cancel).await
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     cancel.cancel();
@@ -71,6 +71,7 @@ async fn queued_check_deadline_includes_waiting_for_the_native_slot() {
         &short_profile,
         &CheckRequest::default(),
         "x = 1;",
+        2_000,
         CancellationToken::new(),
     )
     .await;
@@ -90,6 +91,7 @@ async fn module_without_an_explicit_context_is_not_reported_as_invalid_code() {
         &profile(),
         &request,
         "Процедура Тест()\nКонецПроцедуры",
+        2_000,
         CancellationToken::new(),
     )
     .await;
@@ -122,9 +124,15 @@ async fn public_check_reports_dirty_owned_root_as_error_without_starting_a_platf
     let mut configured = profile();
     configured.work_root = work_root;
     let client = onec_client::Client::new("http://localhost", "", "");
-    let result =
-        check(&client, &configured, &CheckRequest::default(), "x = 1;", CancellationToken::new())
-            .await;
+    let result = check(
+        &client,
+        &configured,
+        &CheckRequest::default(),
+        "x = 1;",
+        2_000,
+        CancellationToken::new(),
+    )
+    .await;
 
     assert_eq!(result.status, CheckStatus::Error);
     assert_eq!(result.failure.unwrap().code, "cleanup_failed");

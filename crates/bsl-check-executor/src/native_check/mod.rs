@@ -28,10 +28,6 @@ pub fn startup(profile: &NativeProfile) -> Result<(), NativeProfileError> {
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) fn configure_stop_grace(stop_grace_ms: u64) {
-    compiler::configure_stop_grace(stop_grace_ms);
-}
-
 // ponytail: one process-wide native job; add per-profile locks only if measured throughput requires it.
 static ACTIVE_CHECK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -41,6 +37,7 @@ pub async fn check(
     profile: &NativeProfile,
     request: &CheckRequest,
     code: &str,
+    stop_grace_ms: u64,
     cancel: CancellationToken,
 ) -> CheckResult {
     if let Err(message) = request.validate() {
@@ -81,7 +78,7 @@ pub async fn check(
         }
         guard = lock => guard,
     };
-    let result = profile.run(client, request, code, cancel, deadline).await;
+    let result = profile.run(client, request, code, stop_grace_ms, cancel, deadline).await;
     drop(guard);
     result
 }

@@ -204,6 +204,7 @@ MethodSize = { maxMethodSize = 250 }
 | `MagicDate` | `authorizedDates` | встроенный набор разрешённых дат |
 | `BadWords` | `badWords` | пусто |
 | `CommentedCode` | `threshold` | `0.9` |
+| `CommentedCode` | `skipSupported` | `false` |
 | `ConsecutiveEmptyLines` | `allowedEmptyLinesCount` | `1` |
 | `DeprecatedPlatformApi` | `exclude` | пусто |
 

@@ -55,6 +55,8 @@ pub enum ConventionalName {
     PredefinedXml,
     RightsXml,
     FormXml,
+    /// The vendor support map under the configuration's `Ext`.
+    ParentConfigurationsBin,
 }
 
 impl ConventionalName {
@@ -80,6 +82,7 @@ impl ConventionalName {
         ConventionalName::PredefinedXml,
         ConventionalName::RightsXml,
         ConventionalName::FormXml,
+        ConventionalName::ParentConfigurationsBin,
     ];
 
     /// The canonical spelling the configurator writes. Constructing a path or
@@ -108,6 +111,7 @@ impl ConventionalName {
             ConventionalName::PredefinedXml => "Predefined.xml",
             ConventionalName::RightsXml => "Rights.xml",
             ConventionalName::FormXml => "Form.xml",
+            ConventionalName::ParentConfigurationsBin => "ParentConfigurations.bin",
         }
     }
 
@@ -205,7 +209,8 @@ mod tests {
             Configuration.xml
             Predefined.xml
             Rights.xml
-            Form.xml"#]]
+            Form.xml
+            ParentConfigurations.bin"#]]
         .assert_eq(&listing);
     }
 

@@ -190,6 +190,12 @@ impl<'a> AnalysisContext<'a> {
         hir::compat_mode::effective_mode(self.provider.compatibility_mode().as_deref())
     }
 
+    /// The vendor support map, when this file belongs to the main configuration
+    /// and the map was loaded (a diagnostic asked for it in the project config).
+    pub fn vendor_support(&self) -> Option<Arc<bsl_metadata::VendorSupport>> {
+        self.provider.vendor_support_for_file(self.file_id)
+    }
+
     /// Project settings for which environments a call is compiled into.
     pub fn env_options(&self) -> hir::execution_env::EnvOptions {
         self.provider.env_options()

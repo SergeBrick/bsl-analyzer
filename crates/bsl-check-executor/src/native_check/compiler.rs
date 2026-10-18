@@ -352,7 +352,10 @@ async fn run_designer_xvfb(
         let startup_conflict = matches!(output.termination, Termination::Completed(Some(code)) if code != 0)
             && super::x11::is_startup_conflict(&error_path);
         let _ = std::fs::remove_file(&error_path);
-        if startup_conflict && attempt < 9 {
+        // xvfb-run rewrites its error file after the command exits, so the server's own report
+        // of a taken display is usually gone; a display this attempt never owned but finds taken
+        // is that same conflict.
+        if (startup_conflict || output.x11_conflict) && attempt < 9 {
             let _ = std::fs::remove_file(log_path);
             continue;
         }
@@ -1393,6 +1396,61 @@ mod tests {
         assert!(std::fs::read_dir(&cwd).unwrap().all(|entry| {
             !entry.unwrap().file_name().to_string_lossy().starts_with(".native-check-xvfb-")
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn xvfb_retries_a_display_taken_by_another_server_after_the_error_file_is_rewritten() {
+        let temp = short_test_root();
+        let root = temp.path().join("x11");
+        let cwd = temp.path().join("job");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join(".X11-unix")).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let counter = cwd.join("attempts");
+        let designer = script(&cwd, "exit 0");
+        // The first attempt loses the display to a server owned by another process, and, as the
+        // real wrapper does, runs the command anyway and rewrites the error file afterwards.
+        let wrapper = python_script(
+            &cwd,
+            "xvfb-run-fake",
+            &format!(
+                "import os,socket,subprocess,sys\na=sys.argv[1:]\nd=int(a[a.index('-n')+1]); e=a[a.index('-e')+1]; cmd=a[a.index('-e')+2:]\np='{}'; n=int(open(p).read())+1 if os.path.exists(p) else 1; open(p,'w').write(str(n))\nr=os.environ['BSL_CHECK_X11_ROOT']; lock=f'{{r}}/.X{{d}}-lock'; sock=f'{{r}}/.X11-unix/X{{d}}'\nif n == 1:\n open(lock,'w').write(str(os.getppid())+'\\n'); socket.socket(socket.AF_UNIX).bind(sock)\n open(e,'a').write(f'Fatal server error: Server is already active for display {{d}}\\n')\n c=subprocess.run(cmd,check=False).returncode; open(e,'w').close(); sys.exit(c)\nopen(lock,'w').write(str(os.getpid())+'\\n')\ns=socket.socket(socket.AF_UNIX); s.bind(sock); s.listen()\ntry:\n sys.exit(subprocess.run(cmd,check=False).returncode)\nfinally:\n s.close(); os.unlink(sock); os.unlink(lock)",
+                counter.display()
+            ),
+        );
+        let profile = NativeProfile {
+            designer_path: designer,
+            python_path: "/usr/bin/python3".into(),
+            xvfb_run_path: Some(wrapper.clone()),
+            expected_build: "test-build".into(),
+            work_root: temp.path().to_owned(),
+            source_kind: super::super::profile::SourceKind::File,
+            source_connection_env: "BSL_SOURCE".into(),
+            runtime_url_env: None,
+            user_env: None,
+            password_env: None,
+            max_input_bytes: 1024,
+            deadline_ms: 60_000,
+            max_log_bytes: 4096,
+        };
+        let log = cwd.join("native.log");
+        let args = [OsString::from("DESIGNER"), OsString::from("/Out"), log.as_os_str().to_owned()];
+        let output = run_designer_xvfb(
+            &wrapper,
+            &profile,
+            &args,
+            &cwd,
+            &log,
+            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+            4096,
+            &root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.termination, Termination::Completed(Some(0)));
+        assert_eq!(std::fs::read_to_string(counter).unwrap(), "2");
     }
 
     #[cfg(target_os = "linux")]

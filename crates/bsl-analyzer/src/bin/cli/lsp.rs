@@ -77,16 +77,86 @@ fn standalone_with_initial(connection: Connection, initial: Message) -> Result<(
 }
 
 struct BackendPipe {
-    write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    /// Unbounded, and drained by its own task: a relay that waited for a backend to take
+    /// its input would stop draining that backend's output, while the backend may be
+    /// waiting for its output to drain before it reads more input.
+    outgoing: Option<tokio::sync::mpsc::UnboundedSender<Message>>,
+    writer: Option<tokio::task::JoinHandle<Result<()>>>,
     messages: tokio::sync::mpsc::Receiver<Message>,
     controls: tokio::sync::mpsc::Receiver<LspControl>,
     reader: tokio::task::JoinHandle<Result<()>>,
     _send_control: tokio::sync::mpsc::Sender<LspControl>,
 }
 
+impl BackendPipe {
+    fn new(
+        io: tokio::io::DuplexStream,
+        controls: tokio::sync::mpsc::Receiver<LspControl>,
+        send_control: tokio::sync::mpsc::Sender<LspControl>,
+    ) -> Self {
+        let (read, mut write) = tokio::io::split(io);
+        let (outgoing, mut queued) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let writer = tokio::spawn(async move {
+            while let Some(message) = queued.recv().await {
+                shared::write_lsp_message(&mut write, &message).await?;
+            }
+            Ok(())
+        });
+        let (sender, messages) = tokio::sync::mpsc::channel(16);
+        let reader = tokio::spawn(async move {
+            let mut read = tokio::io::BufReader::new(read);
+            while let Some(message) = shared::read_lsp_message(&mut read).await? {
+                if sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        Self {
+            outgoing: Some(outgoing),
+            writer: Some(writer),
+            messages,
+            controls,
+            reader,
+            _send_control: send_control,
+        }
+    }
+
+    /// Queues `message` without waiting for the backend; once the writer has ended, reports
+    /// why it did.
+    async fn send(&mut self, message: Message) -> Result<()> {
+        if self.outgoing.as_ref().is_some_and(|outgoing| outgoing.send(message).is_ok()) {
+            return Ok(());
+        }
+        self.flush().await?;
+        anyhow::bail!("LSP backend stopped accepting messages")
+    }
+
+    /// Delivers everything already sent, then reports how the writer ended.
+    async fn flush(&mut self) -> Result<()> {
+        self.outgoing = None;
+        match self.writer.take() {
+            Some(writer) => writer.await?.context("LSP backend write failed"),
+            None => Ok(()),
+        }
+    }
+
+    /// Why the backend's output ended: its read error when there was one.
+    async fn disconnected(&mut self) -> anyhow::Error {
+        let error = "LSP backend disconnected; session cannot be replayed";
+        match (&mut self.reader).await {
+            Ok(Err(cause)) => cause.context(error),
+            _ => anyhow::anyhow!(error),
+        }
+    }
+}
+
 impl Drop for BackendPipe {
     fn drop(&mut self) {
         self.reader.abort();
+        if let Some(writer) = &self.writer {
+            writer.abort();
+        }
     }
 }
 
@@ -148,18 +218,7 @@ async fn connect_backend(root: &Path, context: &LspContext) -> Result<BackendPip
         channel.send_control(LspControl::ResumeLsp(bytes)).await?;
     }
     let (io, controls, send_control) = channel.into_parts();
-    let (read, write) = tokio::io::split(io);
-    let (sender, messages) = tokio::sync::mpsc::channel(16);
-    let reader = tokio::spawn(async move {
-        let mut read = tokio::io::BufReader::new(read);
-        while let Some(message) = shared::read_lsp_message(&mut read).await? {
-            if sender.send(message).await.is_err() {
-                break;
-            }
-        }
-        Ok(())
-    });
-    Ok(BackendPipe { write, messages, controls, reader, _send_control: send_control })
+    Ok(BackendPipe::new(io, controls, send_control))
 }
 
 async fn relay_lsp(
@@ -176,7 +235,7 @@ async fn relay_lsp(
     if let Message::Request(request) = &initial {
         pending.insert(request.id.clone(), request.method.clone());
     }
-    shared::write_lsp_message(&mut backend.write, &initial).await?;
+    backend.send(initial).await?;
     let (sender, mut incoming) = tokio::sync::mpsc::channel(16);
     let receiver = connection.receiver;
     tokio::task::spawn_blocking(move || {
@@ -233,7 +292,7 @@ async fn relay_lsp(
                             version: documents.get_version(&uri).unwrap_or_default(),
                             text: documents.get(&uri).unwrap_or_default(),
                         }};
-                        shared::write_lsp_message(&mut backend.write, &Message::Notification(lsp_server::Notification::new("textDocument/didOpen".into(), params))).await?;
+                        backend.send(Message::Notification(lsp_server::Notification::new("textDocument/didOpen".into(), params))).await?;
                     }
                 }
                 Some(LspControl::ResumeLsp(_)) => break Err(anyhow::anyhow!("unexpected daemon resume control")),
@@ -283,7 +342,7 @@ async fn relay_lsp(
                     connection.sender.send(message)?;
                 }
                 None if shutdown_requested => break Ok(()),
-                None => break Err(anyhow::anyhow!("LSP backend disconnected; session cannot be replayed")),
+                None => break Err(backend.disconnected().await),
                 }
             },
             RelayEvent::Client(message) => {
@@ -303,9 +362,9 @@ async fn relay_lsp(
                             }
                         },
                     }
-                    shared::write_lsp_message(&mut backend.write, &message).await?;
+                    backend.send(message).await?;
                 }
-                None => break Ok(()),
+                None => break backend.flush().await,
                 }
             },
         }
@@ -441,7 +500,90 @@ fn mirror_document(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    fn relay_over(
+        io: tokio::io::DuplexStream,
+    ) -> (Connection, tokio::task::JoinHandle<Result<()>>) {
+        let (server, client) = Connection::memory();
+        let (send_control, controls) = tokio::sync::mpsc::channel(1);
+        let initialize = Message::Request(lsp_server::Request::new(
+            RequestId::from(1),
+            "initialize".into(),
+            serde_json::json!({"capabilities": {}}),
+        ));
+        let relay = tokio::spawn(relay_lsp(
+            server,
+            BackendPipe::new(io, controls, send_control),
+            PathBuf::new(),
+            initialize,
+            serde_json::json!({"capabilities": {}}),
+            lsp_types::InitializeParams::default(),
+        ));
+        (client, relay)
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_the_backend_while_a_write_to_it_is_blocked() {
+        let (relay_io, backend_io) = tokio::io::duplex(4096);
+        let (backend_read, mut backend_write) = tokio::io::split(backend_io);
+        let mut backend_read = tokio::io::BufReader::new(backend_read);
+        let (client, relay) = relay_over(relay_io);
+        let initialize = shared::read_lsp_message(&mut backend_read).await.unwrap().unwrap();
+        assert!(matches!(initialize, Message::Request(request) if request.method == "initialize"));
+
+        client
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                RequestId::from(2),
+                "test/large".into(),
+                "я".repeat(64 * 1024),
+            )))
+            .unwrap();
+        // The backend stops reading once the large request has started to arrive, so the
+        // rest of it cannot be written while the backend has output of its own to deliver.
+        let mut first = [0u8; 1];
+        backend_read.read_exact(&mut first).await.unwrap();
+        shared::write_lsp_message(
+            &mut backend_write,
+            &Message::Notification(lsp_server::Notification::new(
+                "test/progress".into(),
+                serde_json::Value::Null,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let (client, forwarded) = tokio::task::spawn_blocking(move || {
+            let forwarded = client.receiver.recv().unwrap();
+            (client, forwarded)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(forwarded, Message::Notification(notification) if notification.method == "test/progress")
+        );
+        relay.abort();
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_backend_framing_error_is_the_reported_cause() {
+        let (relay_io, backend_io) = tokio::io::duplex(4096);
+        let (backend_read, mut backend_write) = tokio::io::split(backend_io);
+        let mut backend_read = tokio::io::BufReader::new(backend_read);
+        let (client, relay) = relay_over(relay_io);
+        shared::read_lsp_message(&mut backend_read).await.unwrap().unwrap();
+
+        backend_write.write_all(b"Content-Length: 50\r\n\r\n{}").await.unwrap();
+        backend_write.shutdown().await.unwrap();
+
+        let error = relay.await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("truncated LSP body"), "{error:#}");
+        drop(client);
+    }
 
     #[tokio::test]
     async fn relay_services_both_ready_data_producers_and_prioritizes_retirement() {

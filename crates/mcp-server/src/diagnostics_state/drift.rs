@@ -7,7 +7,7 @@ use crate::change_hub::{CarriedDebt, ChangeEntry, Health, SinkCursor, WorkspaceC
 use crate::graph::scan::{classify_changes, FileStat, WorkspaceDiff};
 use crate::graph::universe::ScanVerdict;
 
-use super::lifecycle::{lock_recover, DiagnosticsState, Inner};
+use super::lifecycle::{lock_inner, lock_recover, DiagnosticsState, Inner};
 use super::resident::apply_resident_changes;
 use super::types::{DiagnosticsStatus, Freshness, ReloadState};
 
@@ -49,6 +49,303 @@ pub(super) struct ScanCache {
 }
 
 impl DiagnosticsState {
+    /// Route a validated editor path hint through this owner's existing bounded change hub.
+    /// The event kind is re-derived by the hub from current disk state; callers cannot tell
+    /// the owner that a path was deleted merely by naming a watched-file event type.
+    pub(crate) fn notify_changed_path(&self, requested: &Path) -> bool {
+        let frozen = self.freeze_if_invalid_or_frozen();
+        self.mark_in_use();
+        let Some(root) = self.workspace_root.as_deref() else { return false };
+        let path =
+            if requested.is_absolute() { requested.to_path_buf() } else { root.join(requested) };
+        let canonical = crate::change_hub::resolve_as_far_as_it_goes(&path);
+
+        let admitted = {
+            let inner = lock_inner(&self.inner);
+            let Some(resident) = inner.resident.as_ref() else { return false };
+            if !matches!(inner.status, DiagnosticsStatus::Ready { .. }) {
+                return false;
+            }
+            let project = resident.project();
+            let in_source_root = resident.workspace_roots().root_of(&path, &canonical).is_some();
+            let project_input = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(project_model::is_project_input_file_name)
+                && path.parent().is_some_and(|parent| {
+                    std::iter::once(root)
+                        .chain(project.source_roots().iter().map(PathBuf::as_path))
+                        .any(|dir| {
+                            dir == parent
+                                || crate::change_hub::resolve_as_far_as_it_goes(dir)
+                                    == canonical.parent().unwrap_or(Path::new(""))
+                        })
+                });
+            project_input
+                || (!frozen
+                    && in_source_root
+                    && !project.is_source_excluded(&path)
+                    && !project.is_source_excluded(&canonical))
+        };
+        if !admitted {
+            return false;
+        }
+
+        if let Some(hub) = self.change_hub.as_ref() {
+            return hub.notify_path_changed(&path);
+        }
+        // Direct/reference profiles have no daemon hub. Preserve their existing
+        // throttled reconcile path rather than creating a second watcher or walk here.
+        let _ = self.force_rescan();
+        true
+    }
+
+    /// Reconcile one already-served BSL path from its saved disk bytes without a workspace
+    /// scan. The file read and decode happen outside `inner`; publication is accepted only
+    /// if the resident, generation, scope, and path membership still match the capture.
+    pub(crate) fn refresh_saved_path(
+        &self,
+        requested: &Path,
+    ) -> crate::workspace_handle::WorkspaceRead<ide_host_core::WorkspaceSnapshot> {
+        use crate::workspace_handle::WorkspaceRead;
+
+        if self.freeze_if_invalid_or_frozen() {
+            return WorkspaceRead::Failed(super::lifecycle::LAST_GOOD_INVALID_PROJECT.to_owned());
+        }
+        self.mark_in_use();
+        let Some(root) = self.workspace_root.clone() else {
+            return WorkspaceRead::Disabled;
+        };
+        let requested =
+            if requested.is_absolute() { requested.to_path_buf() } else { root.join(requested) };
+        let key = super::resident::canonical_key(&requested);
+        // Read the same resolved spelling that keys `by_path`; a symlink alias supplied by
+        // an editor must not redirect the point refresh after admission was checked.
+        let path = PathBuf::from(&key);
+
+        let (
+            file_id,
+            was_admitted_hole,
+            generation,
+            baseline_epoch,
+            topology,
+            config_fp,
+            scope,
+            old_fp,
+        ) = {
+            let inner = lock_inner(&self.inner);
+            if inner.invalid_configuration.is_some() {
+                return WorkspaceRead::Failed(
+                    super::lifecycle::LAST_GOOD_INVALID_PROJECT.to_owned(),
+                );
+            }
+            match &inner.status {
+                DiagnosticsStatus::Disabled => return WorkspaceRead::Disabled,
+                DiagnosticsStatus::Idle | DiagnosticsStatus::Loading => {
+                    return WorkspaceRead::Loading;
+                }
+                DiagnosticsStatus::Failed(message)
+                    if message.starts_with("invalid project at ") =>
+                {
+                    return WorkspaceRead::RejectedScope(message.clone());
+                }
+                DiagnosticsStatus::Failed(message) => {
+                    return WorkspaceRead::Failed(message.clone());
+                }
+                DiagnosticsStatus::Ready { .. } => {}
+            }
+            if inner.reload == ReloadState::Running {
+                return WorkspaceRead::Busy;
+            }
+            let Some(resident) = inner.resident.as_ref() else {
+                return WorkspaceRead::Loading;
+            };
+            let (file_id, admitted_hole) = if let Some(&id) = resident.by_path.get(&key) {
+                (Some(id), false)
+            } else if resident.holes.get(&key) == Some(&super::resident::HoleOrigin::Admitted) {
+                let id = resident
+                    .vfs
+                    .0
+                    .with_vfs(|vfs| vfs.file_id(&vfs::VfsPath::new(PathBuf::from(&key))));
+                (id, true)
+            } else {
+                (None, false)
+            };
+            let Some(file_id) = file_id else {
+                // A missing member may be an editor-only document, excluded source, or a
+                // path outside the accepted project. Closing it must not admit it to disk.
+                return WorkspaceRead::Ready(resident.db.snapshot());
+            };
+            if !bsl_conventions::str_has_extension(&key, bsl_conventions::BSL_EXTENSION) {
+                return WorkspaceRead::Ready(resident.db.snapshot());
+            }
+            (
+                file_id,
+                admitted_hole,
+                inner.generation,
+                inner.baseline_epoch,
+                inner.topology,
+                inner.config_fp,
+                resident.scope_identity.clone(),
+                inner.stats.get(&key).copied(),
+            )
+        };
+
+        enum DiskState {
+            Readable(String, u64),
+            Deleted,
+            Unreadable(Option<u64>),
+        }
+        let disk = match std::fs::read(&path) {
+            Ok(bytes) => match base_db::decode_disk_bytes(&bytes) {
+                Some(text) => {
+                    let hash = blake3::hash(&bytes);
+                    let fp = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+                    DiskState::Readable(text, fp)
+                }
+                None => DiskState::Unreadable(Some(fingerprint_bytes(&bytes))),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DiskState::Deleted,
+            // Keep the drift baseline aligned with the regular stat path even when the
+            // bytes cannot be opened. `file_fingerprint` uses the same unreadable marker
+            // derived from (mtime, length) as a workspace scan.
+            Err(_) => DiskState::Unreadable(crate::graph::scan::file_fingerprint(&path)),
+        };
+
+        // A source-config edit changes the meaning of membership even before its reload is
+        // published. Do not apply bytes under an identity that has already moved on disk.
+        if self.freeze_if_invalid_or_frozen() {
+            return WorkspaceRead::Failed(super::lifecycle::LAST_GOOD_INVALID_PROJECT.to_owned());
+        }
+        if config_identity_now(&root) != config_fp {
+            return WorkspaceRead::Failed("saved_path_scope_changed".to_owned());
+        }
+        let listed_body = project_model::is_substrate_listed_body_path(&path);
+
+        let mut published_generation = None;
+        let mut invalidate_scan = false;
+        let snapshot = {
+            let mut inner = lock_inner(&self.inner);
+            if inner.invalid_configuration.is_some() {
+                return WorkspaceRead::Failed(
+                    super::lifecycle::LAST_GOOD_INVALID_PROJECT.to_owned(),
+                );
+            }
+            if inner.reload == ReloadState::Running {
+                return WorkspaceRead::Busy;
+            }
+            if inner.generation != generation
+                || inner.baseline_epoch != baseline_epoch
+                || inner.topology != topology
+                || inner.config_fp != config_fp
+            {
+                return WorkspaceRead::Failed("saved_path_owner_changed".to_owned());
+            }
+            {
+                let Some(resident) = inner.resident.as_ref() else {
+                    return WorkspaceRead::Busy;
+                };
+                if resident.scope_identity != scope {
+                    return WorkspaceRead::Failed("saved_path_scope_changed".to_owned());
+                }
+                let still_member = resident.by_path.get(&key) == Some(&file_id)
+                    || (was_admitted_hole
+                        && resident.holes.get(&key)
+                            == Some(&super::resident::HoleOrigin::Admitted));
+                if !still_member {
+                    return WorkspaceRead::Failed("saved_path_membership_changed".to_owned());
+                }
+                if matches!(&disk, DiskState::Readable(_, fp) if !was_admitted_hole && old_fp == Some(*fp))
+                {
+                    return WorkspaceRead::Ready(resident.db.snapshot());
+                }
+            }
+
+            use ide_host_core::{BatchTextSource, SourceBatchChange, WorkspaceSnapshot};
+            let baseline_changed = match &disk {
+                DiskState::Readable(_, fp) => old_fp != Some(*fp) || was_admitted_hole,
+                DiskState::Deleted => true,
+                DiskState::Unreadable(fp) => {
+                    !was_admitted_hole || fp.is_some_and(|fp| old_fp != Some(fp))
+                }
+            };
+            let refresh_metadata =
+                listed_body && (was_admitted_hole || !matches!(&disk, DiskState::Readable(_, _)));
+            let super::lifecycle::Inner {
+                resident: Some(resident),
+                stats,
+                generation: owner_generation,
+                baseline_epoch: owner_baseline_epoch,
+                status,
+                ..
+            } = &mut *inner
+            else {
+                return WorkspaceRead::Busy;
+            };
+            let super::resident::DiagnosticsResident { db, vfs, by_path, holes, .. } = resident;
+            let change = match disk {
+                DiskState::Readable(text, fp) => {
+                    by_path.insert(key.clone(), file_id);
+                    holes.remove(&key);
+                    stats.insert(key.clone(), fp);
+                    SourceBatchChange::Upsert {
+                        file_id,
+                        path: vfs::VfsPath::new(path.clone()),
+                        source: Some(BatchTextSource::DiskOwned(text)),
+                    }
+                }
+                DiskState::Deleted => {
+                    by_path.remove(&key);
+                    holes.remove(&key);
+                    stats.remove(&key);
+                    SourceBatchChange::Remove { file_id }
+                }
+                DiskState::Unreadable(fp) => {
+                    by_path.remove(&key);
+                    holes.insert(key.clone(), super::resident::HoleOrigin::Admitted);
+                    if let Some(fp) = fp {
+                        stats.insert(key.clone(), fp);
+                    }
+                    SourceBatchChange::Upsert {
+                        file_id,
+                        path: vfs::VfsPath::new(path.clone()),
+                        source: Some(BatchTextSource::Unreadable),
+                    }
+                }
+            };
+            let changed = db.apply_source_batch([change], |database, effects| {
+                if refresh_metadata && !effects.affected_paths.is_empty() {
+                    ide_host_core::refresh_metadata_substrate(
+                        database,
+                        vfs,
+                        std::slice::from_ref(&path),
+                    )
+                } else {
+                    false
+                }
+            });
+            if let Some(change) = changed {
+                *owner_generation = change.generation;
+                published_generation = Some(change.generation);
+                *status = DiagnosticsStatus::Ready { files: by_path.len() };
+            }
+            if baseline_changed {
+                *owner_baseline_epoch += 1;
+                invalidate_scan = true;
+            }
+            let snapshot: WorkspaceSnapshot = db.snapshot();
+            snapshot
+        };
+
+        if invalidate_scan {
+            *lock_recover(&self.scan) = None;
+        }
+        if let Some(generation) = published_generation {
+            super::super::workspace_handle::notify_generation(self, generation);
+        }
+        WorkspaceRead::Ready(snapshot)
+    }
+
     #[cfg(test)]
     pub(super) fn scan_count(&self) -> usize {
         self.scan_count.load(Ordering::SeqCst)
@@ -110,6 +407,9 @@ impl DiagnosticsState {
     }
 
     pub(super) fn poll_drift(&self) {
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         let Some(root) = self.workspace_root.clone() else {
             return;
         };
@@ -214,7 +514,7 @@ impl DiagnosticsState {
     /// root, in an extension or a nested source root, named a path nobody holds: no hole was
     /// found, nothing was re-read, and the request waited out the sweep it was meant to skip.
     fn unread_key_for(&self, root_id: Option<&str>, path: &Path) -> Option<String> {
-        let inner = lock_recover(&self.inner);
+        let inner = lock_inner(&self.inner);
         let resident = inner.resident.as_ref()?;
         let resolved = resident.resolve_rooted_path(root_id, path).ok()?;
         resident.hole_key_of(&resolved)
@@ -223,8 +523,11 @@ impl DiagnosticsState {
     /// Says whether a re-read was ATTEMPTED, so a caller pacing itself pays for a retry that
     /// happened rather than for one that was refused before it began.
     fn retry_holes_in(&self, only: Option<&str>) -> bool {
+        if self.freeze_if_invalid_or_frozen() {
+            return false;
+        }
         let admits = {
-            let inner = lock_recover(&self.inner);
+            let inner = lock_inner(&self.inner);
             let Some(resident) = inner.resident.as_ref() else { return false };
             if resident.holes.is_empty() {
                 return false;
@@ -264,7 +567,10 @@ impl DiagnosticsState {
 
         let mut rescope: Option<(PathBuf, String)> = None;
         {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_inner(&self.inner);
+            if inner.invalid_configuration.is_some() {
+                return false;
+            }
             if inner.reload == ReloadState::Running {
                 // Refused before any file was read, so nothing is paced: see the caller.
                 return false;
@@ -316,7 +622,8 @@ impl DiagnosticsState {
             // passes the epoch check and overwrites the baseline back to its
             // pre-heal state, re-reading the same file every window.
             *baseline_epoch += 1;
-            *generation += 1;
+            *generation = resident.db.snapshot().generation;
+            super::super::workspace_handle::notify_generation(self, *generation);
             // The vendor-diff scope was computed against the working copy this heal
             // just changed; both existing appliers recompute for the same reason.
             if let Some(base) = resident.diff_base.clone() {
@@ -338,7 +645,7 @@ impl DiagnosticsState {
 
         // Diff under a short read lock against the last-applied stats.
         let (changes, config_changed) = {
-            let inner = lock_recover(&self.inner);
+            let inner = lock_inner(&self.inner);
             scan_drift(&inner, &scan)
         };
         self.apply_scan_drift(&changes, config_changed, &scan)
@@ -361,7 +668,7 @@ impl DiagnosticsState {
     /// before the move would otherwise be handed to every read until it cools, each one
     /// refusing it again — and the epoch only grows, so it can never become applicable.
     fn refuse_scan_if_stale(&self, scan: &OwnedScan) -> bool {
-        let baseline = lock_recover(&self.inner).baseline_epoch;
+        let baseline = lock_inner(&self.inner).baseline_epoch;
         if scan.baseline_epoch == baseline {
             return false;
         }
@@ -383,6 +690,9 @@ impl DiagnosticsState {
     ) -> bool {
         if changes.is_empty() && !config_changed {
             return false;
+        }
+        if self.freeze_if_invalid_or_frozen() {
+            return true;
         }
 
         // A snapshot the baseline has outrun speaks for another world, so none of its drift
@@ -480,7 +790,7 @@ impl DiagnosticsState {
         // re-subscribes a fresh cursor at its start, and the next poll after it finishes
         // drains that window onto the new resident. Mirrors the scan path, which bails
         // without rebasing its baseline so the drift is re-detected.
-        if lock_recover(&self.inner).reload == ReloadState::Running {
+        if lock_inner(&self.inner).reload == ReloadState::Running {
             return;
         }
         let Some(cursor) = *lock_recover(&self.hub_cursor) else {
@@ -500,7 +810,7 @@ impl DiagnosticsState {
         // interval answers with a snapshot taken before these very entries.
         if batch.rescan_required {
             self.poll_drift_via_scan(root);
-            if lock_recover(&self.inner).reload == ReloadState::Running {
+            if lock_inner(&self.inner).reload == ReloadState::Running {
                 return;
             }
         }
@@ -511,7 +821,10 @@ impl DiagnosticsState {
     }
 
     pub(super) fn apply_drained_entries(&self, entries: &[ChangeEntry]) {
-        let baseline: HashMap<String, u64> = lock_recover(&self.inner).stats.clone();
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
+        let baseline: HashMap<String, u64> = lock_inner(&self.inner).stats.clone();
         // The analyzer config files fingerprinted by `config_files_fingerprint` — canonicalised
         // to match the drained key spelling. Only a file at THIS exact location is config
         // drift; an identically-named file elsewhere in the tree is not (parity with the
@@ -586,11 +899,14 @@ impl DiagnosticsState {
     /// happened. Derived, the answer cannot go stale and cannot differ between the two
     /// appliers.
     fn resident_config_is_current(&self) -> bool {
+        if self.had_invalid_configuration() {
+            return false;
+        }
         let Some(root) = self.workspace_root.as_deref() else {
             return true;
         };
         let live = config_identity_now(root);
-        lock_recover(&self.inner).config_fp == live
+        lock_inner(&self.inner).config_fp == live
     }
 
     fn apply_drained_resident(
@@ -602,10 +918,16 @@ impl DiagnosticsState {
         removed_keys: &[String],
         new_fp: &HashMap<String, u64>,
     ) {
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         let mut needs_rebuild = false;
         let mut rescope: Option<(PathBuf, String)> = None;
         {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_inner(&self.inner);
+            if inner.invalid_configuration.is_some() {
+                return;
+            }
             if inner.reload == ReloadState::Running {
                 return;
             }
@@ -644,7 +966,8 @@ impl DiagnosticsState {
                 }
                 *baseline_epoch += 1;
                 if moved {
-                    *generation += 1;
+                    *generation = resident.db.snapshot().generation;
+                    super::super::workspace_handle::notify_generation(self, *generation);
                     // An add/remove changed the served file universe; keep the
                     // observable `Ready { files }` count truthful.
                     *status = DiagnosticsStatus::Ready { files: resident.by_path.len() };
@@ -674,13 +997,19 @@ impl DiagnosticsState {
         removed_bsl: &[String],
         scan: &OwnedScan,
     ) {
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         let new_fp: HashMap<&str, u64> =
             scan.stats.iter().map(|s| (s.path.as_str(), s.fingerprint())).collect();
 
         let mut needs_rebuild = false;
         let mut rescope: Option<(PathBuf, String)> = None;
         {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_inner(&self.inner);
+            if inner.invalid_configuration.is_some() {
+                return;
+            }
             // A full rebuild already in flight will publish a fresh resident; defer to it
             // rather than mutating a resident that is about to be replaced.
             if inner.reload == ReloadState::Running {
@@ -769,7 +1098,8 @@ impl DiagnosticsState {
                     *baseline_epoch += 1;
                 }
                 if moved {
-                    *generation += 1;
+                    *generation = resident.db.snapshot().generation;
+                    super::super::workspace_handle::notify_generation(self, *generation);
                     // An add/remove changed the served file universe; keep the
                     // observable `Ready { files }` count truthful.
                     *status = DiagnosticsStatus::Ready { files: resident.by_path.len() };
@@ -796,9 +1126,12 @@ impl DiagnosticsState {
     /// lock — unless a full reload started meanwhile: the rebuilt resident
     /// computes its own fresh scope.
     fn rescope_out_of_lock(&self, root: &Path, base: &str) {
+        if self.freeze_if_invalid_or_frozen() {
+            return;
+        }
         let (scope, identity) = super::resident::build_scope(root, base);
-        let mut inner = lock_recover(&self.inner);
-        if inner.reload == ReloadState::Running {
+        let mut inner = lock_inner(&self.inner);
+        if inner.reload == ReloadState::Running || inner.invalid_configuration.is_some() {
             return;
         }
         if let Some(resident) = inner.resident.as_mut() {
@@ -819,7 +1152,7 @@ impl DiagnosticsState {
             *at = Some(Instant::now());
         }
         let (base, stored, author_identity, ignored_authors, generation) = {
-            let inner = lock_recover(&self.inner);
+            let inner = lock_inner(&self.inner);
             let Some(resident) = inner.resident.as_ref() else { return };
             (
                 resident.diff_base.clone(),
@@ -854,8 +1187,11 @@ impl DiagnosticsState {
             // carries or will recompute its own filter, and a stale publish
             // here could overwrite it.
             let filter = super::resident::build_author_filter(root, &ignored_authors);
-            let mut inner = lock_recover(&self.inner);
-            if inner.reload == ReloadState::Running || inner.generation != generation {
+            let mut inner = lock_inner(&self.inner);
+            if inner.invalid_configuration.is_some()
+                || inner.reload == ReloadState::Running
+                || inner.generation != generation
+            {
                 return;
             }
             if let Some(resident) = inner.resident.as_mut() {
@@ -1037,7 +1373,7 @@ impl DiagnosticsState {
 
         // A delivered structural change kicked a full rebuild that will re-baseline the
         // whole workspace and re-subscribe a fresh cursor; nothing more to reconcile here.
-        if lock_recover(&self.inner).reload == ReloadState::Running {
+        if lock_inner(&self.inner).reload == ReloadState::Running {
             return;
         }
 
@@ -1050,7 +1386,7 @@ impl DiagnosticsState {
             return;
         };
         let (changes, config_changed) = {
-            let inner = lock_recover(&self.inner);
+            let inner = lock_inner(&self.inner);
             scan_drift(&inner, &scan)
         };
         if changes.is_empty() && !config_changed {
@@ -1157,7 +1493,7 @@ impl DiagnosticsState {
         // Read BEFORE the walk, never after. Too old is safe — the snapshot is refused and
         // the next poll walks again; too new would let a snapshot that predates a baseline
         // move claim it was taken after one.
-        let baseline_epoch = lock_recover(&self.inner).baseline_epoch;
+        let baseline_epoch = lock_inner(&self.inner).baseline_epoch;
         self.scan_count.fetch_add(1, Ordering::SeqCst);
         // One project load per scan: the stat universe and the config identity must
         // describe the same project state, mirroring how the build derives its
@@ -1182,6 +1518,11 @@ impl DiagnosticsState {
         });
         Some(OwnedScan { stats, config_fp, baseline_epoch, verdict })
     }
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> u64 {
+    let hash = blake3::hash(bytes);
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("BLAKE3 digest has eight bytes"))
 }
 
 /// What a tick's drains handed over, in the two shapes the hub can name it: exact paths,
@@ -1502,6 +1843,86 @@ mod tests {
     use ide::DiagnosticsConfig;
     use std::fs;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn saved_path_refresh_updates_only_admitted_disk_members_and_rebases_drift() {
+        use crate::workspace_handle::WorkspaceRead;
+        use ide_host_core::DiskFileState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+        fs::write(root.join("bsl-analyzer.toml"), "[source]\nexclude = [\"Excluded\"]\n").unwrap();
+        let excluded = root.join("Excluded/Module.bsl");
+        fs::create_dir_all(excluded.parent().unwrap()).unwrap();
+        fs::write(&excluded, "Функция Исключенная() Экспорт КонецФункции").unwrap();
+
+        let disk_path = module_path(root, "Сервер");
+        let old_text = "Функция Считать() Экспорт\n Возврат 1;\nКонецФункции";
+        let new_text = "Функция Считать() Экспорт\n Возврат \"один\";\nКонецФункции";
+        fs::write(&disk_path, old_text).unwrap();
+
+        let state = DiagnosticsState::for_workspace(root.to_path_buf());
+        state.ensure_loading();
+        wait_ready(&state);
+
+        let canonical_disk = disk_path.canonicalize().unwrap();
+        let canonical_excluded = excluded.canonicalize().unwrap();
+        let before = state.workspace_snapshot().unwrap();
+        let existing = before
+            .catalog
+            .iter()
+            .find(|file| file.path == canonical_disk)
+            .expect("bootstrap admitted the saved module")
+            .clone();
+        assert!(matches!(existing.state, DiskFileState::Readable { .. }));
+        assert!(!before.catalog.iter().any(|file| file.path == canonical_excluded));
+
+        fs::write(&disk_path, new_text).unwrap();
+        let updated = match state.refresh_saved_path(&disk_path) {
+            WorkspaceRead::Ready(snapshot) => snapshot,
+            _ => panic!("a stable admitted saved path must refresh"),
+        };
+        assert_eq!(updated.generation, before.generation + 1);
+        let updated_file = updated
+            .catalog
+            .iter()
+            .find(|file| file.path == canonical_disk)
+            .expect("updated file remains in the disk catalog");
+        assert_eq!(updated_file.file_id, existing.file_id, "refresh retains the VFS identity");
+        assert!(matches!(updated_file.state, DiskFileState::Readable { .. }));
+        match state.read(|resident, _| resident.analysis().file_text(existing.file_id).to_string())
+        {
+            ResidentOutcome::Ready(text, _) => assert_eq!(text, new_text),
+            _ => panic!("the accepted owner must serve the refreshed body"),
+        }
+
+        let no_op = match state.refresh_saved_path(&disk_path) {
+            WorkspaceRead::Ready(snapshot) => snapshot,
+            _ => panic!("a no-op refresh still returns the current snapshot"),
+        };
+        assert_eq!(no_op.generation, updated.generation, "same bytes do not publish");
+
+        // Reconciliation after the point refresh must compare against its new per-path
+        // baseline; otherwise the same saved bytes would create a second generation.
+        state.poll_drift();
+        assert_eq!(state.workspace_snapshot().unwrap().generation, updated.generation);
+
+        let session_only = root.join("SessionOnly.bsl");
+        fs::write(&session_only, "Функция ТолькоСессия() КонецФункции").unwrap();
+        let unchanged = match state.refresh_saved_path(&session_only) {
+            WorkspaceRead::Ready(snapshot) => snapshot,
+            _ => panic!("a non-member close returns the owner snapshot"),
+        };
+        assert_eq!(unchanged.generation, updated.generation);
+        assert!(!unchanged.catalog.iter().any(|file| file.path == session_only));
+        let unchanged = match state.refresh_saved_path(&excluded) {
+            WorkspaceRead::Ready(snapshot) => snapshot,
+            _ => panic!("an excluded path is not admitted by close refresh"),
+        };
+        assert_eq!(unchanged.generation, updated.generation);
+        assert!(!unchanged.catalog.iter().any(|file| file.path == canonical_excluded));
+    }
 
     /// The resident's config identity must move on a `dependsOn`-only edit while the
     /// per-file stat channel stays silent — that identity is the only trigger a full
@@ -2577,7 +2998,7 @@ mod tests {
         // Simulate run_load's Err arm publishing the failure.
         let state = DiagnosticsState::for_workspace(std::env::temp_dir());
         {
-            let mut inner = lock_recover(&state.inner);
+            let mut inner = lock_inner(&state.inner);
             inner.loading_since = Some(Instant::now());
             inner.status = DiagnosticsStatus::Loading;
             // The exact publication run_load performs on Err.
@@ -3254,7 +3675,7 @@ mod tests {
         let key = module.to_string_lossy().into_owned();
         wait_until("post-rebuild edits apply to the new resident", || {
             let _ = state.read(|_, _| ());
-            match lock_recover(&state.inner).stats.get(&key).copied() {
+            match lock_inner(&state.inner).stats.get(&key).copied() {
                 Some(fp) if fp == on_disk => Ok(()),
                 other => Err(format!("baseline holds {other:?}, waiting for {on_disk}")),
             }
@@ -3321,7 +3742,7 @@ mod tests {
         );
 
         state.kick_full_reload();
-        wait_until("the rebuild finishes", || match lock_recover(&state.inner).reload {
+        wait_until("the rebuild finishes", || match lock_inner(&state.inner).reload {
             ReloadState::Running => Err("the rebuild is still running"),
             ReloadState::Failed(_) => panic!("the rebuild failed"),
             ReloadState::Idle => Ok(()),
@@ -3359,7 +3780,7 @@ mod tests {
         hub.degrade_external();
         let carried = state.resubscribe_cursor();
         // The rebuild in flight, as `edit_during_rebuild_applies_after_it` models it.
-        lock_recover(&state.inner).reload = ReloadState::Running;
+        lock_inner(&state.inner).reload = ReloadState::Running;
 
         let mut observer = hub.subscribe();
         std::thread::sleep(Duration::from_millis(10));
@@ -3371,7 +3792,7 @@ mod tests {
 
         let gen0 = raw_generation(&state);
         // The rebuild finishes and settles the debt it carried.
-        lock_recover(&state.inner).reload = ReloadState::Idle;
+        lock_inner(&state.inner).reload = ReloadState::Idle;
         state.settle_rebuild_debt(carried);
 
         let cursor = lock_recover(&state.hub_cursor).expect("the resident holds its cursor");
@@ -3426,11 +3847,11 @@ mod tests {
         hub.degrade_external();
         let carried = state.resubscribe_cursor().expect("the window's debt was carried");
         // The window is open, the rebuild in flight, and nobody drains the fresh cursor.
-        lock_recover(&state.inner).reload = ReloadState::Running;
+        lock_inner(&state.inner).reload = ReloadState::Running;
         overflow_the_cap(&hub);
 
         // The rebuild succeeds and tries to settle what it carried.
-        lock_recover(&state.inner).reload = ReloadState::Idle;
+        lock_inner(&state.inner).reload = ReloadState::Idle;
         state.settle_rebuild_debt(Some(carried));
 
         let cursor = lock_recover(&state.hub_cursor).expect("the resident holds its cursor");
@@ -3569,7 +3990,7 @@ mod tests {
         wait_ready(&state);
 
         // Simulate a full rebuild in flight.
-        lock_recover(&state.inner).reload = ReloadState::Running;
+        lock_inner(&state.inner).reload = ReloadState::Running;
 
         let mut observer = hub.subscribe();
         std::thread::sleep(Duration::from_millis(10));
@@ -3586,7 +4007,7 @@ mod tests {
         assert_eq!(raw_generation(&state), gen0, "no apply while a rebuild is in flight");
 
         // The rebuild finishes.
-        lock_recover(&state.inner).reload = ReloadState::Idle;
+        lock_inner(&state.inner).reload = ReloadState::Idle;
 
         // The still-pending edit now applies to the (current) resident on the next read.
         wait_for_apply(&state, gen0, "the pending edit applies once the rebuild ends");
@@ -3836,7 +4257,7 @@ mod tests {
 
         // The stale snapshot now describes a world without that module.
         let changes = {
-            let inner = lock_recover(&state.inner);
+            let inner = lock_inner(&state.inner);
             classify_changes(&inner.stats, &snapshot.stats)
         };
         assert!(
@@ -3884,7 +4305,7 @@ mod tests {
         }]);
 
         let changes = {
-            let inner = lock_recover(&state.inner);
+            let inner = lock_inner(&state.inner);
             classify_changes(&inner.stats, &snapshot.stats)
         };
         state.apply_scan_drift(&changes, false, &snapshot);
@@ -3962,7 +4383,7 @@ mod tests {
         write_common_module(root, "После", true, "&НаСервере\nФункция П() Экспорт КонецФункции");
 
         state.kick_full_reload();
-        wait_until("the kicked rebuild finishes", || match lock_recover(&state.inner).reload {
+        wait_until("the kicked rebuild finishes", || match lock_inner(&state.inner).reload {
             ReloadState::Running => Err("running"),
             _ => Ok(()),
         });
@@ -3977,7 +4398,7 @@ mod tests {
         );
 
         let changes = {
-            let inner = lock_recover(&state.inner);
+            let inner = lock_inner(&state.inner);
             classify_changes(&inner.stats, &snapshot.stats)
         };
         state.apply_scan_drift(&changes, false, &snapshot);
@@ -4037,7 +4458,7 @@ mod tests {
             kind: ChangeKind::MaybeChanged,
             seq: 1,
         }]);
-        lock_recover(&state.inner).reload = ReloadState::Idle;
+        lock_inner(&state.inner).reload = ReloadState::Idle;
         // A walk that began before the move finishing after it: its snapshot is cached
         // carrying the older epoch, exactly as `throttled_scan` caches unconditionally.
         *lock_recover(&state.scan) = Some(ScanCache {
@@ -4054,7 +4475,7 @@ mod tests {
         state.apply_scan_drift(&no_file_drift, true, &snapshot);
 
         assert_eq!(
-            lock_recover(&state.inner).reload,
+            lock_inner(&state.inner).reload,
             ReloadState::Idle,
             "a stale snapshot's config drift may not start a rebuild",
         );
@@ -4229,7 +4650,7 @@ mod tests {
 
         // Drift that exists BEFORE the scan, so the tick does not return on an empty diff
         // and never reaches the second drain at all.
-        lock_recover(&state.inner).stats.insert(root.join("Vanished.bsl").display().to_string(), 1);
+        lock_inner(&state.inner).stats.insert(root.join("Vanished.bsl").display().to_string(), 1);
 
         let probe_root = root.to_path_buf();
         let probe_hub = hub.clone();
@@ -4264,7 +4685,7 @@ mod tests {
         // own list — the late file is not in it, so the resident keeps it either way. What
         // step 4 does move is the baseline, wholesale, onto its pre-move snapshot.
         assert!(
-            lock_recover(&state.inner).stats.keys().any(|p| p.contains("Поздний")),
+            lock_inner(&state.inner).stats.keys().any(|p| p.contains("Поздний")),
             "the late file is in the baseline: the stale snapshot did not rebase it away",
         );
         let found = state.read(|resident, _| resident.file_id_for(&late).is_some());
@@ -4629,7 +5050,7 @@ mod tests {
         /// running before its thread starts, and the thread counts itself before it lets the
         /// mark go, so at any moment after the ask one of the two shows it.
         fn a_rebuild_was_asked_for(state: &DiagnosticsState) -> bool {
-            lock_recover(&state.inner).reload == ReloadState::Running
+            lock_inner(&state.inner).reload == ReloadState::Running
                 || state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst) > 0
         }
 
@@ -4916,7 +5337,7 @@ mod tests {
             wait_until("the rebuild the delivered edit asked for has run its course", || {
                 let _ = state.read(|_, _| ());
                 let started = state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst);
-                let reload = lock_recover(&state.inner).reload.clone();
+                let reload = lock_inner(&state.inner).reload.clone();
                 if started > 0 && reload == super::super::super::types::ReloadState::Idle {
                     Ok(())
                 } else {

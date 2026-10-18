@@ -8,12 +8,17 @@
 pub mod diagnostics_baseline;
 mod load;
 mod metadata;
+mod workspace;
 
 pub use load::{
     apply_source_batch, build_source_root, register_files_disk_backed, set_file_text_source,
     BatchTextSource, FileTextSource, SourceBatchChange, SourceBatchEffects,
 };
 pub use metadata::{bootstrap_metadata_substrate, refresh_metadata_substrate, VfsWrite};
+pub use workspace::{
+    CatalogFile, CatchUp, DiskFileState, EditorView, PublishedChange, SnapshotFile,
+    SnapshotSourceRoot, WorkspaceBackend, WorkspaceCatalog, WorkspaceSnapshot,
+};
 
 use ide::{Analysis, RootDatabaseImpl};
 use salsa::Database as _;
@@ -26,6 +31,10 @@ pub struct AnalysisHost {
 }
 
 impl AnalysisHost {
+    pub fn from_database(db: RootDatabaseImpl) -> Self {
+        Self { db }
+    }
+
     pub fn analysis(&self) -> Analysis {
         Analysis::from_database(self.db.clone())
     }
@@ -36,6 +45,10 @@ impl AnalysisHost {
 
     pub fn raw_database_mut(&mut self) -> &mut RootDatabaseImpl {
         &mut self.db
+    }
+
+    pub fn into_database(self) -> RootDatabaseImpl {
+        self.db
     }
 
     pub fn request_cancellation(&mut self) {

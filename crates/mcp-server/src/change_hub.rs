@@ -49,6 +49,7 @@ const STOP_BUDGET: Duration = Duration::from_secs(5);
 
 /// How often a stop re-checks the two things it waits on (channel space, thread exit).
 const STOP_POLL: Duration = Duration::from_millis(10);
+static NEXT_INGRESS_HUB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The next topology epoch: a monotonic label for the age of one composition of scan roots.
 ///
@@ -1962,6 +1963,28 @@ impl WorkspaceChangeHub {
         &self.thread.control
     }
 
+    /// Queue one editor-provided path hint through the same bounded ingress as watcher
+    /// events. The synthetic event kind is intentionally generic: `ingest_event` re-stats
+    /// the path and derives changed/removed from current filesystem state.
+    pub(crate) fn notify_path_changed(&self, path: &Path) -> bool {
+        if !self.inner.scope().may_record(path) {
+            return false;
+        }
+        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(path.to_path_buf());
+        match self.control().try_send(HubMsg::Event(Ok(event))) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // The bounded queue dropped detail. Preserve the same loss-debt invariant as
+                // the filesystem callback so every live cursor reconciles instead of silently
+                // missing this hint.
+                self.inner.channel_overflow.store(true, Ordering::Relaxed);
+                true
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
     /// Spawn the hub over one or more roots (the drift-scan universe: the config source
     /// root plus each extension root). Returns immediately — each root is watched
     /// recursively on the hub thread (walking large trees must not block daemon startup).
@@ -2003,8 +2026,8 @@ impl WorkspaceChangeHub {
         user_excluded: ExcludedPaths,
     ) -> Self {
         #[cfg(test)]
-        if let Some(poll) = POLL_INSTEAD_OF_WATCHING.with(std::cell::Cell::get) {
-            return Self::start_seamed_scoped(
+        let hub = if let Some(poll) = POLL_INSTEAD_OF_WATCHING.with(std::cell::Cell::get) {
+            Self::start_seamed_scoped(
                 targets,
                 DEFAULT_CAPACITY,
                 COVERAGE_TICK_PERIOD,
@@ -2015,9 +2038,24 @@ impl WorkspaceChangeHub {
                 user_excluded,
                 poll,
                 BlindPollSeam::default(),
-            );
-        }
-        Self::start_seamed_scoped(
+            )
+        } else {
+            Self::start_seamed_scoped(
+                targets,
+                DEFAULT_CAPACITY,
+                COVERAGE_TICK_PERIOD,
+                false,
+                None,
+                None,
+                excluded,
+                user_excluded,
+                PollConfig::PRODUCTION,
+                #[cfg(test)]
+                BlindPollSeam::default(),
+            )
+        };
+        #[cfg(not(test))]
+        let hub = Self::start_seamed_scoped(
             targets,
             DEFAULT_CAPACITY,
             COVERAGE_TICK_PERIOD,
@@ -2029,7 +2067,20 @@ impl WorkspaceChangeHub {
             PollConfig::PRODUCTION,
             #[cfg(test)]
             BlindPollSeam::default(),
-        )
+        );
+        if std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some() {
+            let hub_id = NEXT_INGRESS_HUB_ID.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                target: "bsl_analyzer::shared_backend",
+                event = "workspace_ingress_created",
+                owner_epoch = crate::broker::process_epoch(),
+                hub_id,
+                hub_count = hub_id,
+                health = ?hub.health(),
+                "shared workspace ingress hub created"
+            );
+        }
+        hub
     }
 
     /// A hub whose thread the operating system refused to start.
@@ -10019,6 +10070,44 @@ mod tests {
             dir.path().join("M.bsl"),
         ));
         assert_eq!(hub.materialize(cursor).entries.len(), 1, "a source edit was dropped");
+    }
+
+    #[test]
+    fn editor_path_hints_use_bounded_ingress_and_current_disk_classification() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("Saved.bsl");
+        let outside = tempdir().unwrap().path().join("Outside.bsl");
+        std::fs::write(&file, "Функция Сохраненная() КонецФункции").unwrap();
+        let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(
+            dir.path().to_path_buf(),
+        )]);
+        assert!(hub.wait_until_watching());
+        let cursor = hub.subscribe();
+
+        assert!(hub.notify_path_changed(&file));
+        assert!(eventually(|| {
+            hub.materialize(cursor).entries.iter().any(|entry| entry.raw == file)
+        }));
+        let batch = hub.drain(cursor);
+        assert!(batch
+            .entries
+            .iter()
+            .any(|entry| { entry.raw == file && entry.kind == ChangeKind::MaybeChanged }));
+
+        // The caller only supplies a path. The generic ingress re-stats it after deletion
+        // and derives the tombstone from the current filesystem state.
+        std::fs::remove_file(&file).unwrap();
+        assert!(hub.notify_path_changed(&file));
+        assert!(eventually(|| {
+            hub.materialize(cursor).entries.iter().any(|entry| entry.raw == file)
+        }));
+        let batch = hub.drain(cursor);
+        assert!(batch
+            .entries
+            .iter()
+            .any(|entry| { entry.raw == file && entry.kind == ChangeKind::MaybeRemoved }));
+
+        assert!(!hub.notify_path_changed(&outside), "external paths are rejected by hub scope");
     }
 
     /// An event names the root by whichever spelling the watch was armed with, and that

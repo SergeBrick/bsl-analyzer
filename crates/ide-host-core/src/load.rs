@@ -53,6 +53,8 @@ pub enum BatchTextSource {
     Disk(Arc<str>),
     /// The same disk-backed source for a caller that owns a one-file read.
     DiskOwned(String),
+    /// A prepared disk revision copied from another Salsa storage.
+    DiskRevision(u64),
     /// A deleted file; retain an empty readable tombstone.
     Deleted,
     /// A present file whose bytes could not be read.
@@ -98,11 +100,21 @@ pub fn apply_source_batch(
     source_root_id: base_db::SourceRootId,
     changes: impl IntoIterator<Item = SourceBatchChange>,
 ) -> SourceBatchEffects {
+    apply_source_batch_cancellable(db, source_root_id, changes, || false)
+        .expect("a non-cancellable source batch cannot be cancelled")
+}
+
+pub(crate) fn apply_source_batch_cancellable(
+    db: &mut RootDatabaseImpl,
+    source_root_id: base_db::SourceRootId,
+    changes: impl IntoIterator<Item = SourceBatchChange>,
+    mut cancelled: impl FnMut() -> bool,
+) -> Option<SourceBatchEffects> {
     use base_db::{SourceDatabase, SourceRoot};
 
     let mut changes = changes.into_iter().peekable();
     if changes.peek().is_none() {
-        return SourceBatchEffects::default();
+        return Some(SourceBatchEffects::default());
     }
 
     // Finish the read and drop the Salsa value before the first tracked write.
@@ -113,6 +125,9 @@ pub fn apply_source_batch(
     let mut effects = SourceBatchEffects::default();
 
     for change in changes {
+        if cancelled() {
+            return None;
+        }
         match change {
             SourceBatchChange::Upsert { file_id, path, source } => {
                 let is_bsl = project_model::is_bsl_source_path(path.as_path());
@@ -163,10 +178,13 @@ pub fn apply_source_batch(
         }
     }
 
+    if cancelled() {
+        return None;
+    }
     if effects.file_set_changed {
         db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
     }
-    effects
+    Some(effects)
 }
 
 fn source_matches(
@@ -179,6 +197,7 @@ fn source_matches(
     let disk_revision = match source {
         BatchTextSource::Disk(text) => Some(content_revision(text)),
         BatchTextSource::DiskOwned(text) => Some(content_revision(text)),
+        BatchTextSource::DiskRevision(revision) => Some(*revision),
         _ => None,
     };
     let Some(revision_input) = db.try_file_revision_input(file_id) else {
@@ -197,7 +216,9 @@ fn source_matches(
             }
             revision_input.revision(db) == content_revision(text)
         }
-        BatchTextSource::Disk(_) | BatchTextSource::DiskOwned(_) => {
+        BatchTextSource::Disk(_)
+        | BatchTextSource::DiskOwned(_)
+        | BatchTextSource::DiskRevision(_) => {
             db.try_file_text_input(file_id).is_none()
                 && revision_input.revision(db)
                     == disk_revision.expect("disk source has a precomputed revision")
@@ -220,7 +241,9 @@ fn apply_owned_source(
         BatchTextSource::Overlay(text) => {
             set_file_text_source(db, file_id, FileTextSource::Overlay(&text))
         }
-        BatchTextSource::Disk(_) | BatchTextSource::DiskOwned(_) => db.set_file_revision_from_disk(
+        BatchTextSource::Disk(_)
+        | BatchTextSource::DiskOwned(_)
+        | BatchTextSource::DiskRevision(_) => db.set_file_revision_from_disk(
             file_id,
             disk_revision.expect("disk source revision was computed during comparison"),
         ),

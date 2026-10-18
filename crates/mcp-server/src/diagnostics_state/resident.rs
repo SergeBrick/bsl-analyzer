@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -37,14 +36,13 @@ fn partitioned_baseline_error(
 
 /// Adapts the resident's owned [`Vfs`] to the lock-neutral [`ide_host_core::VfsWrite`]
 /// the shared metadata policy expects. The resident is only ever touched while the
-/// caller holds the state mutex (the db is `!Sync`), so a single-threaded `RefCell`
-/// gives the interning critical section its interior mutability without a second lock —
-/// the same discipline the LSP's `parking_lot`-locked adapter has, minus the lock.
-pub(super) struct ResidentVfs(pub(super) RefCell<Vfs>);
+/// caller holds the state mutex (the db is `!Sync`); the shared catalog supplies the
+/// one path interner used by disk and editor views.
+pub(super) struct ResidentVfs(pub(super) ide_host_core::WorkspaceCatalog);
 
 impl ide_host_core::VfsWrite for ResidentVfs {
     fn with_write<R>(&self, f: impl FnOnce(&mut Vfs) -> R) -> R {
-        f(&mut self.0.borrow_mut())
+        self.0.with_vfs(f)
     }
 }
 
@@ -128,7 +126,7 @@ pub(super) fn retry_resident_holes(
         .map(|(k, o)| (k.clone(), *o))
         .collect();
 
-    {
+    let effects = {
         let vfs = &resident.vfs;
         let db = &mut resident.db;
         let by_path = &mut resident.by_path;
@@ -171,8 +169,8 @@ pub(super) fn retry_resident_holes(
                 }
             }
         });
-        apply_source_batch(db, crate::graph::input::GRAPH_SOURCE_ROOT, changes);
-    }
+        apply_source_batch(db.database_mut(), crate::graph::input::GRAPH_SOURCE_ROOT, changes)
+    };
 
     // The substrate is re-issued for every transition, not just for paths that were
     // never registered. Whether a module's back-link is currently `None` depends on
@@ -186,9 +184,12 @@ pub(super) fn retry_resident_holes(
         .map(PathBuf::from)
         .filter(|p| project_model::is_substrate_listed_body_path(p))
         .collect();
-    if !touched.is_empty() {
-        ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &touched);
-    }
+    let metadata_changed = !touched.is_empty()
+        && ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &touched);
+    let mut paths = effects.affected_paths;
+    paths.extend(healed.iter().map(|(key, _)| PathBuf::from(key)));
+    paths.extend(vanished.iter().map(PathBuf::from));
+    resident.db.publish_change(effects.changed_file_ids, paths, metadata_changed);
 
     (healed, vanished)
 }
@@ -211,7 +212,7 @@ pub(super) enum HoleOrigin {
 /// path to the Salsa input it set. Held behind the [`std::sync::Mutex`]; reads borrow it,
 /// a reload mutates `db` in place.
 pub(crate) struct DiagnosticsResident {
-    pub(super) db: RootDatabaseImpl,
+    pub(super) db: ide_host_core::WorkspaceBackend,
     /// Trims [`Self::trim_after_read`] has run, for a test that every read trims.
     #[cfg(test)]
     pub(super) read_trims: u32,
@@ -364,7 +365,7 @@ impl DiagnosticsResident {
     #[cfg(test)]
     pub(super) fn file_set_has_for_test(&self, file_id: FileId) -> bool {
         use base_db::SourceDatabase;
-        let db = &self.db;
+        let db = self.db.database();
         db.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
             .root(db)
             .file_set()
@@ -378,6 +379,10 @@ impl DiagnosticsResident {
         &self.workspace_root
     }
 
+    pub(crate) fn project(&self) -> &project_model::Project {
+        &self.project
+    }
+
     /// This resident's own root table — the one its files were enumerated under, so a
     /// location built from it addresses a file this resident can actually serve.
     pub(crate) fn workspace_roots(&self) -> &bsl_search::WorkspaceRoots {
@@ -387,13 +392,12 @@ impl DiagnosticsResident {
     /// An `Analysis` view over a cloned db handle. The clone shares the Salsa storage
     /// (memo/LRU cache), and is dropped before the read guard is released.
     pub(crate) fn analysis(&self) -> Analysis {
-        Analysis::from_database(self.db.clone())
+        self.db.analysis()
     }
 
-    /// The resident Salsa database, for the `metadata` tool's root-scoped metadata
-    /// reads (`resolve_*_across_roots` point-lookups and the Channel-2
-    /// `configuration_for_root` header/enumeration). Borrowed under the state lock, so
-    /// the borrow cannot outlive the read and a reload can never alias it.
+    /// Test-only access for root-scoped metadata and cancellation cases. Borrowed under
+    /// the state lock, so the borrow cannot outlive the read and a reload cannot alias it.
+    #[cfg(test)]
     pub(crate) fn db(&self) -> &RootDatabaseImpl {
         &self.db
     }
@@ -602,7 +606,7 @@ impl DiagnosticsResident {
             if cancel.is_cancelled() {
                 return;
             }
-            let seed = SweepWorker::new(self.db.clone());
+            let seed = SweepWorker::new(self.db.database().clone());
             let outcome = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                 chunk.par_iter().try_for_each_with(seed, |worker, (file_id, _)| {
                     let file_id = *file_id;
@@ -795,7 +799,7 @@ impl DiagnosticsResident {
                 prepared.extend(chunk.iter().map(|_| None));
                 continue;
             }
-            let mut seed = SweepWorker::new(self.db.clone());
+            let mut seed = SweepWorker::new(self.db.database().clone());
             // Warm the configuration inventory HERE, before the pool opens: a job that
             // first-loads a config root fans out over the loader's own rayon scope, parks,
             // and can steal a sibling job carrying a different db clone onto this thread.
@@ -1028,7 +1032,7 @@ impl DiagnosticsResident {
         let per_file: Vec<Vec<(String, ide::SeverityBucket)>> = if swept.is_empty() {
             Vec::new()
         } else {
-            let seed = SweepWorker::new(self.db.clone());
+            let seed = SweepWorker::new(self.db.database().clone());
             self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                 swept
                     .par_iter()
@@ -1438,7 +1442,8 @@ pub(super) fn apply_resident_changes(
             }
         }
     });
-    let source_effects = apply_source_batch(db, crate::graph::input::GRAPH_SOURCE_ROOT, changes);
+    let source_effects =
+        apply_source_batch(db.database_mut(), crate::graph::input::GRAPH_SOURCE_ROOT, changes);
     moved |= source_effects.bsl_source_changed;
     if needs_rebuild {
         return (true, moved);
@@ -1460,16 +1465,21 @@ pub(super) fn apply_resident_changes(
         .filter(|p| config_roots.iter().any(|(_, root)| p.starts_with(root)))
         .filter(|p| changed_source_paths.contains(p))
         .collect();
+    let mut metadata_changed = false;
+    let mut metadata_paths = Vec::new();
     if !xml_paths.is_empty() || !structural_listing_bodies.is_empty() {
         let mut refresh: Vec<PathBuf> = xml_paths.to_vec();
         refresh.extend(structural_listing_bodies);
-        ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &refresh);
+        metadata_changed |=
+            ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &refresh);
+        metadata_paths.extend(refresh);
         if !xml_paths.is_empty() {
             resident.db.bump_config_for_paths(xml_paths.iter().map(|p| p.as_path()));
             apply_project_compatibility_mode(
                 &mut resident.db,
                 resident.project.compatibility_mode(),
             );
+            metadata_changed = true;
         }
         moved = true;
     }
@@ -1490,8 +1500,19 @@ pub(super) fn apply_resident_changes(
         .filter(|p| config_roots.iter().any(|(_, root)| p.starts_with(root)))
         .collect();
     if !became_holes.is_empty() {
-        ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &became_holes);
+        metadata_changed |= ide_host_core::refresh_metadata_substrate(
+            &mut resident.db,
+            &resident.vfs,
+            &became_holes,
+        );
+        metadata_paths.extend(became_holes);
     }
+
+    metadata_paths.extend_from_slice(xml_paths);
+    let mut paths = source_effects.affected_paths;
+    paths.extend(changed_membership_paths);
+    paths.extend(metadata_paths);
+    resident.db.publish_change(source_effects.changed_file_ids, paths, metadata_changed);
 
     (false, moved)
 }
@@ -1721,10 +1742,9 @@ mod tests {
             let other_id = resident.file_id_for(&other_path).expect("other file is resident");
             assert_ne!(target_id, other_id, "collision uses a different existing FileId");
 
-            let source_root = resident
-                .db
-                .source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
-                .root(&resident.db);
+            let database = resident.db.database();
+            let source_root =
+                database.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT).root(database);
             let file_set_before = source_root.file_set().clone();
             let target_vfs_path = file_set_before
                 .path_for_file(&target_id)
@@ -1732,10 +1752,10 @@ mod tests {
                 .clone();
             assert_eq!(file_set_before.file_for_path(&target_vfs_path), Some(&target_id));
             assert_eq!(file_set_before.path_for_file(&target_id), Some(&target_vfs_path));
-            let revision_before = resident.db.file_revision_input(target_id);
-            let revision_value_before = revision_before.revision(&resident.db);
-            let unreadable_before = revision_before.unreadable(&resident.db);
-            let salsa_revision_before = salsa::plumbing::current_revision(&resident.db);
+            let revision_before = database.file_revision_input(target_id);
+            let revision_value_before = revision_before.revision(database);
+            let unreadable_before = revision_before.unreadable(database);
+            let salsa_revision_before = salsa::plumbing::current_revision(database);
             let text_before = resident.analysis().file_text(target_id).to_string();
             assert!(
                 resident.db.try_file_text(target_id).is_none(),
@@ -1753,17 +1773,16 @@ mod tests {
 
             assert_eq!(result, (true, false), "an existing path/id collision requests rebuild");
             assert_eq!(resident.by_path.get(&key).copied(), by_path_before);
-            let source_root_after = resident
-                .db
-                .source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
-                .root(&resident.db);
+            let database = resident.db.database();
+            let source_root_after =
+                database.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT).root(database);
             let file_set_after = source_root_after.file_set();
             assert_eq!(file_set_after, &file_set_before, "the FileSet registration is untouched");
-            let revision_after = resident.db.file_revision_input(target_id);
-            assert_eq!(revision_after.revision(&resident.db), revision_value_before);
-            assert_eq!(revision_after.unreadable(&resident.db), unreadable_before);
+            let revision_after = database.file_revision_input(target_id);
+            assert_eq!(revision_after.revision(database), revision_value_before);
+            assert_eq!(revision_after.unreadable(database), unreadable_before);
             assert_eq!(
-                salsa::plumbing::current_revision(&resident.db),
+                salsa::plumbing::current_revision(database),
                 salsa_revision_before,
                 "the collision path performs no same-value Salsa write"
             );

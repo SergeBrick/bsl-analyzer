@@ -1508,8 +1508,7 @@ fn handle_latency_request_finished(
             )
         }
         LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::PendingWrite, revision } => {
-            let current_revision =
-                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            let current_revision = state.analysis_host.request_revision();
             match queue_latency_retry(
                 state,
                 &key,

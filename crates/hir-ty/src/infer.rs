@@ -183,6 +183,29 @@ struct ReachingDef {
     ty: Option<TypeId>,
 }
 
+/// The state of one [`InferenceContext::types_on_every_path`] query.
+///
+/// A local read reached through several definitions is resolved once: copying a local
+/// through a chain of branches would otherwise revisit it once per path.
+#[derive(Default)]
+struct PathWalk {
+    /// The local reads being resolved.
+    active: Vec<ExprId>,
+    resolved: FxHashMap<ExprId, Option<Vec<TypeId>>>,
+}
+
+/// What a definition reaching a read takes its value from.
+#[derive(Clone, Copy)]
+enum DefinitionSource {
+    /// The right-hand side of an assignment.
+    Value(ExprId),
+    /// The collection a `Для Каждого` iterates.
+    LoopElement(ExprId),
+    /// A parameter, a declaration, a `Для` counter or anything else whose value is not an
+    /// expression of this body.
+    Opaque,
+}
+
 impl InferenceResult {
     pub fn type_id_of_expr_in(&self, owner: DefWithBodyId, expr: ExprId) -> Option<TypeId> {
         self.expr_types_by_body.get(&owner)?.get(&expr).copied()
@@ -2113,6 +2136,255 @@ impl<'db> InferenceContext<'db> {
         })
     }
 
+    /// True when `receiver_expr` holds a metadata description with a closed member list on
+    /// every path reaching it, and none of those descriptions has `field`.
+    ///
+    /// The walk types a local by its textually latest write, which at a merge (`Если`,
+    /// a loop back-edge) is one path's type only, and a chain or a loop element read through
+    /// such a local inherits that one path. A receiver whose types cannot all be vouched for
+    /// leaves the member possibly present.
+    fn description_miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        field: &hir_def::Name,
+    ) -> bool {
+        let Some(types) = self.types_on_every_path(receiver_expr, &mut PathWalk::default()) else {
+            return false;
+        };
+        if types.is_empty() {
+            return false;
+        }
+        let obj_resolver =
+            crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
+        types.iter().all(|ty| {
+            crate::field_lookup::is_closed_metadata_description(self.db, *ty)
+                && crate::field_lookup::lookup_field(self.db, &obj_resolver, *ty, field).is_none()
+                && crate::manager_lookup::lookup_manager_field(self.db, &obj_resolver, *ty, field)
+                    .is_none()
+        })
+    }
+
+    /// Every type `expr` can hold on the paths reaching it, or `None` when that set cannot be
+    /// vouched for.
+    ///
+    /// A member read or an index takes its type from its receiver alone, so it is vouched for
+    /// when the receiver's every type is the one the walk saw. A local is vouched for through
+    /// the right-hand sides of the writes reaching it and the collection of the loop that
+    /// binds it. A local being resolved that is reached again — a write that reads its own
+    /// target (`Описание = Описание.Родитель` in a loop) — vouches for nothing.
+    fn types_on_every_path(&self, expr: ExprId, walk: &mut PathWalk) -> Option<Vec<TypeId>> {
+        const MAX_DEPTH: usize = 16;
+        match self.body.expr(expr) {
+            Expr::Field { base, .. } | Expr::Index { base, .. } => {
+                let base = ExprId::from_idx(*base);
+                let walked = self.expr_types.get(&base).copied()?;
+                let base_types = self.types_on_every_path(base, walk)?;
+                if base_types.is_empty() || base_types.iter().any(|ty| *ty != walked) {
+                    return None;
+                }
+                Some(vec![self.expr_types.get(&expr).copied()?])
+            }
+            Expr::Path(name) => {
+                if let Some(known) = walk.resolved.get(&expr) {
+                    return known.clone();
+                }
+                if walk.active.contains(&expr) || walk.active.len() >= MAX_DEPTH {
+                    return None;
+                }
+                let key = name.as_str().fold_lower();
+                if !self.body_writes_name(name, &key) {
+                    // Not a local: only the configuration root is the same on every path.
+                    let ty = self.expr_types.get(&expr).copied()?;
+                    return crate::field_lookup::is_configuration_metadata_root(self.db, ty)
+                        .then(|| vec![ty]);
+                }
+                let use_stmt = self.body.enclosing_stmt(expr)?;
+                let reaching =
+                    self.reaching_assignment_types_at(self.read_point(use_stmt)?, &key)?;
+                let use_stmt = use_stmt.to_idx();
+                if self.local_may_change_unseen(&key, use_stmt) {
+                    return None;
+                }
+                let sources = self.loop_aware_definitions(&key, use_stmt, reaching)?;
+                walk.active.push(expr);
+                let types = self.types_of_definitions(&sources, walk);
+                walk.active.pop();
+                walk.resolved.insert(expr, types.clone());
+                types
+            }
+            _ => None,
+        }
+    }
+
+    fn types_of_definitions(
+        &self,
+        sources: &[DefinitionSource],
+        walk: &mut PathWalk,
+    ) -> Option<Vec<TypeId>> {
+        let mut types = Vec::new();
+        for source in sources {
+            match *source {
+                DefinitionSource::Value(value) => {
+                    types.extend(self.types_on_every_path(value, walk)?);
+                }
+                DefinitionSource::LoopElement(collection) => {
+                    for collection_ty in self.types_on_every_path(collection, walk)? {
+                        let element = crate::iteration_lookup::resolve_iter_element_ty(
+                            self.db,
+                            collection_ty,
+                        )
+                        .filter(|ty| !self.is_unknown(*ty))?;
+                        types.push(element);
+                    }
+                }
+                DefinitionSource::Opaque => return None,
+            }
+        }
+        let mut seen = FxHashSet::default();
+        types.retain(|ty| seen.insert(*ty));
+        Some(types)
+    }
+
+    /// Whether the body declares `name` or writes it, i.e. whether it names a local rather
+    /// than a global.
+    fn body_writes_name(&self, name: &hir_def::Name, key: &str) -> bool {
+        self.body_declares_binding(name)
+            || self.body.stmts_iter().any(|(_, stmt)| {
+                matches!(stmt, Stmt::Assign { target, .. }
+                    if matches!(self.body.expr_idx(*target), Expr::Path(written)
+                        if written.as_str().fold_lower() == key))
+            })
+    }
+
+    /// The statement at which reaching definitions are taken for a read in `stmt`.
+    ///
+    /// A loop header is not a statement of any block, so for a read in it (the collection of
+    /// `Для Каждого`, the bounds of `Для`) the definitions are taken at the first statement
+    /// of the loop body: those made before the loop together with those coming round the
+    /// back-edge, which is no narrower than what the header reads.
+    fn read_point(&self, stmt: StmtId) -> Option<StmtId> {
+        match self.body.stmt(stmt) {
+            Stmt::For { body, .. } | Stmt::ForEach { body, .. } => {
+                body.first().map(|first| StmtId::from_idx(*first))
+            }
+            _ => Some(stmt),
+        }
+    }
+
+    /// Whether the local named `key` may take a value reaching definitions do not see at
+    /// `use_stmt`.
+    ///
+    /// An argument is passed by reference unless the callee declares it `Знач`, so a call may
+    /// write the local it is given. `Выполнить` may write any local. The handler of `Попытка` is reached from
+    /// the entry of the protected statements only, so a write among them that an error
+    /// interrupts is not seen by the handler or the code after it.
+    fn local_may_change_unseen(&self, key: &str, use_stmt: StmtIdx) -> bool {
+        let names_local = |expr: &hir_def::hir::ExprIdx| matches!(self.body.expr_idx(*expr), Expr::Path(arg) if arg.as_str().fold_lower() == key);
+        let passed_to_call = self.body.exprs_iter().any(|(_, expr)| match expr {
+            Expr::Call { args, .. } | Expr::MethodCall { args, .. } => args.iter().any(names_local),
+            _ => false,
+        });
+        if passed_to_call {
+            return true;
+        }
+        let covers = |outer: StmtIdx, inner: StmtIdx| {
+            crate::narrow::stmt_covers_stmt(&self.body, outer, inner)
+        };
+        let writes: Vec<StmtIdx> = self
+            .body
+            .stmts_iter()
+            .filter_map(|(id, stmt)| match stmt {
+                Stmt::Assign { target, .. } if names_local(target) => Some(id.to_idx()),
+                Stmt::For { var, .. } | Stmt::ForEach { var, .. }
+                    if self.body.binding_idx(*var).name.as_str().fold_lower() == key =>
+                {
+                    Some(id.to_idx())
+                }
+                _ => None,
+            })
+            .collect();
+        self.body.stmts_iter().any(|(_, stmt)| match stmt {
+            Stmt::Execute { .. } => true,
+            Stmt::Try { body: protected, .. } => {
+                let in_protected = |target: StmtIdx| protected.iter().any(|s| covers(*s, target));
+                !in_protected(use_stmt) && writes.iter().any(|write| in_protected(*write))
+            }
+            _ => false,
+        })
+    }
+
+    /// Where the definitions of `var_key` reaching `use_stmt` take their values, with loop
+    /// variables put back. `None` when no set can be vouched for.
+    ///
+    /// Reaching definitions do not see a `Для`/`Для Каждого` header rebind its variable: the
+    /// header is not a statement of any block. Inside a loop over the name, writes made
+    /// before the loop still look as if they reached and the loop's own element does not.
+    /// Inside the innermost such loop the element and the writes made in that loop's body
+    /// are what can reach; outside every such loop, a loop of the name may have left its
+    /// last element behind, and nothing is vouched for.
+    fn loop_aware_definitions(
+        &self,
+        var_key: &str,
+        use_stmt: StmtIdx,
+        reaching: Vec<ReachingDef>,
+    ) -> Option<Vec<DefinitionSource>> {
+        let loops: Vec<StmtIdx> = self
+            .body
+            .stmts_iter()
+            .filter_map(|(id, stmt)| match stmt {
+                Stmt::For { var, .. } | Stmt::ForEach { var, .. }
+                    if self.body.binding_idx(*var).name.as_str().fold_lower() == var_key =>
+                {
+                    Some(id.to_idx())
+                }
+                _ => None,
+            })
+            .collect();
+        if loops.is_empty() {
+            return Some(reaching.iter().map(|def| self.definition_source(def)).collect());
+        }
+
+        let covers = |outer: StmtIdx, inner: StmtIdx| {
+            crate::narrow::stmt_covers_stmt(&self.body, outer, inner)
+        };
+        // The loop's own statement owns its collection expression, which is read before
+        // the variable is rebound, so a read there is not inside the loop.
+        let enclosing: Vec<StmtIdx> = loops
+            .iter()
+            .copied()
+            .filter(|loop_stmt| *loop_stmt != use_stmt && covers(*loop_stmt, use_stmt))
+            .collect();
+        let innermost = enclosing
+            .iter()
+            .copied()
+            .find(|candidate| enclosing.iter().all(|other| covers(*other, *candidate)))?;
+        if loops.iter().any(|other| *other != innermost && covers(innermost, *other)) {
+            return None;
+        }
+
+        let element = match self.body.stmt_idx(innermost) {
+            Stmt::ForEach { collection, .. } => {
+                DefinitionSource::LoopElement(ExprId::from_idx(*collection))
+            }
+            _ => DefinitionSource::Opaque,
+        };
+        let mut definitions = vec![element];
+        definitions.extend(
+            reaching
+                .iter()
+                .filter(|def| def.stmt.is_some_and(|stmt| covers(innermost, stmt.to_idx())))
+                .map(|def| self.definition_source(def)),
+        );
+        Some(definitions)
+    }
+
+    fn definition_source(&self, def: &ReachingDef) -> DefinitionSource {
+        match def.stmt.map(|stmt| self.body.stmt(stmt)) {
+            Some(Stmt::Assign { value, .. }) => DefinitionSource::Value(ExprId::from_idx(*value)),
+            _ => DefinitionSource::Opaque,
+        }
+    }
+
     /// The definitions of `var_key` reaching `use_expr`. `None` overall when
     /// reaching definitions are unavailable for the owner.
     fn reaching_assignment_types(
@@ -2120,7 +2392,15 @@ impl<'db> InferenceContext<'db> {
         use_expr: ExprId,
         var_key: &str,
     ) -> Option<Vec<ReachingDef>> {
-        let stmt_id = self.body.enclosing_stmt(use_expr)?;
+        self.reaching_assignment_types_at(self.body.enclosing_stmt(use_expr)?, var_key)
+    }
+
+    /// The definitions of `var_key` reaching the start of `stmt_id`.
+    fn reaching_assignment_types_at(
+        &self,
+        stmt_id: StmtId,
+        var_key: &str,
+    ) -> Option<Vec<ReachingDef>> {
         let module = hir_def::ModuleId::new(self.context_file_id);
         let body_defs = match self.owner {
             DefWithBodyId::Method(local_id) => self.db.method_reaching_definitions(
@@ -2725,7 +3005,20 @@ impl<'db> InferenceContext<'db> {
                     let closed_metadata_collection =
                         matches!(base_kind, TypeKind::MetadataObjectCollection(_))
                             && self.db.file_has_visible_config(self.context_file_id);
-                    if !field.is_missing() && (closed_receiver || closed_metadata_collection) {
+                    // A metadata-description object (`Метаданные.Справочники.X`) is closed by the
+                    // platform, not by the configuration — its members are the same for every catalog.
+                    // The receiver is closed only when it holds such a description lacking the member
+                    // on every path reaching this read: the walk types a local by its textually latest
+                    // write, so after `Если … Иначе` or around a loop back-edge it can name one path's
+                    // kind while another path holds `Метаданные[Вид][Имя]`, and a chain or a loop
+                    // element read through that local inherits the one path.
+                    let base_id = ExprId::from_idx(*base);
+                    let closed_description =
+                        crate::field_lookup::is_closed_metadata_description(self.db, base_ty)
+                            && self.description_miss_holds_on_every_path(base_id, field);
+                    if !field.is_missing()
+                        && (closed_receiver || closed_metadata_collection || closed_description)
+                    {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
                             receiver_ty: base_ty,

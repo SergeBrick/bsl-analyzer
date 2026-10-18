@@ -3089,8 +3089,16 @@ impl<'db> InferenceContext<'db> {
                     let closed_description =
                         crate::field_lookup::is_closed_metadata_description(self.db, base_ty)
                             && self.description_miss_holds_on_every_path(base_id, field);
+                    // An ordinary form's controls are exactly the ones its dialog lists,
+                    // unless the module adds controls or lets other code at the form.
+                    let closed_ordinary_controls =
+                        crate::form_items::is_ordinary_controls_collection_ty(self.db, base_ty)
+                            && crate::form_items::ordinary_controls_closed(self.db, &resolver);
                     if !field.is_missing()
-                        && (closed_receiver || closed_metadata_collection || closed_description)
+                        && (closed_receiver
+                            || closed_metadata_collection
+                            || closed_description
+                            || closed_ordinary_controls)
                     {
                         self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedField {
                             expr: expr_id,
@@ -3402,6 +3410,12 @@ impl<'db> InferenceContext<'db> {
         if !user_shadows && !body_binding_shadows {
             if let Some(ty) = crate::form_attr::resolve_form_attribute(self.db, &resolver, name) {
                 trace!("resolved {} as managed-form attribute", name);
+                return found(ty, BareNameOrigin::FormMember, all_env);
+            }
+            if let Some(ty) =
+                crate::form_items::resolve_ordinary_form_controls(self.db, &resolver, name)
+            {
+                trace!("resolved {} as the ordinary form's controls", name);
                 return found(ty, BareNameOrigin::FormMember, all_env);
             }
         }

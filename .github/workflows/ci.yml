@@ -458,6 +458,37 @@ jobs:
             grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
           }
           run_nonempty -p mcp-server --test broker
+      - name: Shared LSP and MCP owner and editor lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer --test shared_workspace_backend
+          run_nonempty -p bsl-analyzer --test shared_workspace_backpressure
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::lsp
+          run_nonempty -p bsl-analyzer --bin bsl-analyzer-app cli::mcp::tests::
+          run_nonempty -p bsl-analyzer --lib panic_watch::
+          run_nonempty -p bsl-analyzer --lib shared_admission_
+          run_nonempty -p bsl-analyzer --lib mem_docs::tests::
+          run_nonempty -p bsl-analyzer --lib diagnostics_keep_wire_version_and_reject_results_from_before_an_edit
+          run_nonempty -p bsl-analyzer --lib diagnostics_cancelled_by_writer_requeue_only_current_open_version
+          run_nonempty -p ide-host-core --lib workspace::
+          run_nonempty -p ide-host-core --lib editor_view_builds_configuration_from_owner_inputs_and_refreshes_xml
+          run_nonempty -p mcp-server --lib saved_path_refresh_
+          run_nonempty -p mcp-server --lib queued_source_writer_
+          run_nonempty -p mcp-server --lib editor_path_hints_
+          run_nonempty -p mcp-server --lib lru_trim_waits_for_analysis_clone_without_publishing_generation
+          run_nonempty -p mcp-server --lib shared_backend_sessions_keep_tool_gates_and_native_dispatch_local
+          run_nonempty -p mcp-server --lib invalid_project_freezes_disk_publications_but_keeps_last_good_resident_readable
+          run_nonempty -p mcp-server --lib invalid_project_closes_mcp_before_retiring_last_good_backend
+          run_nonempty -p mcp-server --lib pending_baseline_connects_only_after_start
+          run_nonempty -p mcp-server --lib shared_workspace_defers_workspace_and_reference_credentials_until_activation
+          run_nonempty -p mcp-server --lib broker::transport::
+          run_nonempty -p mcp-server --lib broker::daemon::shared_tests::
       - name: Name dictionary before graph publication
         shell: bash
         run: |
@@ -785,6 +816,16 @@ jobs:
           run_exact mcp-server graph::state::tests::a_build_that_never_started_spends_no_healing
           run_exact mcp-server graph::state::tests::a_change_delivered_during_the_walk_outlives_that_comparison
           run_exact mcp-server graph::state::tests::a_saturated_mark_ledger_and_a_retiring_recovery_set_bound_each_other_not_at_all
+      - name: LSP retry origin guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            output=$(cargo test "$@" 2>&1) || { printf '%s\n' "$output"; return 1; }
+            printf '%s\n' "$output"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"
+          }
+          run_nonempty -p bsl-analyzer --lib g1_origin_guard_
 
   partitioned-baseline-scale:
     name: Partitioned baseline 1.6M release gate

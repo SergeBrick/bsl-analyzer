@@ -2902,3 +2902,129 @@ fn register_slice_offers_period_once() {
         );
     }
 }
+
+fn range_of(text: &str, word: &str) -> text_size::TextRange {
+    let start = text.find(word).unwrap_or_else(|| panic!("`{word}` is not in `{text}`"));
+    text_size::TextRange::at(text_size::TextSize::from(start as u32), text_size::TextSize::of(word))
+}
+
+fn ranges_of(text: &str, word: &str) -> Vec<text_size::TextRange> {
+    text.match_indices(word)
+        .map(|(start, _)| {
+            text_size::TextRange::at(
+                text_size::TextSize::from(start as u32),
+                text_size::TextSize::of(word),
+            )
+        })
+        .collect()
+}
+
+fn parameter_use(
+    name: &str,
+    range: text_size::TextRange,
+    statement_has_into: bool,
+    statement_totals: Option<text_size::TextRange>,
+) -> crate::hir::ParameterSourceUse {
+    crate::hir::ParameterSourceUse {
+        source: crate::hir::ParameterSource { name: name.into(), range },
+        statement_has_into,
+        statement_totals,
+    }
+}
+
+#[test]
+fn parameter_source_in_from() {
+    let text = "ВЫБРАТЬ Д.К КАК К ИЗ &Данные КАК Д";
+    let package = lower_query_with_source_map(text);
+
+    assert_eq!(
+        package.parameter_sources(),
+        [parameter_use("Данные", range_of(text, "&Данные"), false, None)],
+    );
+}
+
+#[test]
+fn parameter_source_with_totals() {
+    let text = "ВЫБРАТЬ Д.К КАК К ИЗ &Данные КАК Д ИТОГИ СУММА(К) ПО К";
+    let package = lower_query_with_source_map(text);
+
+    assert_eq!(
+        package.parameter_sources(),
+        [parameter_use("Данные", range_of(text, "&Данные"), false, Some(range_of(text, "ИТОГИ")),)],
+    );
+}
+
+#[test]
+fn parameter_source_with_into_and_totals() {
+    let text = "ВЫБРАТЬ Д.К КАК К ПОМЕСТИТЬ ВТ ИЗ &Данные КАК Д ИТОГИ СУММА(К) ПО К";
+    let package = lower_query_with_source_map(text);
+
+    assert_eq!(
+        package.parameter_sources(),
+        [parameter_use("Данные", range_of(text, "&Данные"), true, Some(range_of(text, "ИТОГИ")))],
+    );
+}
+
+#[test]
+fn parameter_source_into_in_first_union_member() {
+    let text = "ВЫБРАТЬ Д.К КАК К ПОМЕСТИТЬ ВТ ИЗ &Данные КАК Д \
+                ОБЪЕДИНИТЬ ВСЕ ВЫБРАТЬ Д.К ИЗ &Данные КАК Д";
+    let package = lower_query_with_source_map(text);
+
+    let occurrences = ranges_of(text, "&Данные");
+    assert_eq!(occurrences.len(), 2, "the text must name the parameter twice");
+    assert_eq!(
+        package.parameter_sources(),
+        [
+            parameter_use("Данные", occurrences[0], true, None),
+            parameter_use("Данные", occurrences[1], true, None),
+        ],
+    );
+}
+
+#[test]
+fn parameter_source_in_join() {
+    let text = "ВЫБРАТЬ Т.К КАК К ИЗ Т КАК Т ЛЕВОЕ СОЕДИНЕНИЕ &Данные КАК Д ПО Т.К = Д.К";
+    let package = lower_query_with_source_map(text);
+
+    assert_eq!(
+        package.parameter_sources(),
+        [parameter_use("Данные", range_of(text, "&Данные"), false, None)],
+    );
+}
+
+#[test]
+fn parameter_source_english() {
+    let text = "SELECT D.K AS K FROM &Data AS D";
+    let package = lower_query_with_source_map(text);
+
+    assert_eq!(
+        package.parameter_sources(),
+        [parameter_use("Data", range_of(text, "&Data"), false, None)],
+    );
+}
+
+#[test]
+fn parameter_in_in_list_is_not_a_source() {
+    let text =
+        "ВЫБРАТЬ Н.Ссылка КАК Ссылка ИЗ Справочник.Номенклатура КАК Н ГДЕ Н.Ссылка В (&Список)";
+    let package = lower_query_with_source_map(text);
+
+    assert!(package.parameter_sources().is_empty(), "got {:?}", package.parameter_sources());
+}
+
+#[test]
+fn virtual_table_argument_is_not_a_source() {
+    let text = "ВЫБРАТЬ К.Курс КАК Курс ИЗ РегистрСведений.КурсыВалют.СрезПоследних(&Период) КАК К";
+    let package = lower_query_with_source_map(text);
+
+    assert!(package.parameter_sources().is_empty(), "got {:?}", package.parameter_sources());
+}
+
+#[test]
+fn nested_query_parameter_is_not_a_source() {
+    let text = "ВЫБРАТЬ П.К КАК К ИЗ (ВЫБРАТЬ Т.К КАК К ИЗ &Т КАК Т) КАК П";
+    let package = lower_query_with_source_map(text);
+
+    assert!(package.parameter_sources().is_empty(), "got {:?}", package.parameter_sources());
+}

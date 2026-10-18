@@ -478,6 +478,7 @@ mod tests {
             is_virtual_table: false,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range: MODULE_RANGE,
         }
     }
@@ -505,6 +506,7 @@ mod tests {
             is_virtual_table: true,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range: MODULE_RANGE,
         }
     }
@@ -522,6 +524,7 @@ mod tests {
             is_virtual_table: false,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range: MODULE_RANGE,
         }
     }
@@ -725,6 +728,7 @@ mod tests {
             is_virtual_table: false,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range: MODULE_RANGE,
         };
         let q = mk_query(vec![mk_asterisk(None)], vec![table]);

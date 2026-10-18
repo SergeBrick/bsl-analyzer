@@ -371,6 +371,11 @@ pub trait AnalysisProvider {
         }
     }
 
+    /// The query literals executed as a whole `Запрос` text in the method.
+    fn executed_query_texts(&self, _method_id: MethodId) -> Arc<[hir::ExecutedQueryText]> {
+        Arc::from(Vec::new())
+    }
+
     fn arg_diagnostics_of(
         &self,
         _file_id: FileId,

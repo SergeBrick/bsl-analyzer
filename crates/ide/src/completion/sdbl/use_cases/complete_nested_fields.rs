@@ -171,6 +171,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: syntax::MODULE_RANGE,
             subquery: Vec::new(),
+            parameter: None,
         };
 
         let _ = scope.add_table(table);

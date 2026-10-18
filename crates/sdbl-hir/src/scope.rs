@@ -733,6 +733,7 @@ mod tests {
             is_virtual_table: false,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range: syntax::MODULE_RANGE,
         }
     }

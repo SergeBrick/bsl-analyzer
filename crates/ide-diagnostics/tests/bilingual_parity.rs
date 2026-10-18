@@ -352,6 +352,11 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "SDBL metadata resolution diagnostic; requires configuration metadata fixture",
     ),
     (
+        DiagnosticCode::QueryParameterSourceWithoutInto,
+        "SDBL parameter-source policy; not BSL identifier parity",
+    ),
+    (DiagnosticCode::QueryTotalsInValueTableInto, "SDBL totals policy; not BSL identifier parity"),
+    (
         DiagnosticCode::UnknownFieldInQuery,
         "SDBL field resolution diagnostic; requires configuration metadata fixture",
     ),
@@ -632,7 +637,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 200, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 202, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

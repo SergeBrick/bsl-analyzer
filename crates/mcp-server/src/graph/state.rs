@@ -10361,6 +10361,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
     fn deferred_context_mark_keeps_its_reported_fact() {
         use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
 

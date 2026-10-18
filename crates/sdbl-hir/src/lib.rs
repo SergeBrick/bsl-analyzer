@@ -16,8 +16,8 @@ pub use diagnostics::{
 };
 pub use hir::{
     ExprHir, FieldDef, FieldHir, FunctionKind, GroupByHir, InValues, JoinHir, JoinType, Name,
-    OrderByHir, OrderByItem, ResolvedTable, SdblHir, SdblPackage, SdblQuery, SelectHir, TableRef,
-    UnionHir, WhenClause,
+    OrderByHir, OrderByItem, ParameterSource, ParameterSourceUse, ResolvedTable, SdblHir,
+    SdblPackage, SdblQuery, SelectHir, TableRef, UnionHir, WhenClause,
 };
 pub use lower::{lower_sdbl_to_hir, lower_sdbl_to_hir_with_resolver, SdblLowerResult};
 pub use position_detector::detect_sdbl_at_position;

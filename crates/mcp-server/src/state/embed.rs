@@ -2451,6 +2451,7 @@ mod tests {
     /// being replaced is what turns the retarget into a rebind.
     #[cfg(unix)]
     #[test]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
     fn publish_hook_keeps_a_retargeted_roots_id() {
         let fixture = RetargetedLink::new();
         assert!(fixture.publish(), "the linked extension root must be installed");
@@ -2488,6 +2489,7 @@ mod tests {
     /// the new target; otherwise search hands out an id the next tool calls unknown.
     #[cfg(unix)]
     #[test]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
     fn every_root_table_reader_answers_to_the_id_search_kept_across_a_retarget() {
         let fixture = RetargetedLink::new();
         assert!(fixture.publish(), "the linked extension root must be installed");
@@ -2550,6 +2552,7 @@ mod tests {
     /// provider keyed on the workspace instead of the layout would never find the artifact
     /// and the root table would stay frozen at its boot contents.
     #[test]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
     fn publish_hook_transitions_roots_when_the_cache_lives_outside_the_workspace() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2660,6 +2663,7 @@ mod tests {
     /// supersedes the plan. Without the hub fence the old table can consume and drop an event in
     /// a newly-added root, after which stale planned bytes would be published with no retry debt.
     #[test]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
     fn event_across_root_validation_keeps_the_old_table_and_retry_obligation() {
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();

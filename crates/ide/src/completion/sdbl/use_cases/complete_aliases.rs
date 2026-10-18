@@ -67,6 +67,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: syntax::MODULE_RANGE,
             subquery: Vec::new(),
+            parameter: None,
         };
 
         let table2 = TableRef {
@@ -83,6 +84,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: syntax::MODULE_RANGE,
             subquery: Vec::new(),
+            parameter: None,
         };
 
         let table3 = TableRef {
@@ -99,6 +101,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: syntax::MODULE_RANGE,
             subquery: Vec::new(),
+            parameter: None,
         };
 
         // Distinct aliases by construction, so there is no collision to report.

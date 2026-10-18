@@ -619,6 +619,8 @@ async fn serve_lsp(
     result
 }
 
+const LSP_HEADER_LIMIT: usize = 8192;
+
 pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
     read: &mut R,
 ) -> Result<Option<lsp_server::Message>> {
@@ -626,13 +628,16 @@ pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
     let mut header_size = 0usize;
     loop {
         let mut line = String::new();
-        let count = read.read_line(&mut line).await?;
+        // One byte past the limit is enough to tell an oversized header; reading the
+        // rest of the line would buffer whatever a peer sends before the check.
+        let remaining = (LSP_HEADER_LIMIT - header_size + 1) as u64;
+        let count = (&mut *read).take(remaining).read_line(&mut line).await?;
         if count == 0 {
             anyhow::ensure!(header_size == 0, "truncated LSP header");
             return Ok(None);
         }
         header_size = header_size.checked_add(count).context("LSP header size overflow")?;
-        anyhow::ensure!(header_size <= 8192, "LSP header exceeds 8 KiB");
+        anyhow::ensure!(header_size <= LSP_HEADER_LIMIT, "LSP header exceeds 8 KiB");
         if line == "\r\n" {
             break;
         }
@@ -785,6 +790,16 @@ mod tests {
         send.await.unwrap();
         let bytes = b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
         assert!(read_lsp_message(&mut &bytes[..]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn framing_stops_reading_a_header_line_at_the_header_limit() {
+        let mut bytes = vec![b'A'; 1 << 20];
+        bytes.extend_from_slice(b"\r\nContent-Length: 2\r\n\r\n{}");
+        let mut unread = &bytes[..];
+        assert!(read_lsp_message(&mut unread).await.is_err());
+        let consumed = bytes.len() - unread.len();
+        assert!(consumed <= 8193, "an oversized header line was read whole: {consumed} bytes");
     }
 
     #[tokio::test]

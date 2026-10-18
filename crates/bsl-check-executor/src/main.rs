@@ -45,48 +45,55 @@ async fn main() {
 async fn run(args: Args, cancel: CancellationToken) -> Result<(), i32> {
     let input = read_request_frame(tokio::io::stdin(), MAX_REQUEST_FRAME).await?;
     let request = check_contract::parse_request(&input, MAX_REQUEST_FRAME).map_err(|_| 2)?;
+    let limit = request.limits.max_response_bytes;
     if request.connection != args.profile {
-        write_response(error_response(
-            &request,
-            "profile_connection_mismatch",
-            "The request connection does not match the selected profile",
-        ))
+        write_response(
+            error_response(
+                &request,
+                "profile_connection_mismatch",
+                "The request connection does not match the selected profile",
+            ),
+            limit,
+        )
         .await?;
         return Ok(());
     }
     let bytes = tokio::fs::read(&args.config).await.map_err(|_| 2)?;
     let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| 2)?;
     let Some(profile) = registry.profiles.get(&args.profile) else {
-        write_response(error_response(
-            &request,
-            "profile_not_found",
-            "The selected profile is not registered",
-        ))
+        write_response(
+            error_response(&request, "profile_not_found", "The selected profile is not registered"),
+            limit,
+        )
         .await?;
         return Ok(());
     };
     if !supported_limits(&request.limits) {
-        write_response(error_response(
-            &request,
-            "unsupported_limits",
-            "The requested native bounds are unsupported",
-        ))
+        write_response(
+            error_response(
+                &request,
+                "unsupported_limits",
+                "The requested native bounds are unsupported",
+            ),
+            limit,
+        )
         .await?;
         return Ok(());
     }
     if let Err(error) = bsl_check_executor::native_startup(profile) {
-        write_response(error_response(&request, "profile_invalid", &error.to_string())).await?;
+        write_response(error_response(&request, "profile_invalid", &error.to_string()), limit)
+            .await?;
         return Ok(());
     }
     let client = match make_client(profile) {
         Ok(client) => client,
         Err(message) => {
-            write_response(error_response(&request, "runtime_unavailable", message)).await?;
+            write_response(error_response(&request, "runtime_unavailable", message), limit).await?;
             return Ok(());
         }
     };
     let response = bsl_check_executor::check_wire(profile, request, &client, cancel).await;
-    write_response(response).await
+    write_response(response, limit).await
 }
 
 async fn read_request_frame<R: tokio::io::AsyncRead + Unpin>(
@@ -142,12 +149,22 @@ fn make_client(
     }
 }
 
-async fn write_response(response: check_contract::CheckResponse) -> Result<(), i32> {
-    let bytes = serde_json::to_vec(&response).map_err(|_| 2)?;
+async fn write_response(response: check_contract::CheckResponse, limit: u64) -> Result<(), i32> {
+    let bytes = encode_response(&response, limit)?;
     let mut stdout = tokio::io::stdout();
     stdout.write_all(&bytes).await.map_err(|_| 2)?;
     stdout.write_all(b"\n").await.map_err(|_| 2)?;
     stdout.flush().await.map_err(|_| 2)
+}
+
+/// A response must echo the request's identity verbatim, so one that cannot fit the caller's
+/// limit is refused like any other unusable request rather than written oversized.
+fn encode_response(response: &check_contract::CheckResponse, limit: u64) -> Result<Vec<u8>, i32> {
+    let bytes = serde_json::to_vec(response).map_err(|_| 2)?;
+    if bytes.len() as u64 > limit {
+        return Err(2);
+    }
+    Ok(bytes)
 }
 
 fn error_response(
@@ -236,6 +253,31 @@ mod tests {
         let exact = read_request_frame(&b"{}"[..], 2).await.unwrap();
         assert_eq!(exact, b"{}");
         assert_eq!(read_request_frame(&b"{} "[..], 2).await.unwrap_err(), 2);
+    }
+
+    #[test]
+    fn a_response_over_the_requested_limit_is_refused_instead_of_written() {
+        let limits = check_contract::WireLimits {
+            timeout_ms: 120_000,
+            max_code_bytes: 1024,
+            max_response_bytes: 16 * 1024,
+            max_stderr_bytes: 4096,
+            stop_grace_ms: 2_000,
+        };
+        let mut request: check_contract::CheckRequest = serde_json::from_value(serde_json::json!({
+            "schema_version": check_contract::SCHEMA_VERSION,
+            "request_id": "r1",
+            "connection": "test",
+            "code": "x = 1;",
+            "limits": limits,
+        }))
+        .unwrap();
+        let fits = error_response(&request, "profile_not_found", "missing");
+        assert!(encode_response(&fits, limits.max_response_bytes).is_ok());
+
+        request.connection = "a".repeat(20_000);
+        let echoed = error_response(&request, "profile_connection_mismatch", "mismatch");
+        assert_eq!(encode_response(&echoed, limits.max_response_bytes), Err(2));
     }
 
     #[test]

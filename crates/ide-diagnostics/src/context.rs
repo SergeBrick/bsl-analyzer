@@ -325,6 +325,16 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.module_index(source_root_id))
     }
 
+    /// The syntax of the module's OTHER bodies — the configuration's and its extensions'
+    /// — which resolve this body's methods by name, `Экспорт` or not.
+    pub fn sibling_body_roots(&self) -> Vec<syntax::SyntaxNode> {
+        self.module_index()
+            .sibling_bodies(self.file_id)
+            .into_iter()
+            .map(|file_id| self.query(|p| p.parse(file_id)).syntax_node())
+            .collect()
+    }
+
     /// Handler names some module of this file's source root binds by string to
     /// another module's object - `Форма.ПодключитьОбработчикОжидания("Имя", …)` in a
     /// helper handed the form.

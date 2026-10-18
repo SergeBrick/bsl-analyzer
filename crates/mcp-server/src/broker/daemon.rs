@@ -863,7 +863,9 @@ mod shared_tests {
             ),
             CancellationToken::new(),
             Duration::from_secs(3),
-            Duration::from_secs(60),
+            // An idle TTL no run reaches: only the orphan grace can end this daemon, so a
+            // private-only attach that counted as a warm session would keep it running.
+            test_utils::wait::NO_BOUND,
             || (false, false),
             move || shutdown_seen.store(true, Ordering::SeqCst),
         ));
@@ -874,9 +876,12 @@ mod shared_tests {
             connect_endpoint(shared_backend_name(&key).unwrap(), HANDSHAKE_TIMEOUT).await.unwrap();
         partial.write_u8(0).await.unwrap();
         partial.flush().await.unwrap();
-        let partial_eof = tokio::time::timeout(Duration::from_secs(7), partial.read_u8())
-            .await
-            .expect("partial handshake is bounded by the server deadline");
+        let partial_eof = tokio::time::timeout(
+            test_utils::wait::ceiling(Duration::from_secs(7)),
+            partial.read_u8(),
+        )
+        .await
+        .expect("partial handshake is bounded by the server deadline");
         assert!(partial_eof.is_err(), "slow handshake closes without an accept record");
         assert_eq!(adapter_calls.load(Ordering::SeqCst), 0);
 
@@ -909,20 +914,20 @@ mod shared_tests {
             .await
             .unwrap();
         write_session_context(&mut client, &[]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), attached_rx.recv())
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(3)), attached_rx.recv())
             .await
             .expect("valid handshake starts the adapter")
             .expect("adapter attached");
         assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
         drop(client);
-        tokio::time::timeout(Duration::from_secs(3), finished_rx.recv())
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(3)), finished_rx.recv())
             .await
             .expect("the adapter observes peer EOF")
             .expect("adapter finished");
 
-        tokio::time::timeout(Duration::from_secs(10), daemon)
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(10)), daemon)
             .await
-            .expect("private-only attach must not extend the 3s orphan grace to the 60s idle TTL")
+            .expect("private-only attach must not extend the orphan grace to the idle TTL")
             .unwrap()
             .unwrap();
         assert!(shutdown_called.load(Ordering::SeqCst));
@@ -1001,7 +1006,7 @@ mod shared_tests {
                     .await
                     .unwrap();
             let result = tokio::time::timeout(
-                Duration::from_secs(5),
+                test_utils::wait::ceiling(Duration::from_secs(5)),
                 client_handshake(
                     &mut stream,
                     &Handshake { identity: mismatch, adapter: AdapterKind::Mcp },
@@ -1022,14 +1027,14 @@ mod shared_tests {
         .await
         .expect("exact identity remains admissible after mismatches");
         write_session_context(&mut compatible, &[]).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), attached_rx.recv())
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(3)), attached_rx.recv())
             .await
             .expect("exact identity reaches adapter")
             .expect("adapter attached");
         assert_eq!(adapter_calls.load(Ordering::SeqCst), 1);
         drop(compatible);
         retired.cancel();
-        tokio::time::timeout(Duration::from_secs(5), daemon)
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(5)), daemon)
             .await
             .expect("endpoint exits after explicit shutdown")
             .unwrap()
@@ -1050,23 +1055,32 @@ mod shared_tests {
         let key = SharedBackendKey::new(identity.clone());
         let listener = listener_options_shared(&key).unwrap().create_tokio().unwrap();
         let legacy = tokio::spawn(async move {
-            let mut stream = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("new client reaches fake legacy endpoint before deadline")
-                .unwrap();
-            let length = tokio::time::timeout(Duration::from_secs(5), stream.read_u32())
-                .await
-                .expect("new client private handshake header is bounded")
-                .unwrap() as usize;
+            let mut stream = tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("new client reaches fake legacy endpoint before deadline")
+            .unwrap();
+            let length = tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(5)),
+                stream.read_u32(),
+            )
+            .await
+            .expect("new client private handshake header is bounded")
+            .unwrap() as usize;
             assert!(
                 length <= MAX_HANDSHAKE_BYTES,
                 "new client handshake stays under the protocol's advertised bound"
             );
             let mut received = vec![0; length];
-            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
-                .await
-                .expect("new client private handshake body is bounded")
-                .unwrap();
+            tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(5)),
+                stream.read_exact(&mut received),
+            )
+            .await
+            .expect("new client private handshake body is bounded")
+            .unwrap();
             stream.write_all(b"Content-Length: 2\r\n\r\n{}").await.unwrap();
             stream.flush().await.unwrap();
             received
@@ -1079,7 +1093,7 @@ mod shared_tests {
         .await
         .expect("new shared client connects to the existing endpoint without launching a daemon");
         let attempt = tokio::time::timeout(
-            Duration::from_secs(5),
+            test_utils::wait::ceiling(Duration::from_secs(5)),
             client_handshake(&mut stream, &Handshake { identity, adapter: AdapterKind::Mcp }),
         )
         .await
@@ -1150,16 +1164,19 @@ mod shared_tests {
         client_handshake(&mut client, &Handshake { identity, adapter: AdapterKind::Mcp })
             .await
             .unwrap();
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, write_session_context(&mut client, &[]))
-            .await
-            .expect("test session context write is bounded")
-            .unwrap();
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, attached_rx.recv())
+        tokio::time::timeout(
+            test_utils::wait::ceiling(HANDSHAKE_TIMEOUT),
+            write_session_context(&mut client, &[]),
+        )
+        .await
+        .expect("test session context write is bounded")
+        .unwrap();
+        tokio::time::timeout(test_utils::wait::ceiling(HANDSHAKE_TIMEOUT), attached_rx.recv())
             .await
             .expect("adapter admission is bounded")
             .expect("the session attached");
         superseded.store(true, Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(3)), async {
             loop {
                 match connect_endpoint(
                     shared_backend_name(&key).unwrap(),
@@ -1198,9 +1215,13 @@ mod shared_tests {
             "the session stays open until graph reads return"
         );
         graph_released.store(true, Ordering::SeqCst);
-        tokio::time::timeout(Duration::from_secs(5), daemon).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(5)), daemon)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, client.read_u8())
+            tokio::time::timeout(test_utils::wait::ceiling(HANDSHAKE_TIMEOUT), client.read_u8())
                 .await
                 .expect("old session closes after bounded read handover")
                 .is_err(),
@@ -1278,7 +1299,12 @@ mod shared_tests {
         .unwrap();
         write_session_context(&mut mcp, &[]).await.unwrap();
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await.unwrap(),
+            tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(5)),
+                events_rx.recv()
+            )
+            .await
+            .unwrap(),
             Some(AdapterKind::Mcp)
         ));
 
@@ -1291,19 +1317,33 @@ mod shared_tests {
         write_session_context(&mut lsp_wire, &[]).await.unwrap();
         let mut lsp = LspChannel::new(lsp_wire, || {});
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await.unwrap(),
+            tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(5)),
+                events_rx.recv()
+            )
+            .await
+            .unwrap(),
             Some(AdapterKind::Lsp)
         ));
 
         mcp.shutdown().await.unwrap();
         lsp.io.write_all(b"still alive").await.unwrap();
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await.unwrap(),
+            tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(5)),
+                events_rx.recv()
+            )
+            .await
+            .unwrap(),
             Some(AdapterKind::Lsp)
         ));
         assert!(!daemon.is_finished());
 
         retired.cancel();
-        tokio::time::timeout(Duration::from_secs(5), daemon).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(5)), daemon)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

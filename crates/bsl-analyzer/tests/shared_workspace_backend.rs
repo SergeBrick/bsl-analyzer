@@ -214,20 +214,24 @@ async fn mcp_client_with_args(root: &Path, mode: &str, extra: &[&str]) -> (Clien
     let stdout = child.stdout.take().expect("MCP stdout");
     let stdin = child.stdin.take().expect("MCP stdin");
     let pid = child.id().unwrap_or_default();
-    let client =
-        match tokio::time::timeout(Duration::from_secs(60), ().serve((stdout, stdin))).await {
-            Ok(Ok(client)) => client,
-            Ok(Err(error)) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                panic!("public MCP initialize failed for subprocess pid={pid}: {error}");
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                panic!("public MCP initialize timed out after 60s for subprocess pid={pid}");
-            }
-        };
+    let client = match tokio::time::timeout(
+        test_utils::wait::ceiling(Duration::from_secs(60)),
+        ().serve((stdout, stdin)),
+    )
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("public MCP initialize failed for subprocess pid={pid}: {error}");
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("public MCP initialize timed out after 60s for subprocess pid={pid}");
+        }
+    };
     (client, child)
 }
 
@@ -240,7 +244,8 @@ fn onec_validation_mock(valid: bool) -> (String, Receiver<String>, JoinHandle<()
     let address = listener.local_addr().expect("mock address");
     let (request_tx, request_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline =
+            std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -254,7 +259,9 @@ fn onec_validation_mock(valid: bool) -> (String, Receiver<String>, JoinHandle<()
                 Err(error) => panic!("accept native validation request: {error}"),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(10))).expect("bound mock request read");
+        stream
+            .set_read_timeout(Some(test_utils::wait::ceiling(Duration::from_secs(10))))
+            .expect("bound mock request read");
         let request = read_http_request(&mut stream).expect("read native validation request");
         let authorization = request
             .lines()
@@ -403,7 +410,7 @@ fn isolated_backend_env(cache: &Path, runtime: &Path) -> EnvGuard {
 }
 
 async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(60));
     loop {
         let markers = backend_markers(runtime);
         let starts = markers.iter().filter(|line| line.contains("owner_init_start")).count();
@@ -419,7 +426,7 @@ async fn wait_for_owner_initializers(runtime: &Path, count: usize) -> Vec<String
 }
 
 async fn wait_for_lsp_attach_in_epoch(runtime: &Path, epoch: &str) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().any(|line| {
@@ -449,7 +456,8 @@ fn owner_epochs(markers: &[String]) -> Vec<&str> {
 }
 
 async fn wait_for_resident_bootstrap(runtime: &Path) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().any(|line| line.contains("resident_bootstrap_complete")) {
@@ -477,7 +485,8 @@ fn kill_exact_test_daemon(pid: u32) {
 }
 
 async fn disk_symbol(client: &Client) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
     loop {
         let response = tokio::time::timeout(
             deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -500,7 +509,7 @@ async fn disk_symbol(client: &Client) -> Value {
 }
 
 async fn wait_disk_type(client: &Client, expected: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(90));
     loop {
         let card = disk_symbol(client).await;
         if card["status"] == "ok" && card["return_type"] == expected {
@@ -515,7 +524,7 @@ async fn wait_disk_type(client: &Client, expected: &str) -> Value {
 }
 
 async fn wait_disk_status(client: &Client, expected: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(90));
     loop {
         let card = disk_symbol(client).await;
         if card["status"] == expected {
@@ -699,7 +708,7 @@ fn request_until_ready(
     params: Value,
     operation: &str,
 ) -> (Value, u64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -730,7 +739,7 @@ fn request_until_ready(
 }
 
 async fn wait_for_backend_markers(runtime: &Path) -> Vec<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     loop {
         let markers = backend_markers(runtime);
         if markers.iter().filter(|line| line.contains("session_attached")).count() >= 3
@@ -802,7 +811,8 @@ fn assert_owner_counts(markers: &[String], mcp_count: usize, lsp_count: usize) {
 }
 
 async fn search_code_hits(client: &Client, query: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
     loop {
         let response = client
             .call_tool(CallToolRequestParams::new("search").with_arguments(Map::from_iter([
@@ -825,7 +835,8 @@ async fn search_code_hits(client: &Client, query: &str) -> Value {
 }
 
 async fn graph_resolve_answer(client: &Client, query: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(120));
     loop {
         let response = client
             .call_tool(CallToolRequestParams::new("graph").with_arguments(Map::from_iter([
@@ -860,7 +871,7 @@ fn hover_type(
     stale: &str,
 ) {
     let uri = lsp_types::Url::from_file_path(caller).expect("caller URI");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(60));
     loop {
         let request_id = *next_request_id;
         *next_request_id += 1;
@@ -1237,10 +1248,10 @@ async fn concurrent_broker_sessions_keep_tools_and_native_context_local_with_lsp
     assert_eq!(body_b["results"][1]["valid"], false, "B's HTTP endpoint answered B");
     assert_eq!(body_b["results"][1]["errors"][0], "from-session-b");
     let auth_a = request_a
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(10)))
         .expect("A's mock received its platform request");
     let auth_b = request_b
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(10)))
         .expect("B's mock received its platform request");
     assert!(!auth_a.is_empty() && !auth_b.is_empty(), "both session credentials reach HTTP");
     assert_ne!(auth_a, auth_b, "the two sessions send distinct native credentials");
@@ -1401,7 +1412,8 @@ async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credenti
     );
 
     let (client, mut process) = mcp_client(root.path()).await;
-    let helper_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let helper_deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
     while !helper_started.exists() {
         assert!(
             tokio::time::Instant::now() < helper_deadline,
@@ -1413,7 +1425,7 @@ async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credenti
     assert!(!helper_complete.exists(), "helper remains held before the fast query completes");
 
     let schema = tokio::time::timeout(
-        Duration::from_secs(5),
+        test_utils::wait::ceiling(Duration::from_secs(5)),
         client.call_tool(
             CallToolRequestParams::new("query")
                 .with_arguments(Map::from_iter([("action".to_owned(), json!("schema"))])),
@@ -1435,7 +1447,8 @@ async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credenti
 
     let (postgres_tx, postgres_rx) = mpsc::channel();
     let postgres_worker = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline =
+            std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(15));
         loop {
             match postgres_listener.accept() {
                 Ok((stream, _)) => {
@@ -1459,7 +1472,8 @@ async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credenti
         }
     });
     release.release();
-    let helper_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let helper_deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
     while !helper_complete.exists() {
         assert!(
             tokio::time::Instant::now() < helper_deadline,
@@ -1467,11 +1481,13 @@ async fn lsp_only_defers_search_activation_and_mcp_schema_answers_while_credenti
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::task::spawn_blocking(move || postgres_rx.recv_timeout(Duration::from_secs(15)))
-        .await
-        .expect("join bounded PostgreSQL acceptance wait")
-        .expect("credential activation reaches the local PostgreSQL mock")
-        .expect("local PostgreSQL mock accepted the activation connection");
+    tokio::task::spawn_blocking(move || {
+        postgres_rx.recv_timeout(test_utils::wait::ceiling(Duration::from_secs(15)))
+    })
+    .await
+    .expect("join bounded PostgreSQL acceptance wait")
+    .expect("credential activation reaches the local PostgreSQL mock")
+    .expect("local PostgreSQL mock accepted the activation connection");
     postgres_worker.join().expect("local PostgreSQL mock worker exits");
 
     client.cancel().await.ok();
@@ -1699,7 +1715,7 @@ async fn scope_rebind_rechecks_open_buffers_and_preserves_public_lsp_state() {
         "the target is excluded from the rebound semantic scope: {excluded_definition}"
     );
     let mcp_terminal = tokio::time::timeout(
-        Duration::from_secs(10),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
         mcp.call_tool(CallToolRequestParams::new("symbol_info").with_arguments(Map::from_iter([
             ("symbol".to_owned(), json!("ОбщийМодуль.ЧисловоеЗначение")),
         ]))),
@@ -1871,7 +1887,8 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
     assert_ne!(epochs[0], epochs[1], "the configuration-root change advances owner epoch");
     artifacts.checkpoint("synthetic .env changed configuration root and LSP rebound");
 
-    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let attach_deadline =
+        tokio::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
     let attached_markers = loop {
         let markers = backend_markers(runtime.path());
         let attached = markers.iter().filter(|line| line.contains("session_attached")).count();
@@ -1886,7 +1903,7 @@ async fn dotenv_configuration_root_change_rebinds_shared_lsp_and_retires_mcp() {
     };
 
     let mcp_terminal = tokio::time::timeout(
-        Duration::from_secs(10),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
         mcp.call_tool(CallToolRequestParams::new("symbol_info").with_arguments(Map::from_iter([
             ("symbol".to_owned(), json!("ОбщийМодуль.ЧисловоеЗначение")),
         ]))),
@@ -2233,12 +2250,15 @@ async fn daemon_crash_ends_inflight_sessions_and_next_lsp_start_uses_a_new_epoch
     kill_exact_test_daemon(daemon_pid);
     artifacts.checkpoint("exact disposable daemon PID terminated");
     let editor_exit = editor
-        .wait_for_exit_within(Duration::from_secs(20), "daemon crash is terminal; no replay")
+        .wait_for_exit_within(
+            test_utils::wait::ceiling(Duration::from_secs(20)),
+            "daemon crash is terminal; no replay",
+        )
         .expect("poll the owned LSP proxy")
         .expect("LSP proxy exits after its backend disappears");
     assert!(!editor_exit.success(), "unexpected backend crash is reported as failure");
     let mcp_terminal = tokio::time::timeout(
-        Duration::from_secs(10),
+        test_utils::wait::ceiling(Duration::from_secs(10)),
         mcp.call_tool(CallToolRequestParams::new("symbol_info").with_arguments(Map::from_iter([
             ("symbol".to_owned(), json!("ОбщийМодуль.ЧисловоеЗначение")),
         ]))),
@@ -2425,7 +2445,8 @@ async fn auto_lsp_falls_back_before_initialize_forwarding_without_replaying_publ
     let diagnostics =
         editor.open(&root.path().join("CommonModules/Потребитель/Ext/Module.bsl"), CALLER);
     assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
-    let fallback_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let fallback_deadline =
+        std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(2));
     while !editor.stderr_text().contains("LSP backend unavailable before initialize; using stdio")
         && std::time::Instant::now() < fallback_deadline
     {

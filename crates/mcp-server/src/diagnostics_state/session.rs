@@ -757,14 +757,15 @@ mod tests {
         });
 
         entered_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
             .expect("request cloned the resident analysis before the first text query");
         std::fs::write(&path, saved_text).unwrap();
         release_tx.send(()).expect("the blocked request still owns its query gate");
-        let outcome = tokio::time::timeout(Duration::from_secs(30), request)
-            .await
-            .expect("the revision-mismatch request must terminate")
-            .expect("resident call task joins");
+        let outcome =
+            tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(30)), request)
+                .await
+                .expect("the revision-mismatch request must terminate")
+                .expect("resident call task joins");
         assert!(
             matches!(outcome, CallOutcome::Panicked),
             "a genuine file_text revision mismatch remains a terminal panic, not an automatic retry"
@@ -778,7 +779,7 @@ mod tests {
         let refresh_state = state.clone();
         let refresh_path = path.clone();
         let refreshed = tokio::time::timeout(
-            Duration::from_secs(30),
+            test_utils::wait::ceiling(Duration::from_secs(30)),
             tokio::task::spawn_blocking(move || refresh_state.refresh_saved_path(&refresh_path)),
         )
         .await
@@ -797,7 +798,7 @@ mod tests {
 
         let next_state = state.clone();
         let next = tokio::time::timeout(
-            Duration::from_secs(30),
+            test_utils::wait::ceiling(Duration::from_secs(30)),
             tokio::task::spawn_blocking(move || {
                 next_state.read(|resident, _| resident.analysis().file_text(file_id).to_string())
             }),

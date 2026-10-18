@@ -140,7 +140,7 @@ fn legacy_extension_scope_warning_uses_lsp_channel_and_tracks_config_reload() {
     // cancellation the server could not replay internally reaches the client as
     // ContentModified, an explicit cancellation as RequestCanceled. Retry only those;
     // any other error remains a test failure.
-    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let deadline = std::time::Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     let mut response = Value::Null;
     for id in 4.. {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());

@@ -2830,7 +2830,10 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
         None,
         Some(daemon_pid),
     );
-    let daemon_lease = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(30));
+    let daemon_lease = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
     assert_eq!(daemon_lease, daemon_pid, "the direct daemon owns the live lease");
     let graph_required = graph_overview(&mut required);
     assert_eq!(graph_required["nodes"], 2, "required proxy reaches the supervised daemon");
@@ -2885,7 +2888,10 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
         None,
         Some(warm_daemon_pid),
     );
-    let warm_lease_pid = wait_for_lease_pid(&layout.lease_path(), Duration::from_secs(30));
+    let warm_lease_pid = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
     assert_eq!(warm_lease_pid, warm_daemon_pid, "warm daemon owns the live lease");
     let graph_warm_direct = graph_overview(&mut warm_required);
     assert_eq!(graph_warm_direct, graph_required, "direct warm daemon serves the same graph");

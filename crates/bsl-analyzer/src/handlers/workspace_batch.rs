@@ -496,7 +496,8 @@ mod shared_owner_tests {
     use mcp_server::{SharedState, WorkspaceHandle, WorkspaceRead};
 
     fn wait_for_owner_analysis(owner: &WorkspaceHandle) -> Analysis {
-        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        let deadline =
+            Instant::now() + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
         loop {
             match owner.request_analysis() {
                 WorkspaceRead::Ready(analysis) => return analysis,

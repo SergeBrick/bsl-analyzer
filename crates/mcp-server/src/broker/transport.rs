@@ -493,17 +493,23 @@ mod tests {
         channel.io.write_all(response).await.unwrap();
         drop(channel);
 
-        let (kind, payload) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut peer))
-            .await
-            .unwrap()
-            .expect("queued shutdown response reaches the peer before EOF");
+        let (kind, payload) = tokio::time::timeout(
+            test_utils::wait::ceiling(Duration::from_secs(2)),
+            read_frame(&mut peer),
+        )
+        .await
+        .unwrap()
+        .expect("queued shutdown response reaches the peer before EOF");
         assert_eq!(kind, 1);
         assert_eq!(payload, response);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut peer))
-                .await
-                .unwrap()
-                .unwrap(),
+            tokio::time::timeout(
+                test_utils::wait::ceiling(Duration::from_secs(2)),
+                read_frame(&mut peer)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
             (6, Vec::new())
         );
     }
@@ -529,19 +535,26 @@ mod tests {
         let context = vec![0x2a; MAX_DATA_CHUNK + 7];
         let expected = context.clone();
         tokio::time::timeout(
-            Duration::from_secs(2),
+            test_utils::wait::ceiling(Duration::from_secs(2)),
             client_controls.send(LspControl::ResumeLsp(context)),
         )
         .await
         .unwrap()
         .unwrap();
-        let control =
-            tokio::time::timeout(Duration::from_secs(2), server_controls.recv()).await.unwrap();
+        let control = tokio::time::timeout(
+            test_utils::wait::ceiling(Duration::from_secs(2)),
+            server_controls.recv(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(control, Some(LspControl::ResumeLsp(context)) if context == expected));
         assert!(!producer.is_finished(), "producer should still be writing when control arrives");
 
         producer.abort();
         let _ = producer.await;
-        tokio::time::timeout(Duration::from_secs(2), drain).await.unwrap().unwrap();
+        tokio::time::timeout(test_utils::wait::ceiling(Duration::from_secs(2)), drain)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

@@ -5695,7 +5695,7 @@ mod tests {
         // r2d2::Pool::get retries failed connection creation for the adapter's configured 5s
         // timeout. The synthetic helper rejects the subsequent credential refresh so this
         // fixture has one bounded pool deadline, then a published error outcome.
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(8));
         let mut accepted = 0;
         let mut listener_error = None;
         while Instant::now() < deadline && state.baseline.view().pending {
@@ -5726,7 +5726,10 @@ mod tests {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         state.reference_search.ensure_loading();
-        let reference_ready = state.reference_search.baseline.wait_ready(Duration::from_secs(5));
+        let reference_ready = state
+            .reference_search
+            .baseline
+            .wait_ready(test_utils::wait::ceiling(Duration::from_secs(5)));
         let reference_baseline = state.reference_search.baseline.view();
         state.shutdown();
         assert!(baseline_pending, "workspace baseline stays pending");

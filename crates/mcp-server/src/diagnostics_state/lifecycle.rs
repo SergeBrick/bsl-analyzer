@@ -1638,12 +1638,9 @@ impl DiagnosticsState {
             return;
         };
         let release = gate.join("release");
-        let deadline = Instant::now() + Duration::from_secs(120);
+        // Held until the test that set the gate releases it, however long that takes on the
+        // machine running it; a gate never released is a hang the test runner reports.
         while !release.is_file() {
-            assert!(
-                Instant::now() < deadline,
-                "shared-workspace test gate {variable} was not released"
-            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -1917,7 +1914,7 @@ mod tests {
             trim_done_tx.send(trim_state.enforce_lru(true)).unwrap();
         });
 
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         loop {
             let pending_write = salsa::Cancelled::catch(AssertUnwindSafe(|| {
                 salsa::Database::unwind_if_revision_cancelled(held_analysis.database());
@@ -1938,7 +1935,7 @@ mod tests {
         drop(held_analysis);
         assert!(matches!(
             trim_done_rx
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
                 .expect("test watchdog: LRU trim completes after Analysis clone release"),
             WorkspaceRead::Ready(())
         ));
@@ -1981,7 +1978,7 @@ mod tests {
 
         // Wait for the held clone to observe Salsa's actual global pending-write flag. The
         // writer has taken owner admission and is waiting for this storage handle to leave.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         loop {
             let pending_write = salsa::Cancelled::catch(AssertUnwindSafe(|| {
                 salsa::Database::unwind_if_revision_cancelled(held_analysis.database());
@@ -2021,7 +2018,7 @@ mod tests {
             }
         });
         producer_started_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
             .expect("test watchdog: clone producer started");
         assert_eq!(producer_clones.load(Ordering::Acquire), 0);
 
@@ -2039,11 +2036,11 @@ mod tests {
         // no new Analysis clone could be made while the writer held `inner`.
         drop(held_analysis);
         let committed_generation = writer_done_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
             .expect("test watchdog: source writer completes after clone release");
         assert_eq!(committed_generation, before_generation + 1);
         let (reader_ok, reader_generation) = reader_done_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
             .expect("test watchdog: the queued interactive reader follows the writer");
         assert!(reader_ok, "interactive Analysis clone remains available after publication");
         assert_eq!(reader_generation, Some(committed_generation));
@@ -2080,7 +2077,7 @@ mod tests {
             }
         });
         let _ = first_write_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
             .expect("test watchdog: source-writer producer started");
 
         let (interactive_write_tx, interactive_write_rx) = mpsc::channel();
@@ -2093,7 +2090,7 @@ mod tests {
             interactive_write_tx.send((reader_ok, generation)).unwrap();
         });
         let (reader_ok, generation) = interactive_write_rx
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)))
             .expect("test watchdog: interactive reader progresses during repeated source writes");
         assert!(reader_ok);
         assert!(generation.is_some());

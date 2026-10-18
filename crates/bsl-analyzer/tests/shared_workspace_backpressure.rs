@@ -114,7 +114,12 @@ struct Gate(PathBuf);
 
 impl Gate {
     fn wait_until_held(&self, label: &str, lsp: &ProcessLsp) {
-        wait_for_file(&self.0.join("entered"), Duration::from_secs(30), label, &lsp.stderr_tail());
+        wait_for_file(
+            &self.0.join("entered"),
+            test_utils::wait::ceiling(Duration::from_secs(30)),
+            label,
+            &lsp.stderr_tail(),
+        );
     }
 
     fn release(&self) {
@@ -143,7 +148,7 @@ fn shared_markers(runtime: &Path) -> Vec<String> {
 }
 
 fn wait_for_event(runtime: &Path, event: &str, lsp: &ProcessLsp) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(45));
     loop {
         let markers = shared_markers(runtime);
         if markers.iter().any(|line| line.contains(event)) {
@@ -358,7 +363,10 @@ impl ProcessLsp {
                 "capabilities": {}
             }
         }));
-        let response = lsp.wait_for(Duration::from_secs(20), |message| message["id"] == 1);
+        let response = lsp
+            .wait_for(test_utils::wait::ceiling(Duration::from_secs(20)), |message| {
+                message["id"] == 1
+            });
         assert!(response["error"].is_null(), "LSP initialize failed: {response}");
         lsp.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
         lsp
@@ -390,7 +398,9 @@ impl ProcessLsp {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        self.wait_for(Duration::from_secs(20), |message| message["id"] == id)
+        self.wait_for(test_utils::wait::ceiling(Duration::from_secs(20)), |message| {
+            message["id"] == id
+        })
     }
 
     fn wait_all_frames_written(&self, expected: usize, timeout: Duration) {
@@ -407,7 +417,7 @@ impl ProcessLsp {
     }
 
     fn wait_for_writer_backpressure(&self, before: usize, total: usize) -> usize {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
         let mut last = before;
         let mut unchanged_since = Instant::now();
         loop {
@@ -436,14 +446,17 @@ impl ProcessLsp {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": "shutdown", "params": null}));
-        let response = self.wait_for(Duration::from_secs(10), |message| message["id"] == id);
+        let response = self
+            .wait_for(test_utils::wait::ceiling(Duration::from_secs(10)), |message| {
+                message["id"] == id
+            });
         assert!(
             response["error"].is_null(),
             "LSP shutdown failed: {response}; stderr: {}",
             self.stderr_tail()
         );
         self.send(json!({"jsonrpc": "2.0", "method": "exit", "params": null}));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(10));
         loop {
             if let Some(status) = self.child.try_wait().expect("poll LSP child") {
                 assert!(status.success(), "LSP child exited with {status}");
@@ -466,7 +479,7 @@ impl ProcessLsp {
     }
 
     fn wait_for_diagnostic_version(&self, uri: &str, version: i64) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + test_utils::wait::ceiling(Duration::from_secs(30));
         loop {
             let found = self
                 .diagnostic_events
@@ -675,7 +688,7 @@ fn large_ordered_public_changes_backpressure_while_editor_seed_is_held() {
     eprintln!("S9: public writer stalled after {stalled_after}/{total} frames");
 
     event_gate.release();
-    lsp.wait_all_frames_written(total, Duration::from_secs(45));
+    lsp.wait_all_frames_written(total, test_utils::wait::ceiling(Duration::from_secs(45)));
     let before_publish =
         lsp.request("textDocument/documentSymbol", json!({"textDocument": {"uri": document_uri}}));
     assert_document_symbols(&before_publish, &expected);

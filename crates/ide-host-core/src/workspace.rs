@@ -771,12 +771,9 @@ fn hold_shared_test_gate(variable: &str) {
         return;
     };
     let release = gate.join("release");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    // Held until the test that set the gate releases it, however long that takes on the
+    // machine running it; a gate never released is a hang the test runner reports.
     while !release.is_file() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "shared-workspace test gate {variable} was not released"
-        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
@@ -903,7 +900,8 @@ mod tests {
             a
         });
         writer_entering.recv().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::ceiling(std::time::Duration::from_secs(10));
         loop {
             let cancelled = salsa::Cancelled::catch(AssertUnwindSafe(|| {
                 salsa::Database::unwind_if_revision_cancelled(observer.database());

@@ -2054,10 +2054,17 @@ fn apply_workspace_batch_chunk(
         }
 
         // Diff-push: republish only when the diagnostics hash moved since the last batch.
-        if state.batch_pushed.get(&item.uri) == Some(&item.result_id) {
+        if state
+            .batch_pushed
+            .get(&item.uri)
+            .is_some_and(|pushed| pushed.result_id == item.result_id)
+        {
             continue;
         }
-        state.batch_pushed.insert(item.uri.clone(), item.result_id);
+        state.batch_pushed.insert(
+            item.uri.clone(),
+            crate::global_state::BatchPush { result_id: item.result_id, file_id: opened_file_id },
+        );
         let params = lsp_types::PublishDiagnosticsParams {
             uri: item.uri,
             diagnostics: item.diagnostics,
@@ -6410,7 +6417,10 @@ mod tests {
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
         handle_task(&mut state, chunk).unwrap();
         assert_eq!(recv_publish(&receiver), (uri.clone(), 1));
-        assert_eq!(state.batch_pushed.get(&uri).map(String::as_str), Some("h1"));
+        assert_eq!(
+            state.batch_pushed.get(&uri).map(|pushed| pushed.result_id.as_str()),
+            Some("h1")
+        );
 
         // Same hash again: diff-push skips the republish.
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
@@ -6424,7 +6434,10 @@ mod tests {
         );
         handle_task(&mut state, chunk).unwrap();
         assert_eq!(recv_publish(&receiver), (uri.clone(), 2));
-        assert_eq!(state.batch_pushed.get(&uri).map(String::as_str), Some("h2"));
+        assert_eq!(
+            state.batch_pushed.get(&uri).map(|pushed| pushed.result_id.as_str()),
+            Some("h2")
+        );
     }
 
     #[test]
@@ -6462,8 +6475,14 @@ mod tests {
         let kept = crate::test_uri::file_uri("kept.bsl");
 
         // Two files were pushed by an earlier sweep.
-        state.batch_pushed.insert(gone.clone(), "h1".to_string());
-        state.batch_pushed.insert(kept.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            gone.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
+        state.batch_pushed.insert(
+            kept.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
 
         // The final (only) chunk reports just `kept` (unchanged hash → no republish);
         // reaching the cursor end reconciles: `gone`, never reported, is cleared.
@@ -6482,7 +6501,10 @@ mod tests {
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 5);
         let uri = crate::test_uri::file_uri("a.bsl");
-        state.batch_pushed.insert(uri.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
 
         // A cancelled chunk (a concurrent edit cancelled it) reported nothing: it must
         // NOT clear the pushed file, must keep the plan, and must NOT advance the cursor
@@ -6512,7 +6534,10 @@ mod tests {
         let uri = crate::test_uri::file_uri("a.bsl");
 
         // Prime a pushed file, then re-report it clean: one empty publish clears it.
-        state.batch_pushed.insert(uri.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h0", vec![])]);
         handle_task(&mut state, chunk).unwrap();
         assert_eq!(

@@ -246,6 +246,15 @@ pub enum WorkspaceBatchOutcome {
     Failed,
 }
 
+/// What the deferred batch last published for one URI: the hash of the diagnostics, and
+/// the file the URI resolved to when they were published, so a later open under another
+/// spelling of the same file finds the entry without resolving every published URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchPush {
+    pub result_id: String,
+    pub file_id: Option<vfs::FileId>,
+}
+
 /// One file's result within a deferred whole-project diagnostics batch (Stream B).
 #[derive(Debug)]
 pub struct WorkspaceBatchItem {
@@ -487,7 +496,7 @@ pub struct GlobalState {
     /// shutdown or when the feature is turned off.
     pub workspace_batch_dirty: bool,
     pub workspace_batch_in_flight: bool,
-    pub batch_pushed: HashMap<Url, String>,
+    pub batch_pushed: HashMap<Url, BatchPush>,
     pub workspace_batch_token: Option<salsa::CancellationToken>,
     /// Monotonic id of the current batch sweep. Bumped on every spawn and on a
     /// config-reload reset, and carried on the batch's chunks/done: the event loop
@@ -840,14 +849,11 @@ impl GlobalState {
         let file_id = crate::lsp::file_id(self, uri).ok();
         let published_uris: Vec<_> = self
             .batch_pushed
-            .keys()
-            .filter(|published_uri| {
-                *published_uri == uri
-                    || file_id.is_some_and(|file_id| {
-                        crate::lsp::file_id(self, published_uri).ok() == Some(file_id)
-                    })
+            .iter()
+            .filter(|(published_uri, pushed)| {
+                *published_uri == uri || (file_id.is_some() && pushed.file_id == file_id)
             })
-            .cloned()
+            .map(|(published_uri, _)| published_uri.clone())
             .collect();
         for published_uri in published_uris {
             if self.batch_pushed.remove(&published_uri).is_none() {

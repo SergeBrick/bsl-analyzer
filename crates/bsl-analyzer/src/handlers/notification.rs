@@ -1547,7 +1547,10 @@ mod tests {
         let uri = crate::test_uri::file_uri("mod.bsl");
 
         // The deferred batch had pushed diagnostics for this (then closed) file.
-        state.batch_pushed.insert(uri.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
 
         handle_did_open(
             &mut state,
@@ -1568,6 +1571,44 @@ mod tests {
             !state.batch_pushed.contains_key(&uri),
             "opening a batch-pushed file must clear its batch entry"
         );
+    }
+
+    /// The batch may have published a file under another spelling than the one the editor
+    /// opens it with; the file it resolved to when published still hands it off, and an
+    /// entry for another file stays.
+    #[test]
+    fn did_open_hands_off_a_batch_push_made_under_another_spelling() {
+        let (mut state, _receiver) = create_test_state();
+        let uri = crate::test_uri::file_uri("mod.bsl");
+        let file_id = state.vfs_file_for_url(&uri).unwrap();
+        let other_id = state.vfs_file_for_url(&crate::test_uri::file_uri("other.bsl")).unwrap();
+        let alias = crate::test_uri::file_uri("alias-of-mod.bsl");
+        let unrelated = crate::test_uri::file_uri("unrelated.bsl");
+        for (published, file_id) in [(&alias, file_id), (&unrelated, other_id)] {
+            state.batch_pushed.insert(
+                published.clone(),
+                crate::global_state::BatchPush {
+                    result_id: "h1".to_string(),
+                    file_id: Some(file_id),
+                },
+            );
+        }
+
+        handle_did_open(
+            &mut state,
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri,
+                    language_id: "bsl".to_string(),
+                    version: 1,
+                    text: "Процедура Тест() КонецПроцедуры".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(!state.batch_pushed.contains_key(&alias), "the same file's entry is cleared");
+        assert!(state.batch_pushed.contains_key(&unrelated), "another file's entry stays");
     }
 
     #[test]

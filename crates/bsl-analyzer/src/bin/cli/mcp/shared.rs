@@ -648,10 +648,11 @@ pub(crate) async fn read_lsp_message<R: AsyncBufRead + Unpin>(
         }
     }
     let length = length.context("LSP Content-Length missing")?;
+    // The declared length is the peer's claim: buffer the body as it arrives, never
+    // ahead of it.
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(length)?;
-    bytes.resize(length, 0);
-    read.read_exact(&mut bytes).await?;
+    let received = (&mut *read).take(u64::try_from(length)?).read_to_end(&mut bytes).await?;
+    anyhow::ensure!(received == length, "truncated LSP body");
     let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
     let mut message: lsp_server::Message = serde_json::from_value(raw.clone())?;
     // lsp-server represents both a missing result and JSON-RPC's valid `result: null`
@@ -800,6 +801,16 @@ mod tests {
         assert!(read_lsp_message(&mut unread).await.is_err());
         let consumed = bytes.len() - unread.len();
         assert!(consumed <= 8193, "an oversized header line was read whole: {consumed} bytes");
+    }
+
+    /// The declared length is a peer's claim, not data: the body is buffered as it
+    /// arrives. A length no allocation could satisfy, followed by a short body, is a
+    /// truncated message rather than a failed reservation.
+    #[tokio::test]
+    async fn framing_buffers_a_body_only_as_it_arrives() {
+        let bytes = format!("Content-Length: {}\r\n\r\n{{}}", usize::MAX);
+        let error = read_lsp_message(&mut bytes.as_bytes()).await.unwrap_err();
+        assert!(error.to_string().contains("truncated LSP body"), "{error:#}");
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base_db::DiagnosticsConfigInput;
+use base_db::{DiagnosticsConfigInput, SourceDatabase};
 use crossbeam_channel::Sender;
 use ide::Analysis;
 use lsp_server::Message;
@@ -20,9 +20,26 @@ use crate::mem_docs::FrozenMemDocs;
 pub struct FrozenFilePaths {
     forward: Arc<FxHashMap<PathBuf, FileId>>,
     reverse: Arc<FxHashMap<FileId, PathBuf>>,
+    open_uris: Arc<FxHashMap<Url, FileId>>,
+    open_urls: Arc<FxHashMap<FileId, Url>>,
 }
 
 impl FrozenFilePaths {
+    pub fn freeze_database(db: &ide::RootDatabaseImpl) -> Self {
+        let mut forward = FxHashMap::default();
+        let mut reverse = FxHashMap::default();
+        if let Some(input) = db.try_source_root_input(base_db::BSL_SOURCE_ROOT) {
+            let root = input.root(db);
+            for file_id in root.iter() {
+                let Some(path) = root.file_set().path_for_file(&file_id) else { continue };
+                let path = path.as_path().to_path_buf();
+                forward.insert(path.clone(), file_id);
+                reverse.insert(file_id, path);
+            }
+        }
+        Self { forward: Arc::new(forward), reverse: Arc::new(reverse), ..Self::default() }
+    }
+
     pub fn freeze(vfs: &Vfs) -> Self {
         let n = vfs.num_file_ids();
         let mut forward: FxHashMap<PathBuf, FileId> = FxHashMap::default();
@@ -36,7 +53,32 @@ impl FrozenFilePaths {
             forward.insert(path.clone(), file_id);
             reverse.insert(file_id, path);
         }
-        Self { forward: Arc::new(forward), reverse: Arc::new(reverse) }
+        Self { forward: Arc::new(forward), reverse: Arc::new(reverse), ..Self::default() }
+    }
+
+    /// Adds the exact URI spellings of open documents without changing their canonical paths.
+    pub fn with_open_uri_ids(mut self, bindings: impl IntoIterator<Item = (Url, FileId)>) -> Self {
+        let mut open_uris = FxHashMap::default();
+        let mut open_urls: FxHashMap<FileId, Option<Url>> = FxHashMap::default();
+        for (uri, file_id) in bindings {
+            open_uris.insert(uri.clone(), file_id);
+            match open_urls.entry(file_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(uri));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+        self.open_uris = Arc::new(open_uris);
+        self.open_urls = Arc::new(
+            open_urls
+                .into_iter()
+                .filter_map(|(file_id, uri)| uri.map(|uri| (file_id, uri)))
+                .collect(),
+        );
+        self
     }
 
     pub fn file_id_for_url(&self, url: &Url) -> anyhow::Result<FileId> {
@@ -44,13 +86,18 @@ impl FrozenFilePaths {
         if !project_model::is_bsl_source_path(&path) {
             return Err(anyhow::anyhow!("File is not BSL, request unsupported: {}", url));
         }
-        self.forward
-            .get(&path)
+        self.open_uris
+            .get(url)
+            .or_else(|| self.forward.get(&path))
+            .or_else(|| self.forward.get(&crate::workspace::canonicalize_shared_path(&path)))
             .copied()
             .ok_or_else(|| anyhow::anyhow!("File not in frozen VFS snapshot: {}", url))
     }
 
     pub fn url_for_file_id(&self, file_id: FileId) -> anyhow::Result<Url> {
+        if let Some(url) = self.open_urls.get(&file_id) {
+            return Ok(url.clone());
+        }
         let path = self
             .reverse
             .get(&file_id)
@@ -182,5 +229,51 @@ mod tests {
 
         let frozen = FrozenFilePaths::freeze(&vfs);
         assert!(frozen.is_empty());
+    }
+
+    #[test]
+    fn shared_paths_include_disk_members_without_a_session_vfs_copy() {
+        let mut db = ide::RootDatabaseImpl::new();
+        let disk_path = crate::test_uri::file_path("tmp/closed.bsl");
+        let open_path = crate::test_uri::file_path("tmp/open.bsl");
+        let mut files = vfs::file_set::FileSet::new();
+        files.insert(FileId(4), VfsPath::new(disk_path.clone()));
+        files.insert(FileId(9), VfsPath::new(open_path.clone()));
+        db.set_source_root(base_db::BSL_SOURCE_ROOT, base_db::SourceRoot::new_local(files));
+        let frozen = FrozenFilePaths::freeze_database(&db);
+        assert_eq!(frozen.len(), 2);
+        let uri = Url::from_file_path(&disk_path).unwrap();
+        assert_eq!(frozen.file_id_for_url(&uri).unwrap(), FileId(4));
+        assert_eq!(frozen.url_for_file_id(FileId(4)).unwrap(), uri);
+        db.set_source_root(
+            base_db::BSL_SOURCE_ROOT,
+            base_db::SourceRoot::new_local(Default::default()),
+        );
+        assert_eq!(frozen.file_id_for_url(&uri).unwrap(), FileId(4));
+        assert!(FrozenFilePaths::freeze_database(&db).is_empty());
+    }
+
+    #[test]
+    fn shared_admission_open_uri_alias_resolves_to_canonical_file_id_and_path() {
+        let mut vfs = Vfs::new();
+        let path = crate::test_uri::file_path("tmp/Canonical/Module.bsl");
+        vfs.set_file_contents(VfsPath::new(path.clone()), Some(Arc::from("content")));
+        let file_id = vfs.file_id(&VfsPath::new(path.clone())).unwrap();
+        let alias_path = path.parent().unwrap().parent().unwrap().join("cANONICAL/mODULE.bSL");
+        let alias_uri = Url::from_file_path(alias_path).unwrap();
+
+        let frozen = FrozenFilePaths::freeze(&vfs);
+        assert!(frozen.file_id_for_url(&alias_uri).is_err());
+        let frozen = frozen.with_open_uri_ids([(alias_uri.clone(), file_id)]);
+        assert_eq!(frozen.file_id_for_url(&alias_uri).unwrap(), file_id);
+        assert_eq!(frozen.url_for_file_id(file_id).unwrap(), alias_uri);
+        assert_eq!(frozen.path_for_file_id(file_id), Some(path.as_path()));
+
+        let canonical_uri = Url::from_file_path(&path).unwrap();
+        let ambiguous = frozen
+            .with_open_uri_ids([(alias_uri.clone(), file_id), (canonical_uri.clone(), file_id)]);
+        assert_eq!(ambiguous.file_id_for_url(&alias_uri).unwrap(), file_id);
+        assert_eq!(ambiguous.url_for_file_id(file_id).unwrap(), canonical_uri);
+        assert_eq!(ambiguous.path_for_file_id(file_id), Some(path.as_path()));
     }
 }

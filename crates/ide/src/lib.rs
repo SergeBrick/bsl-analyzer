@@ -63,6 +63,7 @@ pub use ide_assists::{Assist, AssistId, SourceChange};
 pub use ide_db::base_db::Locale;
 pub use ide_db::metadata::{RootKind as WorkspaceRootKind, WorkspaceConfigsSnapshot};
 pub use ide_db::query_resolver::AcrossRootsQueryResolver;
+pub use ide_db::FairMutex;
 pub use ide_db::{
     CommonModuleBodies, GraphConfigCache, RootDatabase, RootDatabaseImpl, SymbolKind, TextRange,
 };

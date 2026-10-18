@@ -1,13 +1,17 @@
 //! Narrow native ACL adapter; allocation ownership follows the Win32 API.
 use std::{
-    fs, io,
-    os::windows::{ffi::OsStrExt, fs::MetadataExt},
+    fs::{self, File},
+    io,
+    os::windows::{ffi::OsStrExt, fs::MetadataExt, io::FromRawHandle},
     path::Path,
     ptr,
 };
 use win_security_identifier::{GetCurrentSid, SecurityIdentifier};
 use windows_sys::Win32::{
-    Foundation::{LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS},
+    Foundation::{
+        LocalFree, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE,
+        INVALID_HANDLE_VALUE,
+    },
     Security::{
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
@@ -18,7 +22,11 @@ use windows_sys::Win32::{
         ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED,
     },
-    Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT},
+    Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_ALWAYS, OPEN_EXISTING,
+    },
 };
 
 struct Descriptor(PSECURITY_DESCRIPTOR);
@@ -82,6 +90,41 @@ pub fn private_directory(path: &Path) -> io::Result<()> {
     }
     reject_reparse(&metadata)?;
     verify_private(path)
+}
+
+pub fn private_file(path: &Path, create: bool) -> io::Result<File> {
+    let descriptor = descriptor()?;
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains an interior NUL"));
+    }
+    wide.push(0);
+    let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
+    // Match std::fs::OpenOptions read/write, default sharing, and
+    // FILE_FLAG_OPEN_REPARSE_POINT while supplying the private creation ACL.
+    // The security descriptor is ignored by CreateFileW when opening an existing file.
+    // SAFETY: inputs remain alive for the synchronous call; the descriptor is OS-owned.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &security,
+            disposition,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned an owned valid handle; File takes ownership.
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 pub fn verify_private(path: &Path) -> io::Result<()> {
@@ -182,6 +225,12 @@ mod tests {
         let target = temp.path().join("target");
         private_directory(&target).unwrap();
         verify_private(&target).unwrap();
+        let nul_prefix = target.join("must-not-exist");
+        let mut nul_path = nul_prefix.as_os_str().to_os_string();
+        nul_path.push("\0suffix");
+        let error = private_file(std::path::Path::new(&nul_path), true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!nul_prefix.exists());
         let junction = temp.path().join("junction");
         fs::create_dir(&junction).unwrap();
         let target_text = target.canonicalize().unwrap().to_string_lossy().into_owned();

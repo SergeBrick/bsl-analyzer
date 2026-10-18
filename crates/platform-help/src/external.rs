@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::installed::LoadContext;
 use crate::package::{self, CorpusManifest, Slot, VerifiedCorpus};
+use sha2::{Digest, Sha256};
 
 /// A help corpus is tens of megabytes; far beyond that is not a corpus.
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
@@ -17,6 +18,31 @@ const MAX_MANIFEST: u64 = 1024 * 1024;
 /// never falls back to another URL's data.
 pub fn cache_dir_for(url: &str, context: &LoadContext) -> PathBuf {
     context.cache_dir.join("external").join(&package::sha256_hex(url.as_bytes())[..32])
+}
+
+/// Fingerprint the locally selected publication without loading its corpus.
+///
+/// The current pointer and bounded manifest identify the effective snapshot. A
+/// missing or unreadable cache returns None.
+pub fn snapshot_fingerprint(url: &str, context: &LoadContext) -> Option<[u8; 32]> {
+    let slot = cache_dir_for(url, context);
+    let name = std::fs::read_to_string(slot.join("current")).ok()?;
+    let name = name.trim();
+    if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let manifest_path = slot.join(name).join(package::MANIFEST_FILE_NAME);
+    let metadata = std::fs::metadata(&manifest_path).ok()?;
+    if metadata.len() > MAX_MANIFEST {
+        return None;
+    }
+    let manifest = std::fs::read(manifest_path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"platform-help-external-publication-v1\0");
+    hasher.update(name.as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(&manifest);
+    Some(hasher.finalize().into())
 }
 
 /// The package published at `url`, refreshed when the published manifest
@@ -161,7 +187,41 @@ fn same_publication(cached: &CorpusManifest, published: &CorpusManifest) -> bool
 
 #[cfg(test)]
 mod tests {
-    use super::scrubbed;
+    use super::{cache_dir_for, scrubbed, snapshot_fingerprint};
+    use crate::installed::LoadContext;
+
+    #[test]
+    fn snapshot_fingerprint_is_manifest_only_and_changes_on_same_path_publication() {
+        let cache = tempfile::tempdir().unwrap();
+        let context = LoadContext {
+            cache_dir: cache.path().to_path_buf(),
+            discovery_roots: Vec::new(),
+            platform_path_env: None,
+        };
+        let url = "https://help.example.test/manifest.json";
+        assert_eq!(snapshot_fingerprint(url, &context), None);
+
+        let slot = cache_dir_for(url, &context);
+        let publication = "a".repeat(64);
+        let package = slot.join(&publication);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(slot.join("current"), &publication).unwrap();
+        std::fs::write(
+            package.join(crate::package::MANIFEST_FILE_NAME),
+            br#"{"schema_version":1,"platform_version":"8.3.1","sha256":"one"}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("corpus.json"), b"corpus must not be read").unwrap();
+        let first = snapshot_fingerprint(url, &context).unwrap();
+
+        std::fs::write(
+            package.join(crate::package::MANIFEST_FILE_NAME),
+            br#"{"schema_version":1,"platform_version":"8.3.2","sha256":"two"}"#,
+        )
+        .unwrap();
+        let second = snapshot_fingerprint(url, &context).unwrap();
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn transport_messages_lose_secrets_in_any_spelling_of_the_url() {

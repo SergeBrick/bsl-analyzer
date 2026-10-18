@@ -556,14 +556,15 @@ mod tests {
             .with_lease(lease.clone());
         graph.ensure_first_build();
         // Settled, not merely ready: the publish pass checks ownership too, and one still
-        // running when the verdict is dropped below would pause admission on its own.
+        // running when the lease file is taken below would pause admission on its own.
         crate::graph::test_support::wait_settled(&graph);
+        // Keep the heartbeat from observing the deliberately held OS lock as Unknown and
+        // pausing the graph pool while the request-only checkout is being measured: every
+        // ownership check queues on the lifecycle lock for the whole window instead.
+        let mut verdict = lease.hold_lifecycle_lock_for_test();
         let held_lease = lease.hold_file_lock_for_test();
         std::fs::remove_file(lease_path).unwrap();
-        lease.invalidate_verdict_for_test();
-        // Every ownership check — the heartbeat's, a pass's — now queues on the lifecycle lock
-        // for the whole window instead of answering "unknown" and pausing admission.
-        let lifecycle = lease.hold_lifecycle_lock_for_test();
+        *verdict = None;
 
         // Taken off this thread: a descriptor that went to the lease would queue behind the
         // lock held here and never come back before the watchdog.
@@ -593,8 +594,8 @@ mod tests {
             })
         };
         let answered = answer.recv_timeout(crate::change_hub::test_support::STATE_CEILING);
-        drop(lifecycle);
         drop(held_lease);
+        drop(verdict);
         drop(finish_tx);
         // Answered before the join: a thread still stuck past the watchdog is left behind
         // rather than waited on without a bound.

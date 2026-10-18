@@ -5050,7 +5050,7 @@ mod tests {
         /// running before its thread starts, and the thread counts itself before it lets the
         /// mark go, so at any moment after the ask one of the two shows it.
         fn a_rebuild_was_asked_for(state: &DiagnosticsState) -> bool {
-            lock_recover(&state.inner).reload == ReloadState::Running
+            lock_inner(&state.inner).reload == ReloadState::Running
                 || state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst) > 0
         }
 
@@ -5337,7 +5337,7 @@ mod tests {
             wait_until("the rebuild the delivered edit asked for has run its course", || {
                 let _ = state.read(|_, _| ());
                 let started = state.rebuilds_started.load(std::sync::atomic::Ordering::SeqCst);
-                let reload = lock_recover(&state.inner).reload.clone();
+                let reload = lock_inner(&state.inner).reload.clone();
                 if started > 0 && reload == super::super::super::types::ReloadState::Idle {
                     Ok(())
                 } else {

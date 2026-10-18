@@ -2685,7 +2685,7 @@ mod tests {
     /// Move the recorded failure `by` into the past: the time a retry pause measures has passed,
     /// with no wait for it.
     fn shift_failure_back(state: &DiagnosticsState, by: Duration) {
-        let mut inner = lock_recover(&state.inner);
+        let mut inner = lock_inner(&state.inner);
         let at = inner.failed_at.expect("a failure is on record");
         inner.failed_at = Some(at.checked_sub(by).expect("the failure is younger than the clock"));
     }

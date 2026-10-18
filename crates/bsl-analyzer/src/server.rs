@@ -1150,6 +1150,29 @@ fn refresh_shared_readiness(state: &mut GlobalState) -> bool {
     first_ready_generation && state.vfs_done && state.shared_owner_generation.is_some()
 }
 
+/// Put back into the view the open documents the exclusions no longer cover, with the
+/// editor's buffer as their text: one taken out by an earlier exclusion and one opened while
+/// it was in force alike. Only didOpen otherwise puts a document into the view.
+fn readmit_shared_documents(state: &mut GlobalState) {
+    for uri in state.opened_document_uris() {
+        if crate::handlers::notification::is_excluded_document(state, &uri) {
+            continue;
+        }
+        if state.open_file_uri_ids.get(&uri).is_some_and(|id| state.open_files.contains(id)) {
+            continue;
+        }
+        let Some(text) = state.mem_docs.get(&uri) else { continue };
+        match state.vfs_file_for_url(&uri) {
+            Ok(file_id) => {
+                crate::handlers::notification::open_shared_document(state, &uri, file_id, &text)
+            }
+            Err(error) => {
+                tracing::warn!(%uri, %error, "cannot readmit a no longer excluded document")
+            }
+        }
+    }
+}
+
 pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Result<()> {
     use crate::global_state::Task;
 
@@ -1178,6 +1201,7 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                         }
                         crate::handlers::notification::withdraw_document_diagnostics(state, &uri);
                     }
+                    readmit_shared_documents(state);
                     if state.open_files.is_empty() {
                         state.analysis_host.take_view();
                         state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
@@ -6787,5 +6811,145 @@ mod tests {
         let chunk = current_chunk(&state, vec![]);
         handle_task(&mut state, chunk).unwrap();
         assert!(state.workspace_batch_plan.is_none(), "the sweep must finalize on the last chunk");
+    }
+
+    /// Rewrites the project config and waits until the owner has adopted it on a reconcile
+    /// pass, so that its accepted project does (or no longer does) exclude `path`. The owner
+    /// admits a change notice only while it is ready, so the notice is repeated until taken.
+    fn edit_owner_config(
+        owner: &mcp_server::WorkspaceHandle,
+        config: &std::path::Path,
+        text: &str,
+        path: &std::path::Path,
+        excluded: bool,
+    ) {
+        std::fs::write(config, text).expect("write project config");
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
+        let mut noticed = false;
+        loop {
+            if !noticed {
+                noticed = matches!(owner.request_analysis(), mcp_server::WorkspaceRead::Ready(_))
+                    && owner.notify_changed_path(config);
+            }
+            if let mcp_server::WorkspaceRead::Ready(project) = owner.project() {
+                let covers = project
+                    .source_exclusions()
+                    .respelled_under(&project.source_roots())
+                    .is_excluded_resolved(path);
+                if noticed && covers == excluded {
+                    return;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "owner did not adopt the config edit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Lifting `[source].exclude` while a document stays open puts the editor's buffer
+    /// back into the view, both for a document open before the exclusion and for one
+    /// opened while it was in force: edits made after that reach analysis.
+    #[test]
+    fn shared_reload_readmits_open_documents_the_exclusion_no_longer_covers() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        let config = root.path().join("bsl-analyzer.toml");
+        std::fs::write(&config, "[source]\nroot = \".\"\n").expect("write project config");
+        let hidden = root.path().join("Hidden");
+        std::fs::create_dir(&hidden).expect("create the directory to exclude");
+        let before = hidden.join("Before.bsl");
+        let during = hidden.join("During.bsl");
+        std::fs::write(&before, "Процедура ДискДо() КонецПроцедуры\n").expect("write source");
+        std::fs::write(&during, "Процедура ДискВо() КонецПроцедуры\n").expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        // Nothing in this session reads the owner's diagnostics, so a config edit is taken up
+        // only by its periodic reconcile; the shortest one the owner allows keeps the wait
+        // short. The interval is read once, when the owner is built.
+        let reconcile = std::env::var_os("BSL_MCP_RECONCILE_SECS");
+        std::env::set_var("BSL_MCP_RECONCILE_SECS", "5");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        );
+        match reconcile {
+            Some(value) => std::env::set_var("BSL_MCP_RECONCILE_SECS", value),
+            None => std::env::remove_var("BSL_MCP_RECONCILE_SECS"),
+        }
+        let backend = backend.expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        state.vfs_done = true;
+        state.adopt_shared_project(root.path().to_path_buf(), project);
+        let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
+            let uri = lsp_types::Url::from_file_path(path).unwrap();
+            crate::handlers::notification::handle_did_open(
+                state,
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "bsl".to_owned(),
+                        version: 1,
+                        text: text.to_owned(),
+                    },
+                },
+            )
+            .expect("open the document");
+            uri
+        };
+        let before_buffer = "Процедура БуферДо() КонецПроцедуры\n";
+        let during_buffer = "Процедура БуферВо() КонецПроцедуры\n";
+        let before_uri = open(&mut state, &before, before_buffer);
+        let before_id = crate::lsp::file_id(&state, &before_uri).expect("resolve the open URI");
+        assert!(state.open_files.contains(&before_id));
+
+        let excluding = "[source]\nroot = \".\"\nexclude = [\"Hidden\"]\n";
+        edit_owner_config(&owner, &config, excluding, &before, true);
+        handle_task(&mut state, Task::SharedWorkspaceChanged { generation: 0 }).unwrap();
+        assert!(!state.open_files.contains(&before_id), "the exclusion takes the document out");
+        let during_uri = open(&mut state, &during, during_buffer);
+
+        edit_owner_config(&owner, &config, "[source]\nroot = \".\"\n", &before, false);
+        handle_task(&mut state, Task::SharedWorkspaceChanged { generation: 0 }).unwrap();
+
+        for (uri, buffer) in [(&before_uri, before_buffer), (&during_uri, during_buffer)] {
+            let file_id = crate::lsp::file_id(&state, uri).expect("resolve the readmitted URI");
+            assert!(state.open_files.contains(&file_id), "{uri} is open again");
+            let analysis = state.analysis_host.view().expect("open editor view").analysis();
+            assert_eq!(&*analysis.file_text(file_id), buffer, "{uri} is analysed from its buffer");
+        }
+
+        let edited = "Процедура Правка() КонецПроцедуры\n";
+        crate::handlers::notification::handle_did_change(
+            &mut state,
+            lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    uri: before_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited.to_owned(),
+                }],
+            },
+        )
+        .expect("edit the readmitted document");
+        let analysis = state.analysis_host.view().expect("open editor view").analysis();
+        assert_eq!(&*analysis.file_text(before_id), edited, "a later edit reaches analysis");
+        drop(analysis);
+        drop(state);
+        drop(owner);
+        drop(backend);
     }
 }

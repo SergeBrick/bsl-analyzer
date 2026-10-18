@@ -205,6 +205,49 @@ pub fn schedule_diagnostics(state: &mut GlobalState, uri: &Url) {
     }
 }
 
+/// Put an editor buffer into the shared session's view as an open document, the
+/// view's text for `file_id` from then on.
+pub(crate) fn open_shared_document(
+    state: &mut GlobalState,
+    uri: &Url,
+    file_id: vfs::FileId,
+    text: &str,
+) {
+    let Some(owner) = state.analysis_host.owner().cloned() else { return };
+    state.open_file_uri_ids.insert(uri.clone(), file_id);
+    let start_seed = state.analysis_host.view().is_none();
+    state.analysis_host.prepare_view_for_open();
+    if start_seed {
+        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
+        state.shared_view_seeded = false;
+        state.shared_seed_queued = true;
+    }
+    state.update_diagnostics_config();
+    state.update_features_config();
+    let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
+    state.open_files.insert(file_id);
+    if let Some(view) = state.analysis_host.view_mut() {
+        view.open(file_id, path.clone(), Arc::from(text));
+    }
+    state.mark_shared_view_changed();
+    state.schedule_shared_seed();
+    let vfs_path = vfs::VfsPath::new(path);
+    let mut vfs = state.vfs.write();
+    vfs.set_file_contents(vfs_path, Some(Arc::from(text)));
+    let _ = vfs.take_changes();
+    drop(vfs);
+    state.vfs_done = matches!(
+        owner.readiness(),
+        mcp_server::WorkspaceReadiness::Ready { .. }
+            | mcp_server::WorkspaceReadiness::Frozen { .. }
+    ) && state.shared_view_seeded;
+    state.clear_batch_push_for(uri);
+    if state.vfs_done {
+        preload_dependencies(state, file_id);
+    }
+    schedule_diagnostics(state, uri);
+}
+
 pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParams) -> Result<()> {
     let _p = tracing::info_span!("handle_did_open", uri = %params.text_document.uri).entered();
     if !is_handled_uri(&params.text_document.uri) {
@@ -230,39 +273,8 @@ pub fn handle_did_open(state: &mut GlobalState, params: DidOpenTextDocumentParam
     }
 
     let file_id = state.vfs_file_for_url(&uri)?;
-    if let Some(owner) = state.analysis_host.owner().cloned() {
-        state.open_file_uri_ids.insert(uri.clone(), file_id);
-        let start_seed = state.analysis_host.view().is_none();
-        state.analysis_host.prepare_view_for_open();
-        if start_seed {
-            state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
-            state.shared_view_seeded = false;
-            state.shared_seed_queued = true;
-        }
-        state.update_diagnostics_config();
-        state.update_features_config();
-        let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
-        state.open_files.insert(file_id);
-        if let Some(view) = state.analysis_host.view_mut() {
-            view.open(file_id, path.clone(), Arc::from(text.as_str()));
-        }
-        state.mark_shared_view_changed();
-        state.schedule_shared_seed();
-        let vfs_path = vfs::VfsPath::new(path);
-        let mut vfs = state.vfs.write();
-        vfs.set_file_contents(vfs_path, Some(Arc::from(text.as_str())));
-        let _ = vfs.take_changes();
-        drop(vfs);
-        state.vfs_done = matches!(
-            owner.readiness(),
-            mcp_server::WorkspaceReadiness::Ready { .. }
-                | mcp_server::WorkspaceReadiness::Frozen { .. }
-        ) && state.shared_view_seeded;
-        state.clear_batch_push_for(&uri);
-        if state.vfs_done {
-            preload_dependencies(state, file_id);
-        }
-        schedule_diagnostics(state, &uri);
+    if state.analysis_host.is_shared() {
+        open_shared_document(state, &uri, file_id, &text);
         return Ok(());
     }
     // Mark open BEFORE process_changes so the edit is stored as a resident

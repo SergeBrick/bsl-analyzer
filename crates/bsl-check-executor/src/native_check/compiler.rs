@@ -297,7 +297,10 @@ fn create_native_log(path: &Path) -> Result<(), ProcessFailure> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "One Xvfb-wrapped Designer launch takes distinct process, deadline, output, and display inputs"
+)]
 #[cfg(target_os = "linux")]
 async fn run_designer_xvfb(
     wrapper: &Path,

@@ -8,7 +8,6 @@
 //! keeps them.
 
 use std::path::Path;
-use std::time::Duration;
 
 use mcp_server::{serve_stream, McpProfile, McpServer, SharedState, WorkspaceCacheLayout};
 use rmcp::model::CallToolRequestParams;
@@ -16,10 +15,6 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
-
-// Shared helpers for the gates in this binary; not every binary uses every one.
-#[allow(dead_code)]
-mod common;
 
 type Client = RunningService<RoleClient, ()>;
 
@@ -46,6 +41,10 @@ fn stage_workspace() -> TempDir {
 
 async fn workspace_client(root: &Path, warm: bool) -> Client {
     let state = SharedState::workspace(root.to_path_buf()).expect("valid workspace project");
+    state_client(state, warm).await
+}
+
+async fn state_client(state: SharedState, warm: bool) -> Client {
     if warm {
         state.warm_start();
     }
@@ -56,7 +55,8 @@ async fn workspace_client(root: &Path, warm: bool) -> Client {
 }
 
 async fn client_without_graph(root: &Path) -> (Client, std::fs::File) {
-    // Hold before construction: startup may otherwise publish before the first request.
+    // Hold the candidate-build lock before boot: the lease must remain free for startup,
+    // but no graph may finish until the test releases this lock.
     let project = mcp_server::project::at(root).unwrap();
     let cache_base = root
         .parent()
@@ -69,10 +69,12 @@ async fn client_without_graph(root: &Path) -> (Client, std::fs::File) {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(cache.lease_lock_path())
+        .open(cache.root().join("bsl-graph.replacement.lock"))
         .unwrap();
     lock.lock().unwrap();
-    (workspace_client(root, true).await, lock)
+    let state = SharedState::workspace_with_cache(root.to_path_buf(), cache)
+        .expect("valid workspace project with the held graph cache");
+    (state_client(state, true).await, lock)
 }
 
 fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -99,32 +101,22 @@ async fn resolve(client: &Client, query: &str) -> Value {
 }
 
 async fn wait_until_resident_is_ready(client: &Client) {
-    let mut deadline = common::Patience::new(
-        std::time::Duration::from_secs(180),
-        std::time::Duration::from_millis(100),
-    );
     loop {
         let status = call(client, "diagnostics", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {
             return;
         }
-        assert!(deadline.allows(), "the resident never became ready, last status {status}",);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
     }
 }
 
 async fn wait_until_graph_is_ready(client: &Client) {
-    let mut deadline = common::Patience::new(
-        std::time::Duration::from_secs(180),
-        std::time::Duration::from_millis(100),
-    );
     loop {
         let status = call(client, "graph", args(&[("action", Value::from("status"))])).await;
         if status["state"] == "ready" {
             return;
         }
-        assert!(deadline.allows(), "the graph never became ready, last status {status}",);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -172,7 +164,7 @@ fn provider_of(body: &Value, category: &str) -> Option<String> {
         .and_then(|c| c["provider"].as_str().map(str::to_owned))
 }
 
-/// И2. Dictionary providers answer while a held lease prevents graph publication.
+/// И2. Dictionary providers answer while a held build lock prevents graph publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn the_configuration_and_the_platform_answer_by_name() {
@@ -203,7 +195,7 @@ async fn the_configuration_and_the_platform_answer_by_name() {
     );
 }
 
-/// И3. An unconsulted graph is named; releasing the lease lets it answer.
+/// И3. An unconsulted graph is named; releasing the build lock lets it answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn every_source_is_named_before_and_after_the_graph_is_built() {
@@ -229,7 +221,7 @@ async fn every_source_is_named_before_and_after_the_graph_is_built() {
     );
 }
 
-/// И4. The same empty answer is partial under the held lease and complete after release.
+/// И4. The same empty answer is partial under the held build lock and complete after release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_list_says_whether_it_is_a_proven_zero() {
     let ws = stage_workspace();
@@ -240,6 +232,7 @@ async fn an_empty_list_says_whether_it_is_a_proven_zero() {
 
     let building = resolve(&client, ABSENT).await;
     assert!(candidates(&building).is_empty(), "{building}");
+    assert_eq!(provider_state(&building, "graph"), "not_ready", "{building}");
     assert!(
         reason_codes(&building).iter().any(|c| c == "index_building"),
         "an empty list while the graph builds must not read as complete: {building}",
@@ -265,7 +258,7 @@ async fn an_empty_list_says_whether_it_is_a_proven_zero() {
 /// would leave the list empty under either implementation, which is why the test that asked
 /// for one proved nothing.
 ///
-/// The held lease keeps the graph unavailable while the platform answers.
+/// The held build lock keeps the graph unavailable while the platform answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(not(corpus_contract), ignore = "corpus contract: needs the platform help corpus")]
 async fn a_resident_miss_is_answered_without_the_graph() {

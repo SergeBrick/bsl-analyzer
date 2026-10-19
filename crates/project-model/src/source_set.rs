@@ -176,8 +176,11 @@ fn partition_root(
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
-            !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
-                || !scope.prunes_dir(entry.path(), entry.path_is_symlink(), &mut resolved)
+            if entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink() {
+                !scope.prunes_dir(entry.path(), entry.path_is_symlink(), &mut resolved)
+            } else {
+                !scope.exclusions().excludes_walked_file(entry.path(), &mut resolved)
+            }
         });
     for entry in shallow {
         let entry = match entry {
@@ -447,6 +450,29 @@ mod tests {
         );
         assert!(empty.files.is_empty(), "an excluded walk root was restored");
         assert!(empty.clean(), "an intentionally empty source universe is valid");
+    }
+
+    /// A file at the top of a root is decided by the shallow pass, not by the deep walk of a
+    /// subtree, so an exclusion pattern naming it has to hold there too. The unscoped scan
+    /// finds the file, which is what tells an honoured pattern from one never consulted.
+    #[test]
+    fn a_pattern_leaves_out_a_file_at_the_top_of_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("root");
+        write(&root.join("Allowed.bsl"), "");
+        write(&root.join("Hidden.Queries.bsl"), "");
+        write(&root.join("nested/Kept.bsl"), "");
+        let excluded = ExcludedPaths::default().with_patterns(&root, ["*.Queries.bsl"]).unwrap();
+
+        let unscoped = SourceSet::scan(std::slice::from_ref(&root));
+        let scoped = SourceSet::scan_in_scope(std::slice::from_ref(&root), &[], &excluded);
+
+        assert_eq!(unscoped.files.len(), 3, "positive control: the file is there to be excluded");
+        assert_eq!(
+            walked_paths(&scoped),
+            [root.join("Allowed.bsl"), root.join("nested/Kept.bsl")],
+            "the shallow pass kept a top-level file that a pattern excludes"
+        );
     }
 
     #[cfg(unix)]

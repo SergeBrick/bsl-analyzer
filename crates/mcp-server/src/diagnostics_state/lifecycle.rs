@@ -11,8 +11,8 @@ use crate::change_hub::{Health, SinkCursor, WorkspaceChangeHub};
 use crate::graph::input::{db_for_files_lazy, ProjectSnapshot};
 
 use super::drift::{
-    compute_freshness, config_identity, config_identity_now, reconcile_interval, ScanCache,
-    DRIFT_CHECK_INTERVAL,
+    compute_freshness, config_identity, config_identity_now, config_identity_probe,
+    reconcile_interval, ScanCache, DRIFT_CHECK_INTERVAL,
 };
 use super::resident::{canonical_key, DiagnosticsResident, HoleOrigin, ResidentVfs};
 use super::types::{DiagnosticsStatus, ReloadState, ResidentOutcome, StatusReport, WatchReport};
@@ -646,13 +646,17 @@ impl DiagnosticsState {
             return false;
         }
         let Some(root) = self.workspace_root.as_deref() else { return false };
-        let identity_before = config_identity_now(root);
-        if crate::project::at(root).is_ok() {
+        // Live topology is re-derived on every call: an extension can vanish while
+        // bsl-analyzer.toml stays untouched, and only a fresh derivation sees that. The verdict
+        // and the identity come from that one derivation, so a valid project costs one per call.
+        let (identity_before, valid_before) = config_identity_probe(root);
+        if valid_before {
             return false;
         }
         // Do not latch an error based on a config that was being repaired while it was
         // parsed. The fingerprint is deliberately cheap and does not load source files.
-        if config_identity_now(root) != identity_before {
+        let (identity_after, valid_after) = config_identity_probe(root);
+        if valid_after || identity_after != identity_before {
             return false;
         }
 
@@ -1490,6 +1494,12 @@ impl DiagnosticsState {
         Self::build_resident_with_catalog(root, excluded, WorkspaceCatalog::new())
     }
 
+    /// Build synchronously for tests of the resident, independent of the loader lifecycle.
+    #[cfg(test)]
+    pub(super) fn build_resident_for_test(root: &Path) -> DiagnosticsResident {
+        Self::build_resident(root, &[]).unwrap().resident
+    }
+
     fn build_resident_with_catalog(
         root: &Path,
         excluded: &[PathBuf],
@@ -1567,9 +1577,9 @@ impl DiagnosticsState {
         let holes: HashMap<String, HoleOrigin> =
             unread.iter().map(|p| (canonical_key(p), HoleOrigin::Admitted)).collect();
 
-        // Pre-seed the VFS with the SAME FileIds the source root uses for each `.bsl`,
-        // in enumerate order, so the interner assigns id `i` to `files[i]`. The metadata
-        // bootstrap resolves common-module / service module back-links through
+        // The VFS already holds the SAME FileIds the source root uses for each `.bsl`
+        // (interned above from the catalog, so they are the catalog's, not the scan's).
+        // The metadata bootstrap resolves common-module / service module back-links through
         // `vfs.file_id(<Module.bsl>)`; without these ids present it drops them silently.
         // Bootstrap then allocates only the metadata-XML ids on top of this id space.
         // Runs AFTER every file is registered, so the unreadable ones already carry
@@ -1578,8 +1588,12 @@ impl DiagnosticsState {
         Self::hold_shared_test_gate("BSL_TEST_SHARED_METADATA_BOOTSTRAP_GATE");
         ide_host_core::bootstrap_metadata_substrate(&mut db, &vfs);
 
-        let mut by_path = HashMap::with_capacity(files.len());
-        for (file_id, path) in files {
+        // The catalog is shared with everything else this state registers, so it may
+        // already hold ids the scan's enumeration index does not match. The index has to
+        // carry the ids the source root was built with, or an edit's batch lands on another
+        // file's revision and the query keeps reading the stale one.
+        let mut by_path = HashMap::with_capacity(shared_files.len());
+        for (file_id, path) in &shared_files {
             let key = canonical_key(path);
             if holes.contains_key(&key) {
                 continue;
@@ -2177,6 +2191,67 @@ mod tests {
             initial_text,
             "repair requires a replacement owner and does not resume this one"
         );
+    }
+
+    /// The freeze gate runs ahead of every drift path, and on a valid, unchanged project it latches
+    /// nothing, so its probe is pure overhead. The gate is driven alone: `poll_drift` also runs a
+    /// scan throttled on the wall clock, and counting through it would measure the clock.
+    #[test]
+    fn freeze_gate_derives_the_project_at_most_once_per_call_on_a_valid_workspace() {
+        use crate::diagnostics_state::drift::config_identity_probes;
+
+        const CALLS: usize = 100;
+        let dir = tempfile::tempdir().unwrap();
+        sample_workspace(dir.path());
+        let state = DiagnosticsState::for_workspace(dir.path().to_path_buf())
+            .with_last_good_on_invalid(true);
+        let built =
+            DiagnosticsState::build_resident_with_catalog(dir.path(), &[], state.catalog.clone())
+                .unwrap();
+        state.publish_build_success(&mut lock_inner(&state.inner), built);
+
+        let derivations_before = crate::project::at_derivations();
+        let probes_before = config_identity_probes();
+        for _ in 0..CALLS {
+            assert!(!state.freeze_if_invalid_or_frozen());
+        }
+        let derivations = crate::project::at_derivations() - derivations_before;
+        let probes = config_identity_probes() - probes_before;
+
+        assert!(
+            derivations <= CALLS && probes <= CALLS,
+            "{CALLS} gate calls on a valid project ran {derivations} project derivations and \
+             {probes} config identity probes; the validity probe may cost at most one of each \
+             per call"
+        );
+    }
+
+    /// The config fingerprint sees only `bsl-analyzer.toml` and its neighbours, so a gate that
+    /// trusted it alone would keep serving after an extension vanished under an untouched config.
+    #[test]
+    fn freeze_latches_when_a_declared_extension_vanishes_with_the_config_untouched() {
+        use crate::diagnostics_state::test_support::workspace_with_an_outside_extension;
+
+        let (_dir, workspace, extension) = workspace_with_an_outside_extension();
+        let state =
+            DiagnosticsState::for_workspace(workspace.clone()).with_last_good_on_invalid(true);
+        let built =
+            DiagnosticsState::build_resident_with_catalog(&workspace, &[], state.catalog.clone())
+                .unwrap();
+        state.publish_build_success(&mut lock_inner(&state.inner), built);
+
+        assert!(!state.freeze_invalid_project(), "the fixture is valid, so nothing latches yet");
+
+        std::fs::remove_dir_all(&extension).unwrap();
+        assert!(
+            crate::project::at(&workspace).is_err(),
+            "the vanished extension must invalidate the live project, or the test proves nothing"
+        );
+        assert!(
+            state.freeze_invalid_project(),
+            "a vanished extension invalidates the project while bsl-analyzer.toml stays as it was"
+        );
+        assert!(state.had_invalid_configuration());
     }
 
     /// The sweeper parks between ticks, and the shutdown wakes it out of that park rather

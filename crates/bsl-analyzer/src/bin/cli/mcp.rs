@@ -10,7 +10,7 @@ use std::{
 
 use clap::{Args, Subcommand, ValueEnum};
 use process_record::ProcessRecordGuard;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 mod process_record;
 pub(crate) mod shared;
@@ -32,7 +32,7 @@ struct OnecConnectionConfig {
     check_executor: Option<CheckExecutorConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckExecutorConfig {
     program: PathBuf,

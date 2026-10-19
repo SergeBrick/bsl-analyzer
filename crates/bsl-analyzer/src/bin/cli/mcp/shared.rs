@@ -265,6 +265,28 @@ fn stamp_file_metadata(hasher: &mut blake3::Hasher, path: &Path) {
     }
 }
 
+/// Worker admission semaphores shared by every session of one daemon, so that
+/// `max_concurrent` bounds a connection rather than each session attached to it.
+#[derive(Default)]
+struct ExecutorSlots(std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Semaphore>>>);
+
+impl ExecutorSlots {
+    fn profile(
+        &self,
+        connection: &str,
+        executor: super::CheckExecutorConfig,
+    ) -> Result<mcp_server::CheckExecutorProfile> {
+        // The permit count is fixed when a semaphore is created, so a session that asks for a
+        // different `max_concurrent` gets its own semaphore instead of resizing a running one.
+        // Every other limit varies per session without splitting the connection's admission.
+        let key = format!("{connection}\0{}", executor.max_concurrent);
+        let mut profile = executor.into_profile()?;
+        let mut slots = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        profile.semaphore = slots.entry(key).or_insert(profile.semaphore).clone();
+        Ok(profile)
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct NativeContext {
     pub url: Option<String>,
@@ -275,10 +297,11 @@ pub(crate) struct NativeContext {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct NamedConnection {
-    url: String,
+    url: Option<String>,
     user: String,
     password: String,
     allow_execute: bool,
+    check_executor: Option<super::CheckExecutorConfig>,
 }
 
 impl NativeContext {
@@ -287,46 +310,73 @@ impl NativeContext {
         if let Some(path) = std::env::var_os("BSL_ONEC_CONNECTIONS_FILE") {
             let contents = std::fs::read_to_string(path)?;
             let config: super::OnecConnectionsFile = serde_json::from_str(&contents)?;
-            for (name, entry) in config.connections {
-                anyhow::ensure!(
-                    !name.trim().is_empty() && !entry.url.trim().is_empty(),
-                    "1C connection name and URL must not be empty"
-                );
-                let resolve = |key: &str| -> Result<String> {
-                    if key.is_empty() {
-                        Ok(String::new())
-                    } else {
-                        std::env::var(key)
-                            .with_context(|| format!("missing environment variable {key}"))
-                    }
-                };
-                context.named.insert(
-                    name,
-                    NamedConnection {
-                        url: entry.url,
-                        user: resolve(&entry.user_env)?,
-                        password: resolve(&entry.password_env)?,
-                        allow_execute: entry.allow_execute,
-                    },
-                );
-            }
+            context.add_named(config)?;
         }
         Ok(context)
     }
 
-    fn install(&self, config: &mut mcp_server::SessionConfig) {
+    fn add_named(&mut self, config: super::OnecConnectionsFile) -> Result<()> {
+        for (name, entry) in config.connections {
+            anyhow::ensure!(
+                !name.trim().is_empty()
+                    && entry.url.as_deref().is_none_or(|url| !url.trim().is_empty())
+                    && (entry.url.is_some() || entry.check_executor.is_some()),
+                "1C connection name must not be empty and needs url or check_executor"
+            );
+            if let Some(executor) = entry.check_executor.clone() {
+                executor.into_profile()?;
+            }
+            let resolve = |key: &str| -> Result<String> {
+                if key.is_empty() {
+                    Ok(String::new())
+                } else {
+                    std::env::var(key)
+                        .with_context(|| format!("missing environment variable {key}"))
+                }
+            };
+            let (user, password) = if entry.url.is_some() {
+                (resolve(&entry.user_env)?, resolve(&entry.password_env)?)
+            } else {
+                (String::new(), String::new())
+            };
+            self.named.insert(
+                name,
+                NamedConnection {
+                    url: entry.url,
+                    user,
+                    password,
+                    allow_execute: entry.allow_execute,
+                    check_executor: entry.check_executor,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn install(&self, config: &mut mcp_server::SessionConfig, slots: &ExecutorSlots) -> Result<()> {
         if let Some(url) = &self.url {
             config.set_onec_client(onec_client::Client::new(url, &self.user, &self.password));
         }
         for (name, native) in &self.named {
+            let client = native
+                .url
+                .as_ref()
+                .map(|url| onec_client::Client::new(url, &native.user, &native.password));
+            let executor = native
+                .check_executor
+                .clone()
+                .map(|executor| slots.profile(name, executor))
+                .transpose()?;
             config.add_onec_connection(
                 name.clone(),
-                mcp_server::OnecConnection::new(
-                    onec_client::Client::new(&native.url, &native.user, &native.password),
+                mcp_server::OnecConnection::with_optional_http(
+                    client,
                     native.allow_execute,
+                    executor,
                 ),
             );
         }
+        Ok(())
     }
 }
 
@@ -370,6 +420,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
         None
     };
     let epoch = mcp_server::broker::process_epoch();
+    let executor_slots = Arc::new(ExecutorSlots::default());
     let owner: Arc<tokio::sync::OnceCell<mcp_server::McpServer>> =
         Arc::new(tokio::sync::OnceCell::new());
     let markers_enabled = std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some();
@@ -387,6 +438,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
         let cache = cache.clone();
         let expected = expected.clone();
         let preset = preset.clone();
+        let executor_slots = executor_slots.clone();
         let retiring = retiring.clone();
         let epoch = epoch;
         if markers_enabled {
@@ -480,7 +532,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                         &context.native
                     };
                     let mut settings = mcp_server::SessionConfig::default();
-                    native.install(&mut settings);
+                    native.install(&mut settings, &executor_slots)?;
                     for tool in context.enable_tools {
                         settings.enable_tool(tool);
                     }
@@ -693,6 +745,78 @@ pub(crate) async fn write_lsp_message<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_only_connection_survives_the_session_context_round_trip() {
+        let config: super::super::OnecConnectionsFile = serde_json::from_str(
+            r#"{"connections":{"exec":{"check_executor":{"program":"/test/executor","args":["--a","b c"],"handles_snippet":true}}}}"#,
+        )
+        .unwrap();
+        let mut native = NativeContext::default();
+        native.add_named(config).unwrap();
+
+        let bytes = serde_json::to_vec(&McpContext { native, ..McpContext::default() }).unwrap();
+        let context: McpContext = serde_json::from_slice(&bytes).unwrap();
+        let mut settings = mcp_server::SessionConfig::default();
+        context.native.install(&mut settings, &ExecutorSlots::default()).unwrap();
+
+        let named = &context.native.named["exec"];
+        assert!(named.url.is_none(), "executor-only connection keeps no HTTP URL");
+        let executor = named.check_executor.clone().expect("executor profile crosses the wire");
+        let profile = executor.into_profile().unwrap();
+        assert_eq!(profile.program, std::path::PathBuf::from("/test/executor"));
+        assert_eq!(profile.args, ["--a", "b c"].map(std::ffi::OsString::from));
+        assert!(profile.handles_snippet);
+    }
+
+    #[test]
+    fn executor_semaphore_is_shared_by_sessions_of_one_connection() {
+        let config = || -> super::super::OnecConnectionsFile {
+            serde_json::from_str(
+                r#"{"connections":{"exec":{"check_executor":{"program":"/x","max_concurrent":1,"handles_snippet":true}}}}"#,
+            )
+            .unwrap()
+        };
+        let mut native = NativeContext::default();
+        native.add_named(config()).unwrap();
+        let slots = ExecutorSlots::default();
+        let executor = || native.named["exec"].check_executor.clone().unwrap();
+
+        let first = slots.profile("exec", executor()).unwrap();
+        let second = slots.profile("exec", executor()).unwrap();
+        let other_connection = slots.profile("other", executor()).unwrap();
+
+        assert!(Arc::ptr_eq(&first.semaphore, &second.semaphore));
+        assert!(!Arc::ptr_eq(&first.semaphore, &other_connection.semaphore));
+        let _held = first.semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(second.semaphore.available_permits(), 0, "the limit holds across sessions");
+    }
+
+    #[test]
+    fn executor_semaphore_ignores_limits_other_than_max_concurrent() {
+        let executor = |max_concurrent: usize,
+                        timeout_ms: u64|
+         -> super::super::CheckExecutorConfig {
+            serde_json::from_str(&format!(
+                r#"{{"program":"/x","max_concurrent":{max_concurrent},"timeout_ms":{timeout_ms},"handles_snippet":true}}"#
+            ))
+            .unwrap()
+        };
+        let slots = ExecutorSlots::default();
+        let first = slots.profile("exec", executor(1, 120_000)).unwrap();
+        let slower = slots.profile("exec", executor(1, 600_000)).unwrap();
+        let wider = slots.profile("exec", executor(2, 120_000)).unwrap();
+
+        assert!(Arc::ptr_eq(&first.semaphore, &slower.semaphore));
+        assert!(!Arc::ptr_eq(&first.semaphore, &wider.semaphore));
+    }
+
+    #[test]
+    fn named_connection_without_url_or_executor_is_rejected() {
+        let config: super::super::OnecConnectionsFile =
+            serde_json::from_str(r#"{"connections":{"empty":{}}}"#).unwrap();
+        assert!(NativeContext::default().add_named(config).is_err());
+    }
 
     #[test]
     fn shared_identity_changes_for_resolved_config_fields_outside_cache_scope() {

@@ -3168,6 +3168,7 @@ dependencies = [
  "bsl-metadata",
  "bsl-platform",
  "bsl-search",
+ "check-contract",
  "chrono",
  "dirs",
  "expect-test",

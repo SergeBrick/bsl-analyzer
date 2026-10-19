@@ -752,6 +752,13 @@ const WAITS: &[(&str, &str, &str, Waiting)] = &[
     // The request's own acquire, called off by the request's cancellation.
     ("tools/search/acquire.rs", "acquire_engine_within", "thread::sleep", Waiting::Request),
     ("tools/search/wait.rs", "await_reply", ".recv_timeout(", Waiting::Request),
+    // The check request waits under its own cancellation and absolute deadline; its stop path
+    // gives the process a bounded grace and reap window, while the background reaper owns the
+    // child until a successful wait proves it was collected.
+    ("tools/check_executor.rs", "execute", ".wait(", Waiting::Request),
+    ("tools/check_executor.rs", "stop_child", ".wait(", Waiting::Bounded),
+    ("tools/check_executor.rs", "stop_child", ".wait(", Waiting::Bounded),
+    ("tools/check_executor.rs", "reap_in_background", ".wait(", Waiting::OwnProtocol),
     // The admission itself: the queue wait and the head's poll, both refusing on the stop.
     ("tools/search/acquire.rs", "acquire_for_owner", "acquire_for_owner(", Waiting::Owner),
     ("tools/search/acquire.rs", "acquire_for_owner", "thread::sleep", Waiting::Owner),
@@ -861,6 +868,8 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
     assert_eq!(
         exempt,
         [
+            "check_executor_windows_tests.rs",
+            "check_executor_wire_tests.rs",
             "diagnostics_state/test_support.rs",
             "graph/build/vector_lifecycle_tests.rs",
             "graph/portable_workspace_graph_tests.rs",

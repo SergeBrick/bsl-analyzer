@@ -1639,6 +1639,49 @@ fn test_value_function_invalid_predefined_item_gets_unresolved_token() {
     );
 }
 
+/// The tokens `ЗНАЧЕНИЕ(Справочник.Валюты.<value>)` files as resolved and as unresolved
+/// against `catalog`.
+fn value_function_tokens(
+    catalog: bsl_metadata::MetadataObject,
+    value: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut config = bsl_metadata::Configuration::new("TestConfig");
+    config.add_metadata_object(catalog);
+    let code = format!(
+        "ВЫБРАТЬ 1 ИЗ Справочник.Валюты КАК Вал ГДЕ Вал.Ссылка = ЗНАЧЕНИЕ(Справочник.Валюты.{value})"
+    );
+    let ast = parser::parse_sdbl(&code);
+    let package = lower_sdbl_to_hir(&ast, Some(std::sync::Arc::new(config)));
+    let sm = &package.source_map;
+    (
+        sm.field_names.iter().map(|t| t.text.to_string()).collect(),
+        sm.unresolved_field_names.iter().map(|t| t.text.to_string()).collect(),
+    )
+}
+
+#[test]
+fn test_value_function_judges_a_read_empty_predefined_set() {
+    use bsl_metadata::{MdoType, MetadataObject};
+
+    let mut catalog = MetadataObject::new(MdoType::Catalog, "Валюты");
+    catalog.predefined_read = true;
+    let (_, unresolved) = value_function_tokens(catalog, "Нет");
+    assert!(unresolved.iter().any(|t| t == "Нет"), "got: {unresolved:?}");
+}
+
+#[test]
+fn test_value_function_leaves_an_unread_predefined_set_open() {
+    use bsl_metadata::{metadata_object::PredefinedItem, MdoType, MetadataObject};
+
+    let mut catalog = MetadataObject::new(MdoType::Catalog, "Валюты");
+    catalog.predefined_items =
+        vec![PredefinedItem { name: "Евро".to_string(), name_en: None, uuid: "1".to_string() }];
+    catalog.predefined_unread = true;
+    let (resolved, unresolved) = value_function_tokens(catalog, "Доллар");
+    assert!(resolved.iter().any(|t| t == "Доллар"), "got: {resolved:?}");
+    assert!(!unresolved.iter().any(|t| t == "Доллар"), "got: {unresolved:?}");
+}
+
 #[test]
 fn test_value_function_predefined_item_empty_list_graceful_degradation() {
     use bsl_metadata::{MdoType, MetadataObject};

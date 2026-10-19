@@ -1078,6 +1078,13 @@ impl MetadataObject {
         })
     }
 
+    /// Whether `predefined_items` is the object's whole predefined set, so a name it
+    /// lacks is not a predefined item: every layer was read, and the base either had its
+    /// file read or yielded items. Without the file the set is not known to be empty.
+    pub fn predefined_set_known(&self) -> bool {
+        !self.predefined_unread && (self.predefined_read || !self.predefined_items.is_empty())
+    }
+
     pub fn find_predefined_item(&self, name: &str) -> Option<&PredefinedItem> {
         self.predefined_items.iter().find(|pi| {
             stdx::case::eq_ignore_case(&pi.name, name)

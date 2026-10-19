@@ -149,9 +149,7 @@ pub(crate) fn closed_member_owner(
     let closed = mdo.object_belonging() != bsl_metadata::ObjectBelonging::Adopted
         && match kind {
             MdoType::Enum => true,
-            _ => {
-                !mdo.predefined_unread && (mdo.predefined_read || !mdo.predefined_items.is_empty())
-            }
+            _ => mdo.predefined_set_known(),
         };
     closed.then_some(mdo)
 }

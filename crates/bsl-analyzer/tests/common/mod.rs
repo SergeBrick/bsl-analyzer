@@ -120,6 +120,7 @@ pub struct Lsp {
     pub initialize_response: Value,
     stderr_output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_reader: Option<std::thread::JoinHandle<()>>,
+    protocol_errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// Server notifications sent during initialize are valid LSP traffic too; keep
     /// them for the test that owns the channel instead of eating them while waiting
     /// for the initialize response.
@@ -139,6 +140,19 @@ impl Lsp {
     /// capability-less client `start` has always used.
     pub fn start_with_capabilities(root: &Path, capabilities: Value) -> Self {
         Self::start_with_mode_and_capabilities(root, None, capabilities)
+    }
+
+    pub fn start_with_capabilities_and_log(
+        root: &Path,
+        capabilities: Value,
+        log: Option<&Path>,
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+        command.arg("lsp");
+        if let Some(log) = log {
+            command.env("BSL_LOG_FILE", log).env("BSL_LOG", "warn");
+        }
+        Self::start_command(command, root, capabilities, SILENCE)
     }
 
     pub fn start_stdio(root: &Path) -> Self {
@@ -194,6 +208,8 @@ impl Lsp {
             }
         });
         let (tx, messages) = mpsc::channel();
+        let protocol_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let errors = protocol_errors.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -208,6 +224,8 @@ impl Lsp {
                     }
                     if let Some(value) = header.strip_prefix("Content-Length:") {
                         length = value.trim().parse::<usize>().ok();
+                    } else if !header.starts_with("Content-Type:") {
+                        errors.lock().unwrap().push(header);
                     }
                 }
                 let Some(length) = length else { return };
@@ -215,10 +233,13 @@ impl Lsp {
                 if reader.read_exact(&mut body).is_err() {
                     return;
                 }
-                if let Ok(message) = serde_json::from_slice(&body) {
-                    if tx.send(message).is_err() {
-                        return;
+                match serde_json::from_slice(&body) {
+                    Ok(message) => {
+                        if tx.send(message).is_err() {
+                            return;
+                        }
                     }
+                    Err(error) => errors.lock().unwrap().push(error.to_string()),
                 }
             }
         });
@@ -229,6 +250,7 @@ impl Lsp {
             initialize_response: Value::Null,
             stderr_output,
             stderr_reader: Some(stderr_reader),
+            protocol_errors,
             pending: Default::default(),
             recent: Default::default(),
         };
@@ -268,6 +290,11 @@ impl Lsp {
         }
         lsp.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
         lsp
+    }
+
+    pub fn assert_protocol_clean(&self) {
+        let errors = self.protocol_errors.lock().unwrap();
+        assert!(errors.is_empty(), "unexpected LSP stdout: {errors:?}");
     }
 
     pub fn send(&mut self, message: Value) {

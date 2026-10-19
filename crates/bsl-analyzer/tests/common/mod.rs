@@ -16,12 +16,13 @@ use serde_json::{json, Value};
 
 pub const BROKEN: &str = "Процедура Тест(\n";
 
+/// How much of an LSP child's stderr [`Lsp::stderr_text`] keeps: the most recent bytes.
+pub const STDERR_TAIL: usize = 64 * 1024;
+
 /// Silence a server at rest is allowed before a wait is judged lost: a minute under
 /// `timing_contract`. An ordinary run does not judge a slow server by the clock — a server
 /// descheduled on a loaded machine is as quiet and as idle as a lost one — so there the window
 /// is the hang guard, far past any healthy answer (see [`test_utils::wait::hang_guard`]).
-/// How much of an LSP child's stderr [`Lsp::stderr_text`] keeps: the most recent bytes.
-pub const STDERR_TAIL: usize = 64 * 1024;
 pub const SILENCE: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 /// Total bound for one wait, even while unrelated messages keep arriving: ten minutes in

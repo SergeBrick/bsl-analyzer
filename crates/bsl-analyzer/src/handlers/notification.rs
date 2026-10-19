@@ -529,13 +529,16 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
         let mut caught_up = false;
         // A shared session keys open documents by canonical path, so another spelling of
         // this file (a symlinked directory) can still hold it open; that buffer then
-        // becomes the file's text instead of the file closing under it.
+        // becomes the file's text instead of the file closing under it. With several left,
+        // the least URI is taken so the choice does not follow hash order.
         let still_open = crate::lsp::file_id(state, &uri).ok().and_then(|file_id| {
             state
                 .open_file_uri_ids
                 .iter()
-                .find(|(other, id)| **other != uri && **id == file_id)
-                .and_then(|(other, _)| state.mem_docs.get(other))
+                .filter(|(other, id)| **other != uri && **id == file_id)
+                .map(|(other, _)| other)
+                .min()
+                .and_then(|other| state.mem_docs.get(other))
                 .map(|text| (file_id, Arc::<str>::from(text.as_str())))
         });
         if let Some((file_id, text)) = still_open {

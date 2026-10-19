@@ -266,6 +266,14 @@ impl RequestDispatcher<'_> {
             None
         };
         let Some(analysis) = serving else {
+            // A shared session without an editor view has no store holding the file a
+            // syntax request names, only its empty fallback.
+            let host = &self.global_state.analysis_host;
+            let while_loading = if host.is_shared() && host.view().is_none() {
+                WhileLoading::Decline
+            } else {
+                while_loading
+            };
             match while_loading {
                 WhileLoading::Decline => {
                     tracing::debug!(

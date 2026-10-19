@@ -1714,12 +1714,20 @@ fn queue_latency_retry(
 }
 
 fn finish_latency_request(state: &mut GlobalState, key: &RequestAttemptKey, response: Response) {
+    if close_latency_lifecycle(state, key) {
+        state.respond(response);
+    }
+}
+
+/// Retire the lifecycle of `key`'s attempt, or report that the attempt is no longer the
+/// current one and its terminal response is stale.
+fn close_latency_lifecycle(state: &mut GlobalState, key: &RequestAttemptKey) -> bool {
     let current = state.request_lifecycles.get(&key.id).is_some_and(|lifecycle| {
         lifecycle.generation == key.generation && lifecycle.attempt == key.attempt
     });
     if !current {
         tracing::debug!(request_id = ?key.id, generation = key.generation, attempt = key.attempt, "discarding stale terminal response");
-        return;
+        return false;
     }
 
     state
@@ -1744,7 +1752,7 @@ fn finish_latency_request(state: &mut GlobalState, key: &RequestAttemptKey, resp
         attempt = key.attempt,
         "finalized LSP request"
     );
-    state.respond(response);
+    true
 }
 
 pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<()> {
@@ -1823,8 +1831,10 @@ pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<(
                     "content modified".to_string(),
                 ),
             );
-        } else {
-            state.retry_dispatch = None;
+        } else if state.retry_dispatch.take().is_some() {
+            // The dispatcher answered without admitting the attempt (declined while loading
+            // or busy), so only its lifecycle is left to close.
+            close_latency_lifecycle(state, &key);
         }
     }
     Ok(())
@@ -4991,6 +5001,34 @@ mod tests {
         state.request_lifecycles.remove(&unopened_id);
     }
 
+    /// A queued retry the dispatcher declines before admitting it — here because the
+    /// workspace is loading again — is answered by the decline, and its lifecycle must close
+    /// with it: a lifecycle left behind counts against the shared admission bound forever.
+    #[test]
+    fn a_retry_declined_before_admission_closes_its_lifecycle() {
+        let (_root, mut state, client_receiver, _task_receiver, retry, _active_token) =
+            g1_session_boundary_state(lsp_server::RequestId::from(7420));
+        while client_receiver.try_recv().is_ok() {}
+        state.vfs_done = false;
+
+        admit_pending_latency_retries(&mut state).unwrap();
+
+        let response = std::iter::from_fn(|| client_receiver.try_recv().ok())
+            .find_map(|message| match message {
+                Message::Response(response) if response.id == retry.id => Some(response),
+                _ => None,
+            })
+            .expect("the declined retry is answered");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32)
+        );
+        assert!(
+            !state.request_lifecycles.contains_key(&retry.id),
+            "the declined retry closes its lifecycle"
+        );
+    }
+
     #[test]
     fn g1_shutdown_branch_does_not_admit_valid_queued_retry_and_cleans_session() {
         g1_with_tracing(|| {
@@ -7163,9 +7201,10 @@ mod tests {
         });
     }
 
-    /// Two spellings of one file — through a symlinked directory — share one canonical
-    /// file in a shared session. Closing one must leave the file open for the other and
-    /// analysed from that other buffer, not from disk.
+    /// Spellings of one file through symlinked directories share one canonical file in a
+    /// shared session. Closing one must leave the file open for the others and analysed from
+    /// one of their buffers, not from disk — the same one on every run, which the input
+    /// tells apart by giving each of the two remaining spellings a different buffer.
     #[cfg(unix)]
     #[test]
     fn closing_one_spelling_of_a_shared_file_keeps_it_open_for_the_other() {
@@ -7176,8 +7215,10 @@ mod tests {
         std::fs::create_dir(&source).expect("create source root");
         let module = source.join("Module.bsl");
         std::fs::write(&module, "Процедура Диск() КонецПроцедуры\n").expect("write source");
-        std::os::unix::fs::symlink(&source, root.path().join("alias"))
-            .expect("link the source directory");
+        for alias in ["alias", "zalias"] {
+            std::os::unix::fs::symlink(&source, root.path().join(alias))
+                .expect("link the source directory");
+        }
 
         let project = mcp_server::project::at(root.path()).expect("load test workspace project");
         let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
@@ -7200,8 +7241,7 @@ mod tests {
         let mut state = GlobalState::new_shared(sender, owner.clone());
         state.vfs_done = true;
         apply_shared_project(&mut state, root.path().to_path_buf(), project);
-        let buffer = "Процедура Буфер() КонецПроцедуры\n";
-        let open = |state: &mut GlobalState, path: &std::path::Path| {
+        let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
             let uri = lsp_types::Url::from_file_path(path).unwrap();
             crate::handlers::notification::handle_did_open(
                 state,
@@ -7210,33 +7250,45 @@ mod tests {
                         uri: uri.clone(),
                         language_id: "bsl".to_owned(),
                         version: 1,
-                        text: buffer.to_owned(),
+                        text: text.to_owned(),
                     },
                 },
             )
             .expect("open the document");
             uri
         };
-        let real = open(&mut state, &module);
-        let alias = open(&mut state, &root.path().join("alias/Module.bsl"));
-        let file_id = crate::lsp::file_id(&state, &real).expect("resolve the real spelling");
-        assert_eq!(
-            crate::lsp::file_id(&state, &alias).ok(),
-            Some(file_id),
-            "both spellings resolve to one shared file"
+        let real = open(&mut state, &module, "Процедура Исходник() КонецПроцедуры\n");
+        let alias_buffer = "Процедура Псевдоним() КонецПроцедуры\n";
+        let alias = open(&mut state, &root.path().join("alias/Module.bsl"), alias_buffer);
+        let closed = open(
+            &mut state,
+            &root.path().join("zalias/Module.bsl"),
+            "Процедура Последний() КонецПроцедуры\n",
         );
+        let file_id = crate::lsp::file_id(&state, &real).expect("resolve the real spelling");
+        for spelling in [&alias, &closed] {
+            assert_eq!(
+                crate::lsp::file_id(&state, spelling).ok(),
+                Some(file_id),
+                "every spelling resolves to one shared file"
+            );
+        }
 
         crate::handlers::notification::handle_did_close(
             &mut state,
             lsp_types::DidCloseTextDocumentParams {
-                text_document: lsp_types::TextDocumentIdentifier { uri: alias },
+                text_document: lsp_types::TextDocumentIdentifier { uri: closed },
             },
         )
-        .expect("close the alias spelling");
+        .expect("close one spelling");
 
-        assert!(state.open_files.contains(&file_id), "the real spelling keeps the file open");
+        assert!(state.open_files.contains(&file_id), "the other spellings keep the file open");
         let analysis = state.analysis_host.view().expect("open editor view").analysis();
-        assert_eq!(&*analysis.file_text(file_id), buffer, "the file is analysed from the buffer");
+        assert_eq!(
+            &*analysis.file_text(file_id),
+            alias_buffer,
+            "the file is analysed from the remaining buffer with the least URI"
+        );
         drop(analysis);
         drop(state);
         drop(owner);
@@ -7276,6 +7328,42 @@ mod tests {
             Some(lsp_server::ErrorCode::ContentModified as i32),
             "the request is declined, not answered from an empty store: {:?}",
             response.result
+        );
+    }
+
+    /// A syntax request is answered inline while loading from the store holding its file.
+    /// A shared session without an editor view has no such store — its fallback is empty —
+    /// so the request is declined as not ready instead of failing on a missing file.
+    #[test]
+    fn a_view_less_shared_syntax_request_is_declined_while_not_ready() {
+        let backend = mcp_server::SharedState::shared();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, backend.workspace_handle());
+        state.vfs_done = true;
+        let root = tempfile::tempdir().expect("create workspace");
+        let uri = lsp_types::Url::from_file_path(root.path().join("Module.bsl")).unwrap();
+
+        handle_request(
+            &mut state,
+            Request::new(
+                1.into(),
+                lsp_types::request::DocumentSymbolRequest::METHOD.to_string(),
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            ),
+        )
+        .unwrap();
+
+        let response = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|message| match message {
+                Message::Response(response) if response.id == 1.into() => Some(response),
+                _ => None,
+            })
+            .expect("the request is answered at dispatch");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "declined as not ready: {:?}",
+            response.error
         );
     }
 

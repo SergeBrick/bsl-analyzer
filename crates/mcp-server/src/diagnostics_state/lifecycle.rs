@@ -1567,9 +1567,9 @@ impl DiagnosticsState {
         let holes: HashMap<String, HoleOrigin> =
             unread.iter().map(|p| (canonical_key(p), HoleOrigin::Admitted)).collect();
 
-        // Pre-seed the VFS with the SAME FileIds the source root uses for each `.bsl`,
-        // in enumerate order, so the interner assigns id `i` to `files[i]`. The metadata
-        // bootstrap resolves common-module / service module back-links through
+        // The VFS already holds the SAME FileIds the source root uses for each `.bsl`
+        // (interned above from the catalog, so they are the catalog's, not the scan's).
+        // The metadata bootstrap resolves common-module / service module back-links through
         // `vfs.file_id(<Module.bsl>)`; without these ids present it drops them silently.
         // Bootstrap then allocates only the metadata-XML ids on top of this id space.
         // Runs AFTER every file is registered, so the unreadable ones already carry
@@ -1578,8 +1578,12 @@ impl DiagnosticsState {
         Self::hold_shared_test_gate("BSL_TEST_SHARED_METADATA_BOOTSTRAP_GATE");
         ide_host_core::bootstrap_metadata_substrate(&mut db, &vfs);
 
-        let mut by_path = HashMap::with_capacity(files.len());
-        for (file_id, path) in files {
+        // The catalog is shared with everything else this state registers, so it may
+        // already hold ids the scan's enumeration index does not match. The index has to
+        // carry the ids the source root was built with, or an edit's batch lands on another
+        // file's revision and the query keeps reading the stale one.
+        let mut by_path = HashMap::with_capacity(shared_files.len());
+        for (file_id, path) in &shared_files {
             let key = canonical_key(path);
             if holes.contains_key(&key) {
                 continue;

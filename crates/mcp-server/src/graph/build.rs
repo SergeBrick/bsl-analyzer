@@ -4163,7 +4163,9 @@ mod tests {
             tracing_subscriber::registry().with(Capture(records.clone())),
             || graph.run_load(false),
         );
-        let records = std::sync::Arc::try_unwrap(records).unwrap().into_inner().unwrap();
+        // tracing-core briefly upgrades every registered dispatcher while another test thread
+        // registers a callsite, so the subscriber may still be shared here; take the records.
+        let records = std::mem::take(&mut *records.lock().unwrap());
         let terminal = records
             .iter()
             .find(|record| record["kind"] == "mutation_summary" && record["outcome"] == "failed")
@@ -4253,7 +4255,9 @@ mod tests {
             tracing_subscriber::registry().with(Capture(records.clone())),
             || graph.run_load(true),
         );
-        let records = std::sync::Arc::try_unwrap(records).unwrap().into_inner().unwrap();
+        // tracing-core briefly upgrades every registered dispatcher while another test thread
+        // registers a callsite, so the subscriber may still be shared here; take the records.
+        let records = std::mem::take(&mut *records.lock().unwrap());
 
         assert_eq!(hook_calls.load(Ordering::SeqCst), 1, "the failed candidate is not retried");
         assert_eq!(publication_base(&db).unwrap(), base);

@@ -40,6 +40,15 @@ pub fn apply_ordinary_forms_setting(
     }
 }
 
+/// The `ordinaryAppSupport` the diagnostics rules of `project` end up with: the
+/// `[diagnostics]` setting, else the value derived from `<DefaultRunMode>`
+/// ([`project_model::Project::diagnostics_rules_json`]). A section the diagnostics
+/// loader rejects falls back to its defaults as a whole, so it gives `false` here too.
+pub fn effective_ordinary_app_support(project: &project_model::Project) -> bool {
+    serde_json::from_value::<ide::DiagnosticsConfig>(project.diagnostics_rules_json())
+        .is_ok_and(|config| config.ordinary_app_support)
+}
+
 /// Owns the resident Salsa database and produces cheap [`Analysis`] snapshots over
 /// cloned handles (the clone shares the Salsa storage / LRU cache).
 #[derive(Default)]

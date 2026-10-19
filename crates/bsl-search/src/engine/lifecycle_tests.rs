@@ -119,7 +119,10 @@ fn capture_level(level: tracing::level_filters::LevelFilter, f: impl FnOnce()) -
         tracing_subscriber::registry().with(Capture(records.clone()).with_filter(level)),
         f,
     );
-    Arc::try_unwrap(records).unwrap().into_inner().unwrap()
+    // tracing-core briefly upgrades every registered dispatcher while another test thread
+    // registers a callsite, so the subscriber may still be shared here; take the records.
+    let taken = std::mem::take(&mut *records.lock().unwrap());
+    taken
 }
 
 /// Read one complete JSON HTTP request using its declared Content-Length. Returning

@@ -239,8 +239,10 @@ pub struct EnvOptions {
     /// platform data is the least reliable.
     pub client_environments: EnvFlags,
     /// Whether the legacy thick client (ordinary application) is part of the
-    /// project's runtime surface. Mirrors the diagnostics-level
-    /// `ordinary_app_support` setting.
+    /// project's runtime surface. The same effective value as the
+    /// diagnostics-level `ordinary_app_support` (the setting, else the main
+    /// configuration's `DefaultRunMode`); naming the legacy thick client in
+    /// `checked_environments` also turns it on.
     pub ordinary_app_support: bool,
     /// Environments availability diagnostics report on. Server-side modules
     /// formally compile into the external connection too, but flagging every

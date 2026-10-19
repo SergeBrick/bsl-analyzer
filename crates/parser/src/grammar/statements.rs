@@ -66,6 +66,11 @@ pub fn statement(p: &mut Parser) -> bool {
         // one, when the statement ended inside it — a literal whose closing
         // line was inserted takes its `;` along.
         Some(T![PreEndInsert]) if p.inline_insert_open() => p.bump_inline_insert_marker(),
+        // The end of the branch read of a torn conditional group, where the
+        // statements of that branch end.
+        Some(T![PreElsIf] | T![PreElse] | T![PreEndIf]) if p.at_torn_if_end() => {
+            super::torn_preprocessor_if_end(p)
+        }
         _ => {
             if p.current().is_some() {
                 let m = p.start();

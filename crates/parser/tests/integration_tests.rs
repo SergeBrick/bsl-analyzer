@@ -607,9 +607,9 @@ fn test_preprocessor_not_without_parens() {
 
 #[test]
 fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
-    // A directive inside a condition is still an error, but recovery must not
-    // take its `#Если` alone: the `#КонецЕсли` left over would close the
-    // module-level region before the procedure that follows.
+    // A directive inside a condition must not leave its `#КонецЕсли` to the
+    // region around it: that would close the module-level region before the
+    // procedure that follows.
     let input = r#"#Если Не ТонкийКлиент И Не ВебКлиент Тогда
 Функция Первая()
     Если Ложь
@@ -626,7 +626,9 @@ fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
 КонецПроцедуры
 #КонецЕсли
 "#;
-    let root = parse(input).syntax_node();
+    let parsed = parse(input);
+    assert!(!parsed.has_errors(), "{:?}", parsed.errors());
+    let root = parsed.syntax_node();
     let regions: Vec<_> = root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
     assert_eq!(regions.len(), 1, "one module-level region: {regions:?}");
     let region = &regions[0];
@@ -639,8 +641,12 @@ fn test_preprocessor_if_torn_into_expression_keeps_enclosing_region() {
         region.descendants().any(|n| n.kind() == SyntaxKind::PROCEDURE_DEF),
         "the procedure after the torn condition stays inside the region"
     );
+    // The directive in the condition tears it apart and is read as one
+    // variant: its lines are opaque parts around the branch read, not a block.
     let nested = region.descendants().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).count() - 1;
-    assert_eq!(nested, 1, "the directive in the condition is a block of its own");
+    assert_eq!(nested, 0, "the directive in the condition is not a structured block");
+    let parts = region.descendants().filter(|n| n.kind() == SyntaxKind::PRE_TORN_IF_PART).count();
+    assert_eq!(parts, 2, "its `#Если` line and its `#КонецЕсли` line");
 }
 
 #[test]
@@ -687,9 +693,11 @@ fn test_preprocessor_if_crossing_an_else_if_keeps_enclosing_region() {
 }
 
 #[test]
-fn test_preprocessor_if_unclosed_in_method_keeps_enclosing_closer() {
-    // A block left open at the end of a method is an error, but the
-    // `#КонецЕсли` right after the method still closes the module-level region.
+fn test_preprocessor_if_unclosed_in_method_leaves_the_outer_region_unclosed() {
+    // The preprocessor pairs directives by text: the only `#КонецЕсли` here
+    // belongs to the nearest `#Если`, the one inside the method, so the region
+    // around the method is the block left without a closer, and it runs to the
+    // end of the module.
     let bodies = [
         "#Если Клиент Тогда\n    Х = 1;",
         "Если Х Тогда\n#Если Клиент Тогда\nИначеЕсли Й Тогда\nКонецЕсли;",
@@ -699,11 +707,41 @@ fn test_preprocessor_if_unclosed_in_method_keeps_enclosing_closer() {
         for body in bodies {
             let region = format!("#Если Сервер Тогда\n{head}\n{body}\n{tail}\n#КонецЕсли");
             let input = format!("{region}\nПроцедура Б()\nКонецПроцедуры\n");
-            let root = parse(&input).syntax_node();
+            let parse = parse(&input);
+            let root = parse.syntax_node();
             let regions: Vec<_> =
                 root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
             assert_eq!(regions.len(), 1, "{input}: {regions:?}");
-            assert_eq!(regions[0].text().to_string(), region, "the region ends at its #КонецЕсли");
+            assert_eq!(
+                regions[0].text().to_string(),
+                input.trim_end(),
+                "the region runs to the module end"
+            );
+            let errors = parse.errors();
+            assert_eq!(errors.len(), 1, "{input}: only the missing closer: {errors:?}");
+            let range = errors[0].range();
+            assert_eq!(range.start(), range.end(), "{input}: at the end");
+            assert_eq!(usize::from(range.end()), input.len(), "{input}: at the end");
+        }
+    }
+}
+
+#[test]
+fn test_preprocessor_if_crossed_by_a_loop_closer_survives_a_method_after_the_crossing() {
+    // The loop closer ends the block's content, and a method stands between
+    // that closer and the block's `#Иначе`/`#ИначеЕсли`. The method must hand
+    // the block back: the diagnostics are the ones the text gives without the
+    // method.
+    for tail in ["#Иначе\n", "#ИначеЕсли С Тогда\n#Иначе\n"] {
+        for (head, end) in [("Процедура Б()", "КонецПроцедуры"), ("Функция Б()", "КонецФункции")]
+        {
+            let method = format!("{head}\n{end}\n");
+            let plain = format!("Пока Х Цикл\n#Если К Тогда\nКонецЦикла;\nКонецЦикла;\n{tail}");
+            let with_method =
+                format!("Пока Х Цикл\n#Если К Тогда\nКонецЦикла;\n{method}КонецЦикла;\n{tail}");
+            let (plain_errors, method_errors) =
+                (parse(&plain).errors().len(), parse(&with_method).errors().len());
+            assert_eq!(method_errors, plain_errors, "{with_method}");
         }
     }
 }

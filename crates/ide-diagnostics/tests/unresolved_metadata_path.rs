@@ -604,6 +604,31 @@ fn predefined_items_that_cannot_be_read_are_not_judged() {
 }
 
 #[test]
+fn a_catalog_without_predefined_items_file_is_not_judged() {
+    let source = r#"
+Процедура Тест() Экспорт
+    З = ПредопределенноеЗначение("Справочник.Товары.Нет");
+КонецПроцедуры
+"#;
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let cf = dir.path().join("cf");
+    write_configuration(&cf);
+    let judged = |cf: &Path| {
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf.to_path_buf())],
+            None,
+            "cf/CommonModules/Тест/Ext/Module.bsl",
+            source,
+        )
+    };
+    assert_eq!(judged(&cf).len(), 1, "with Predefined.xml the item set is known");
+    std::fs::remove_file(cf.join("Catalogs/Товары/Ext/Predefined.xml"))
+        .expect("remove predefined items");
+    assert_eq!(judged(&cf), Vec::<String>::new());
+}
+
+#[test]
 fn predefined_items_whose_file_is_not_text_are_not_judged() {
     let source = r#"
 Процедура Тест() Экспорт

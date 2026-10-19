@@ -149,8 +149,9 @@ fn object_missing(
 }
 
 /// The same membership `Перечисления.Цвета.Красный` is judged by
-/// ([`crate::manager_lookup::lookup_predefined`]), plus the empty reference every one of
-/// these kinds has without declaring it.
+/// ([`crate::manager_lookup::lookup_predefined`]) over the same closed set
+/// ([`crate::manager_lookup::closed_member_owner`]), plus the empty reference every one
+/// of these kinds has without declaring it.
 fn predefined_value_missing(
     resolver: &dyn ObjectResolver,
     kind: MdoType,
@@ -160,19 +161,10 @@ fn predefined_value_missing(
     if matches!(value.fold_lower().as_str(), "пустаяссылка" | "emptyref") {
         return None;
     }
-    let mdo = resolver.resolve_metadata_object(kind, owner)?;
+    let mdo = crate::manager_lookup::closed_member_owner(resolver, kind, owner)?;
     let found = match kind {
         MdoType::Enum => mdo.find_enum_value(value).is_some(),
-        MdoType::Catalog
-        | MdoType::ChartOfAccounts
-        | MdoType::ChartOfCharacteristicTypes
-        | MdoType::ChartOfCalculationTypes => {
-            if mdo.predefined_unread {
-                return None;
-            }
-            mdo.find_predefined_item(value).is_some()
-        }
-        _ => return None,
+        _ => mdo.find_predefined_item(value).is_some(),
     };
     (!found).then(|| MissingMetadata::PredefinedValue {
         kind,

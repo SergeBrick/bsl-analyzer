@@ -47,6 +47,10 @@ English spellings (`Type("CatalogRef.Товары")`, `PredefinedValue("Enum.Ц�
   over;
 - the object or the value is added by another extension of the workspace: the module
   does not see it, but every extension of the infobase is applied when the call runs;
+- the value of a catalog or a chart whose predefined items were not read (no
+  `Ext/Predefined.xml`, or one that does not parse, in the configuration or in an
+  extension), and the value of an object adopted by an extension whose main
+  configuration is not visible: the full set of values is unknown;
 - the call sits in an `#If` branch no environment of the method compiles, or in a
   common module with no environments set.
 

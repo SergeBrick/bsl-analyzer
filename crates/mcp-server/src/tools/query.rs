@@ -110,10 +110,20 @@ fn validate_parameters(
     // refuse a request that omitting the field would have served.
     match connection.filter(|name| !name.is_empty()) {
         Some(name) => {
-            state.onec_connection(Some(name)).map_err(|e| McpError::invalid_params(e, None))?;
+            let selected =
+                state.onec_connection(Some(name)).map_err(|e| McpError::invalid_params(e, None))?;
+            if selected.http_client().is_none() {
+                return Err(McpError::invalid_params(
+                    format!("1C connection '{name}' has no HTTP backend for the platform check"),
+                    None,
+                ));
+            }
             Ok(Some(name.to_string()))
         }
-        None => Ok(state.onec_connection(None).ok().map(|_| String::new())),
+        None => Ok(state
+            .onec_connection(None)
+            .ok()
+            .and_then(|selected| selected.http_client().map(|_| String::new()))),
     }
 }
 
@@ -256,7 +266,10 @@ async fn platform_block(state: &SharedState, connection: &str, query: &str) -> P
     };
 
     let request = onec_client::ValidateQueryRequest { query: query.to_string() };
-    match selected.client().validate_query(&request).await {
+    let Some(client) = selected.http_client() else {
+        return PlatformBlock { valid: None, errors: Vec::new(), error: None };
+    };
+    match client.validate_query(&request).await {
         Ok(result) => {
             PlatformBlock { valid: Some(result.valid), errors: result.errors, error: None }
         }
@@ -538,6 +551,9 @@ pub async fn execute_query(
     let selected = state
         .onec_connection(connection.filter(|name| !name.is_empty()))
         .map_err(|e| McpError::invalid_params(e, None))?;
+    let client = selected
+        .http_client()
+        .ok_or_else(|| McpError::invalid_params("This 1C connection has no HTTP backend", None))?;
 
     if query.trim().is_empty() {
         return Err(McpError::invalid_params("Пустой запрос", None));
@@ -555,7 +571,7 @@ pub async fn execute_query(
         parameters: parameters.unwrap_or_default(),
     };
 
-    let result = selected.client().execute_query(&request).await.map_err(|e| {
+    let result = client.execute_query(&request).await.map_err(|e| {
         McpError::internal_error(format!("Ошибка выполнения запроса в 1С: {e}"), None)
     })?;
 
@@ -631,6 +647,21 @@ mod tests {
 
     fn extract_text(result: &CallToolResult) -> &str {
         result.content[0].as_text().expect("expected text content").text.as_str()
+    }
+
+    #[test]
+    fn an_explicitly_named_connection_without_http_is_refused_not_degraded() {
+        let mut state = test_shared_state();
+        state.add_onec_connection(
+            "exec".to_owned(),
+            crate::state::OnecConnection::with_optional_http(None, false, None),
+        );
+
+        let named = validate_parameters(&state, "ВЫБРАТЬ 1", None, Some("exec"));
+        assert!(named.is_err(), "a named connection that cannot run the platform check is refused");
+
+        let unnamed = validate_parameters(&state, "ВЫБРАТЬ 1", None, None);
+        assert_eq!(unnamed.unwrap(), None, "an unnamed request just has no platform block");
     }
 
     #[test]

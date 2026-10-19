@@ -2148,20 +2148,75 @@ impl<'db> InferenceContext<'db> {
         receiver_expr: ExprId,
         field: &hir_def::Name,
     ) -> bool {
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
+            crate::field_lookup::is_closed_metadata_description(self.db, ty)
+                && self.lacks_field(ty, field)
+        })
+    }
+
+    /// True when `receiver_expr` holds, on every path reaching it, a platform object whose
+    /// member surface the curated overlays attest as complete, and none of those objects has
+    /// `field`.
+    ///
+    /// The attested surface answers for the type the walk saw, and the walk saw one path only:
+    /// a local written with a structure before an `Если` and with a range inside it reads as
+    /// the range after `КонецЕсли`, although the structure path may well own the member.
+    fn platform_field_miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        field: &hir_def::Name,
+    ) -> bool {
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
+            self.is_closed_platform_object(ty) && self.lacks_field(ty, field)
+        })
+    }
+
+    /// The method counterpart of [`Self::platform_field_miss_holds_on_every_path`]: a
+    /// parameter written with a range on one path still holds the caller's value on the
+    /// other, and that value may well have the method.
+    fn platform_method_miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        method: &hir_def::Name,
+    ) -> bool {
+        self.miss_holds_on_every_path(receiver_expr, |ty| {
+            self.is_closed_platform_object(ty)
+                && crate::method_lookup::lookup_method(self.db, ty, method).is_none()
+        })
+    }
+
+    /// A platform object whose extracted member surface is attested as complete for the
+    /// served corpus. A homonym is refused here as well as by the verification itself, so the
+    /// verdict does not rest on an unseen detail of the other module's contract.
+    fn is_closed_platform_object(&self, ty: TypeId) -> bool {
+        let TypeKind::PlatformObject(facet) = self.db.lookup_type(ty) else {
+            return false;
+        };
+        let platform = bsl_platform::PlatformData::instance();
+        platform.platform_type_member_surface_verified(&facet.name)
+            && !platform.is_ambiguous_type_name(&facet.name)
+    }
+
+    /// True when every type `receiver_expr` can hold on the paths reaching it is a closed
+    /// receiver lacking the member; false when that set cannot be vouched for.
+    fn miss_holds_on_every_path(
+        &self,
+        receiver_expr: ExprId,
+        closed_without_member: impl Fn(TypeId) -> bool,
+    ) -> bool {
         let Some(types) = self.types_on_every_path(receiver_expr, &mut PathWalk::default()) else {
             return false;
         };
-        if types.is_empty() {
-            return false;
-        }
+        !types.is_empty() && types.iter().all(|ty| closed_without_member(*ty))
+    }
+
+    /// Whether neither the fields nor the manager members of `ty` answer to `field`.
+    fn lacks_field(&self, ty: TypeId, field: &hir_def::Name) -> bool {
         let obj_resolver =
             crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
-        types.iter().all(|ty| {
-            crate::field_lookup::is_closed_metadata_description(self.db, *ty)
-                && crate::field_lookup::lookup_field(self.db, &obj_resolver, *ty, field).is_none()
-                && crate::manager_lookup::lookup_manager_field(self.db, &obj_resolver, *ty, field)
-                    .is_none()
-        })
+        crate::field_lookup::lookup_field(self.db, &obj_resolver, ty, field).is_none()
+            && crate::manager_lookup::lookup_manager_field(self.db, &obj_resolver, ty, field)
+                .is_none()
     }
 
     /// Every type `expr` can hold on the paths reaching it, or `None` when that set cannot be
@@ -2170,7 +2225,8 @@ impl<'db> InferenceContext<'db> {
     /// A member read or an index takes its type from its receiver alone, so it is vouched for
     /// when the receiver's every type is the one the walk saw. A local is vouched for through
     /// the right-hand sides of the writes reaching it and the collection of the loop that
-    /// binds it. A local being resolved that is reached again — a write that reads its own
+    /// binds it. A constructor that writes its type name and takes no argument is that type
+    /// on every path. A local being resolved that is reached again — a write that reads its own
     /// target (`Описание = Описание.Родитель` in a loop) — vouches for nothing.
     fn types_on_every_path(&self, expr: ExprId, walk: &mut PathWalk) -> Option<Vec<TypeId>> {
         const MAX_DEPTH: usize = 16;
@@ -2211,6 +2267,9 @@ impl<'db> InferenceContext<'db> {
                 walk.active.pop();
                 walk.resolved.insert(expr, types.clone());
                 types
+            }
+            Expr::New { type_name: Some(_), args } if args.is_empty() => {
+                Some(vec![self.expr_types.get(&expr).copied()?])
             }
             _ => None,
         }
@@ -2979,6 +3038,20 @@ impl<'db> InferenceContext<'db> {
                     //
                     // An object a common attribute may reach without the reader being able
                     // to say so has an open field set, and a miss on it proves nothing.
+                    // A platform type is as closed a receiver as a metadata
+                    // collection where the curated overlays attest that the
+                    // extract lists its whole member surface: a miss is then a
+                    // defect of the checked code, not a gap in the corpus. The
+                    // attestation holds for one type at a known platform
+                    // release, so anything less — a corpus older than the
+                    // attested release, a corpus of unknown version — keeps the
+                    // receiver open, and so does a homonym, whose namesake may
+                    // well own the name. Like a metadata description, the
+                    // receiver must hold such a type on every path reaching the
+                    // read, not only on the one the walk saw last.
+                    let base_id = ExprId::from_idx(*base);
+                    let closed_platform_object = self.is_closed_platform_object(base_ty)
+                        && self.platform_field_miss_holds_on_every_path(base_id, field);
                     let closed_receiver = (matches!(
                         base_kind,
                         TypeKind::MetadataRef(_)
@@ -2997,7 +3070,8 @@ impl<'db> InferenceContext<'db> {
                                     self.db, base_ty,
                                 )
                                 .unwrap_or(base_ty),
-                            ));
+                            ))
+                        || closed_platform_object;
                     // `Метаданные.Справочники` is closed on the same grounds as the manager
                     // collection, but only where the configuration is visible: an external
                     // processor or a loose module names objects of a configuration this
@@ -3012,7 +3086,6 @@ impl<'db> InferenceContext<'db> {
                     // write, so after `Если … Иначе` or around a loop back-edge it can name one path's
                     // kind while another path holds `Метаданные[Вид][Имя]`, and a chain or a loop
                     // element read through that local inherits the one path.
-                    let base_id = ExprId::from_idx(*base);
                     let closed_description =
                         crate::field_lookup::is_closed_metadata_description(self.db, base_ty)
                             && self.description_miss_holds_on_every_path(base_id, field);
@@ -3957,13 +4030,34 @@ impl<'db> InferenceContext<'db> {
                             method_name: method_name.clone(),
                             kind: UnresolvedMethodKind::MethodNotFound,
                         });
-                    } else if matches!(
-                        self.db.lookup_type(receiver_ty),
-                        TypeKind::PlatformObject(_)
-                    ) {
-                        let base_expr = self.body.expr(base_id).clone();
-                        if let Expr::Path(receiver_path_name) = base_expr {
-                            if matches!(
+                    } else if let Some(platform_type) = match self.db.lookup_type(receiver_ty) {
+                        TypeKind::PlatformObject(facet) => Some(facet.name.clone()),
+                        _ => None,
+                    } {
+                        // A platform type whose member surface is attested as
+                        // complete is a closed receiver: the extract lists every
+                        // method it has, so a miss is the platform's own answer
+                        // and not a gap in the corpus — provided the receiver
+                        // holds such a type on every path reaching the call, not
+                        // only on the one the walk saw last. The name is the
+                        // receiver to the reader — the platform type in the
+                        // spelling the corpus uses.
+                        if self.is_closed_platform_object(receiver_ty) {
+                            if self.platform_method_miss_holds_on_every_path(base_id, &method_name)
+                            {
+                                self.push_inference_diagnostic(
+                                    InferenceDiagnostic::UnresolvedMethodCall {
+                                        expr: callee,
+                                        receiver_name: hir_def::Name::new(&platform_type),
+                                        method_name: method_name.clone(),
+                                        kind: UnresolvedMethodKind::MethodNotFound,
+                                    },
+                                );
+                            }
+                        } else {
+                            let base_expr = self.body.expr(base_id).clone();
+                            if let Expr::Path(receiver_path_name) = base_expr {
+                                if matches!(
                                 crate::platform_global_lookup::try_resolve_platform_global_member(
                                     self.db,
                                     &receiver_path_name,
@@ -3971,14 +4065,15 @@ impl<'db> InferenceContext<'db> {
                                 ),
                                 crate::platform_global_lookup::PlatformGlobalLookup::KnownContainerMissingMember
                             ) {
-                                self.push_inference_diagnostic(
-                                    InferenceDiagnostic::UnresolvedMethodCall {
-                                        expr: callee,
-                                        receiver_name: receiver_path_name,
-                                        method_name: method_name.clone(),
-                                        kind: UnresolvedMethodKind::MethodNotFound,
-                                    },
-                                );
+                                    self.push_inference_diagnostic(
+                                        InferenceDiagnostic::UnresolvedMethodCall {
+                                            expr: callee,
+                                            receiver_name: receiver_path_name,
+                                            method_name: method_name.clone(),
+                                            kind: UnresolvedMethodKind::MethodNotFound,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }

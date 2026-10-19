@@ -22,16 +22,16 @@ pub enum TokenKind {
     // Регистр не значим: 4.2.4.5 и примечание к самой таблице. Таблица
     // идёт тремя участками вперемежку со словами вне неё.
     // ===================================================================
-    #[regex(r"(?i)процедура|(?i)procedure")]
+    #[regex(r"(?i)процедура|(?i)procedure", |lex| finish_identifier(lex, TokenKind::KwProcedure))]
     KwProcedure,
 
-    #[regex(r"(?i)конецпроцедуры|(?i)endprocedure")]
+    #[regex(r"(?i)конецпроцедуры|(?i)endprocedure", |lex| finish_identifier(lex, TokenKind::KwEndProcedure))]
     KwEndProcedure,
 
-    #[regex(r"(?i)функция|(?i)function")]
+    #[regex(r"(?i)функция|(?i)function", |lex| finish_identifier(lex, TokenKind::KwFunction))]
     KwFunction,
 
-    #[regex(r"(?i)конецфункции|(?i)endfunction")]
+    #[regex(r"(?i)конецфункции|(?i)endfunction", |lex| finish_identifier(lex, TokenKind::KwEndFunction))]
     KwEndFunction,
 
     // ===================================================================
@@ -43,82 +43,82 @@ pub enum TokenKind {
     // и у каждого участка свой баннер. Экспорт — 4.6.1/4.6.3/4.6.4,
     // Знач — 4.7.4.2 и синтаксис 4.6.3/4.6.4.
     // ===================================================================
-    #[regex(r"(?i)экспорт|(?i)export")]
+    #[regex(r"(?i)экспорт|(?i)export", |lex| finish_identifier(lex, TokenKind::KwExport))]
     KwExport,
 
-    #[regex(r"(?i)знач|(?i)val")]
+    #[regex(r"(?i)знач|(?i)val", |lex| finish_identifier(lex, TokenKind::KwVal))]
     KwVal,
 
     // ===================================================================
     // Зарезервированные слова 4.2.4.6 — продолжение таблицы.
     // ===================================================================
-    #[regex(r"(?i)если|(?i)if")]
+    #[regex(r"(?i)если|(?i)if", |lex| finish_identifier(lex, TokenKind::KwIf))]
     KwIf,
 
-    #[regex(r"(?i)тогда|(?i)then")]
+    #[regex(r"(?i)тогда|(?i)then", |lex| finish_identifier(lex, TokenKind::KwThen))]
     KwThen,
 
-    #[regex(r"(?i)иначеесли|(?i)elsif")]
+    #[regex(r"(?i)иначеесли|(?i)elsif", |lex| finish_identifier(lex, TokenKind::KwElsIf))]
     KwElsIf,
 
-    #[regex(r"(?i)иначе|(?i)else")]
+    #[regex(r"(?i)иначе|(?i)else", |lex| finish_identifier(lex, TokenKind::KwElse))]
     KwElse,
 
-    #[regex(r"(?i)конецесли|(?i)endif")]
+    #[regex(r"(?i)конецесли|(?i)endif", |lex| finish_identifier(lex, TokenKind::KwEndIf))]
     KwEndIf,
 
-    #[regex(r"(?i)для|(?i)for")]
+    #[regex(r"(?i)для|(?i)for", |lex| finish_identifier(lex, TokenKind::KwFor))]
     KwFor,
 
-    #[regex(r"(?i)каждого|(?i)each")]
+    #[regex(r"(?i)каждого|(?i)each", |lex| finish_identifier(lex, TokenKind::KwEach))]
     KwEach,
 
-    #[regex(r"(?i)из|(?i)in")]
+    #[regex(r"(?i)из|(?i)in", |lex| finish_identifier(lex, TokenKind::KwIn))]
     KwIn,
 
-    #[regex(r"(?i)по|(?i)to")]
+    #[regex(r"(?i)по|(?i)to", |lex| finish_identifier(lex, TokenKind::KwTo))]
     KwTo,
 
-    #[regex(r"(?i)пока|(?i)while")]
+    #[regex(r"(?i)пока|(?i)while", |lex| finish_identifier(lex, TokenKind::KwWhile))]
     KwWhile,
 
-    #[regex(r"(?i)цикл|(?i)do")]
+    #[regex(r"(?i)цикл|(?i)do", |lex| finish_identifier(lex, TokenKind::KwDo))]
     KwDo,
 
-    #[regex(r"(?i)конеццикла|(?i)enddo")]
+    #[regex(r"(?i)конеццикла|(?i)enddo", |lex| finish_identifier(lex, TokenKind::KwEndDo))]
     KwEndDo,
 
-    #[regex(r"(?i)возврат|(?i)return")]
+    #[regex(r"(?i)возврат|(?i)return", |lex| finish_identifier(lex, TokenKind::KwReturn))]
     KwReturn,
 
-    #[regex(r"(?i)продолжить|(?i)continue")]
+    #[regex(r"(?i)продолжить|(?i)continue", |lex| finish_identifier(lex, TokenKind::KwContinue))]
     KwContinue,
 
-    #[regex(r"(?i)прервать|(?i)break")]
+    #[regex(r"(?i)прервать|(?i)break", |lex| finish_identifier(lex, TokenKind::KwBreak))]
     KwBreak,
 
-    #[regex(r"(?i)перейти|(?i)goto")]
+    #[regex(r"(?i)перейти|(?i)goto", |lex| finish_identifier(lex, TokenKind::KwGoto))]
     KwGoto,
 
-    #[regex(r"(?i)попытка|(?i)try")]
+    #[regex(r"(?i)попытка|(?i)try", |lex| finish_identifier(lex, TokenKind::KwTry))]
     KwTry,
 
-    #[regex(r"(?i)исключение|(?i)except")]
+    #[regex(r"(?i)исключение|(?i)except", |lex| finish_identifier(lex, TokenKind::KwExcept))]
     KwExcept,
 
-    #[regex(r"(?i)конецпопытки|(?i)endtry")]
+    #[regex(r"(?i)конецпопытки|(?i)endtry", |lex| finish_identifier(lex, TokenKind::KwEndTry))]
     KwEndTry,
 
-    #[regex(r"(?i)вызватьисключение|(?i)raise")]
+    #[regex(r"(?i)вызватьисключение|(?i)raise", |lex| finish_identifier(lex, TokenKind::KwRaise))]
     KwRaise,
 
-    #[regex(r"(?i)перем|(?i)var")]
+    #[regex(r"(?i)перем|(?i)var", |lex| finish_identifier(lex, TokenKind::KwVar))]
     KwVar,
 
-    #[regex(r"(?i)новый|(?i)new")]
+    #[regex(r"(?i)новый|(?i)new", |lex| finish_identifier(lex, TokenKind::KwNew))]
     KwNew,
 
-    #[regex(r"(?i)выполнить|(?i)execute")]
+    #[regex(r"(?i)выполнить|(?i)execute", |lex| finish_identifier(lex, TokenKind::KwExecute))]
     KwExecute,
 
     // ===================================================================
@@ -130,28 +130,28 @@ pub enum TokenKind {
     // грамматика не принимает их всюду, где стоит создаваемое имя, —
     // известное ограничение, а не норма источника.
     // ===================================================================
-    #[regex(r"(?i)добавитьобработчик|(?i)addhandler")]
+    #[regex(r"(?i)добавитьобработчик|(?i)addhandler", |lex| finish_identifier(lex, TokenKind::KwAddHandler))]
     KwAddHandler,
 
-    #[regex(r"(?i)удалитьобработчик|(?i)removehandler")]
+    #[regex(r"(?i)удалитьобработчик|(?i)removehandler", |lex| finish_identifier(lex, TokenKind::KwRemoveHandler))]
     KwRemoveHandler,
 
-    #[regex(r"(?i)асинх|(?i)async")]
+    #[regex(r"(?i)асинх|(?i)async", |lex| finish_identifier(lex, TokenKind::KwAsync))]
     KwAsync,
 
-    #[regex(r"(?i)ждать|(?i)await")]
+    #[regex(r"(?i)ждать|(?i)await", |lex| finish_identifier(lex, TokenKind::KwAwait))]
     KwAwait,
 
     // ===================================================================
     // Зарезервированные слова 4.2.4.6 — логические операции, конец таблицы.
     // ===================================================================
-    #[regex(r"(?i)и|(?i)and")]
+    #[regex(r"(?i)и|(?i)and", |lex| finish_identifier(lex, TokenKind::KwAnd))]
     KwAnd,
 
-    #[regex(r"(?i)или|(?i)or")]
+    #[regex(r"(?i)или|(?i)or", |lex| finish_identifier(lex, TokenKind::KwOr))]
     KwOr,
 
-    #[regex(r"(?i)не|(?i)not")]
+    #[regex(r"(?i)не|(?i)not", |lex| finish_identifier(lex, TokenKind::KwNot))]
     KwNot,
 
     // ===================================================================
@@ -159,16 +159,16 @@ pub enum TokenKind {
     //
     // Истина/Ложь — 4.3.3, Неопределено — 4.3.5, NULL — 4.3.2.
     // ===================================================================
-    #[regex(r"(?i)истина|(?i)true")]
+    #[regex(r"(?i)истина|(?i)true", |lex| finish_identifier(lex, TokenKind::KwTrue))]
     KwTrue,
 
-    #[regex(r"(?i)ложь|(?i)false")]
+    #[regex(r"(?i)ложь|(?i)false", |lex| finish_identifier(lex, TokenKind::KwFalse))]
     KwFalse,
 
-    #[regex(r"(?i)неопределено|(?i)undefined")]
+    #[regex(r"(?i)неопределено|(?i)undefined", |lex| finish_identifier(lex, TokenKind::KwUndefined))]
     KwUndefined,
 
-    #[regex(r"(?i)null")]
+    #[regex(r"(?i)null", |lex| finish_identifier(lex, TokenKind::KwNull))]
     KwNull,
 
     // ===================================================================
@@ -213,43 +213,43 @@ pub enum TokenKind {
     // Имя семейства `Ann*` унаследовано: по источнику это директивы
     // компиляции, а не аннотации 4.8.2.
     // ===================================================================
-    #[regex(r"&(?i)наклиенте|&(?i)atclient")]
+    #[regex(r"&(?i)наклиенте|&(?i)atclient", |lex| finish_identifier(lex, TokenKind::AnnAtClient))]
     AnnAtClient,
 
-    #[regex(r"&(?i)насервере|&(?i)atserver")]
+    #[regex(r"&(?i)насервере|&(?i)atserver", |lex| finish_identifier(lex, TokenKind::AnnAtServer))]
     AnnAtServer,
 
-    #[regex(r"&(?i)насерверебезконтекста|&(?i)atservernocontext")]
+    #[regex(r"&(?i)насерверебезконтекста|&(?i)atservernocontext", |lex| finish_identifier(lex, TokenKind::AnnAtServerNoContext))]
     AnnAtServerNoContext,
 
-    #[regex(r"&(?i)наклиентенасерверебезконтекста|&(?i)atclientatservernocontext")]
+    #[regex(r"&(?i)наклиентенасерверебезконтекста|&(?i)atclientatservernocontext", |lex| finish_identifier(lex, TokenKind::AnnAtClientAtServerNoContext))]
     AnnAtClientAtServerNoContext,
 
-    #[regex(r"&(?i)наклиентенасервере|&(?i)atclientatserver")]
+    #[regex(r"&(?i)наклиентенасервере|&(?i)atclientatserver", |lex| finish_identifier(lex, TokenKind::AnnAtClientAtServer))]
     AnnAtClientAtServer,
 
     // ===================================================================
     // Аннотации — таблица 4.8.2.
     // ===================================================================
-    #[regex(r"&(?i)перед|&(?i)before")]
+    #[regex(r"&(?i)перед|&(?i)before", |lex| finish_identifier(lex, TokenKind::AnnBefore))]
     AnnBefore,
 
-    #[regex(r"&(?i)после|&(?i)after")]
+    #[regex(r"&(?i)после|&(?i)after", |lex| finish_identifier(lex, TokenKind::AnnAfter))]
     AnnAfter,
 
     /// `&Instead` источником не задан и оставлен разрешением совместимости
     /// с предшественником: 4.8.2 даёт английское имя `Вместо` как `Around`.
-    #[regex(r"&(?i)вместо|&(?i)around|&(?i)instead")]
+    #[regex(r"&(?i)вместо|&(?i)around|&(?i)instead", |lex| finish_identifier(lex, TokenKind::AnnAround))]
     AnnAround,
 
-    #[regex(r"&(?i)изменениеиконтроль|&(?i)changeandvalidate")]
+    #[regex(r"&(?i)изменениеиконтроль|&(?i)changeandvalidate", |lex| finish_identifier(lex, TokenKind::AnnChangeAndValidate))]
     AnnChangeAndValidate,
 
     /// Языковой формой не является: 4.8.2 гласит, что система не поддерживает
     /// пользовательских аннотаций. Разрешение IDE — неизвестное написание
     /// после `&` должно оставаться опознаваемой аннотацией, иначе
     /// восстановление теряет весь заголовок метода.
-    #[regex(r"&[_\p{L}][_\p{L}0-9]*")]
+    #[regex(r"&[_\p{L}]", |lex| finish_identifier(lex, TokenKind::AnnCustom))]
     AnnCustom,
 
     // ===================================================================
@@ -380,7 +380,7 @@ pub enum TokenKind {
     #[regex(r#"'[^'"\n\r\p{L}]*'"#)]
     Date,
 
-    #[regex(r"[_\p{L}][_\p{L}0-9]*", priority = 1)]
+    #[regex(r"[_\p{L}]", |lex| finish_identifier(lex, TokenKind::Ident), priority = 1)]
     Ident,
 
     #[regex(r"//[^\n]*")]
@@ -396,6 +396,40 @@ pub enum TokenKind {
     Bom,
 
     Error,
+}
+
+fn finish_identifier(lexer: &mut logos::Lexer<TokenKind>, original_kind: TokenKind) -> TokenKind {
+    let mut consumed_bytes = 0;
+    for (offset, ch) in lexer.remainder().char_indices() {
+        if ch == '_' || ch.is_ascii_digit() || is_identifier_letter(ch) {
+            consumed_bytes = offset + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if consumed_bytes == 0 {
+        return original_kind;
+    }
+
+    lexer.bump(consumed_bytes);
+    if lexer.slice().starts_with('&') {
+        TokenKind::AnnCustom
+    } else {
+        TokenKind::Ident
+    }
+}
+
+fn is_identifier_letter(ch: char) -> bool {
+    if ch.is_ascii_alphabetic() {
+        return true;
+    }
+
+    // Keep the old `\p{L}` character class semantics. The only single-code
+    // point keyword is Cyrillic И (KwAnd), which is still a valid letter in
+    // an identifier. All other letters lex as Ident; non-letters lex Error.
+    let mut encoded = [0; 4];
+    let mut single_char = TokenKind::lexer(ch.encode_utf8(&mut encoded));
+    matches!(single_char.next(), Some(Ok(TokenKind::Ident | TokenKind::KwAnd)))
 }
 
 impl TokenKind {
@@ -740,6 +774,186 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::Comment);
         assert_eq!(tokens[1].kind, TokenKind::Newline);
         assert_eq!(tokens[2].kind, TokenKind::Ident);
+    }
+
+    #[test]
+    fn line_comment_keeps_utf8_and_carriage_return_and_stops_before_lf() {
+        let tokens = tokenize("/\n//я\r\n//\n//");
+        let actual: Vec<_> =
+            tokens.iter().map(|token| (token.kind, token.text.as_str(), token.offset)).collect();
+        assert_eq!(
+            actual,
+            vec![
+                (TokenKind::Slash, "/", 0),
+                (TokenKind::Newline, "\n", 1),
+                (TokenKind::Comment, "//я\r", 2),
+                (TokenKind::Newline, "\n", 7),
+                (TokenKind::Comment, "//", 8),
+                (TokenKind::Newline, "\n", 10),
+                (TokenKind::Comment, "//", 11),
+            ]
+        );
+    }
+
+    #[test]
+    fn long_comment_lexes_iteratively_on_a_small_stack() {
+        let source = format!("//{}я", "x".repeat(1_500_000));
+        let byte_length = source.len();
+        std::thread::Builder::new()
+            .name("lexer-long-comment-small-stack".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let tokens = tokenize(&source);
+                assert_eq!(tokens.len(), 1);
+                assert_eq!(tokens[0].kind, TokenKind::Comment);
+                assert_eq!(tokens[0].offset, 0);
+                assert_eq!(tokens[0].text.len(), byte_length);
+                assert_eq!(tokens[0].text.as_str(), source.as_str());
+            })
+            .expect("spawn small-stack lexer thread")
+            .join()
+            .expect("long comment must not overflow the lexer stack");
+    }
+
+    #[test]
+    fn long_identifiers_lex_iteratively_on_a_small_stack() {
+        for (label, source) in [
+            ("ascii", "x".repeat(1_500_000)),
+            ("cyrillic", "я".repeat(1_500_000)),
+            ("mixed", "xя".repeat(750_000)),
+        ] {
+            let byte_length = source.len();
+            std::thread::Builder::new()
+                .name(format!("lexer-long-ident-{label}-small-stack"))
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let tokens = tokenize(&source);
+                    assert_eq!(tokens.len(), 1);
+                    assert_eq!(tokens[0].kind, TokenKind::Ident);
+                    assert_eq!(tokens[0].offset, 0);
+                    assert_eq!(tokens[0].text.len(), byte_length);
+                    assert_eq!(tokens[0].text.as_str(), source.as_str());
+                })
+                .expect("spawn small-stack lexer thread")
+                .join()
+                .unwrap_or_else(|_| {
+                    panic!("long {label} identifier must not overflow the lexer stack")
+                });
+        }
+    }
+
+    fn source_regex_spellings(prefix: &str) -> Vec<String> {
+        let mut spellings = Vec::new();
+        for line in include_str!("lib.rs").lines().map(str::trim) {
+            let Some(pattern) = line
+                .strip_prefix("#[regex(r\"")
+                .and_then(|pattern| pattern.split_once('\"').map(|(pattern, _)| pattern))
+            else {
+                continue;
+            };
+            if !pattern.starts_with(prefix) {
+                continue;
+            }
+            spellings.extend(pattern.split('|').map(|alternative| alternative.replace("(?i)", "")));
+        }
+        spellings
+    }
+
+    #[test]
+    fn bounded_prefixes_cover_all_keyword_regexes_and_keep_suffixes_as_names() {
+        // The source-derived controls make a new one-line keyword regex enter
+        // this test automatically; count checks catch changes to regex syntax
+        // that would otherwise make the selector miss an existing pattern.
+        let identifiers = source_regex_spellings("(?i)");
+        assert_eq!(identifiers.len(), 79);
+        for keyword in identifiers {
+            let exact = tokenize(&keyword);
+            assert_eq!(exact.len(), 1, "exact keyword {keyword:?}");
+            assert_ne!(exact[0].kind, TokenKind::Ident, "exact keyword {keyword:?}");
+
+            let suffixed = format!("{keyword}x");
+            let tokens = tokenize(&suffixed);
+            assert_eq!(tokens.len(), 1, "keyword suffix {suffixed:?}");
+            assert_eq!(tokens[0].kind, TokenKind::Ident, "keyword suffix {suffixed:?}");
+            assert_eq!(tokens[0].text.as_str(), suffixed);
+        }
+
+        let ampersand_keywords = source_regex_spellings("&(?i)");
+        assert_eq!(ampersand_keywords.len(), 19);
+        for keyword in ampersand_keywords {
+            let exact = tokenize(&keyword);
+            assert_eq!(exact.len(), 1, "exact directive/annotation {keyword:?}");
+            assert_ne!(
+                exact[0].kind,
+                TokenKind::AnnCustom,
+                "exact directive/annotation {keyword:?}"
+            );
+
+            let suffixed = format!("{keyword}x");
+            let tokens = tokenize(&suffixed);
+            assert_eq!(tokens.len(), 1, "directive/annotation suffix {suffixed:?}");
+            assert_eq!(tokens[0].kind, TokenKind::AnnCustom, "suffix {suffixed:?}");
+            assert_eq!(tokens[0].text.as_str(), suffixed);
+        }
+
+        // Include one user-defined spelling as a positive control for the
+        // fallback itself; it is intentionally not a fixed keyword regex.
+        let custom = tokenize("&МояАннотация");
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].kind, TokenKind::AnnCustom);
+        let suffixed = tokenize("&МояАннотацияx");
+        assert_eq!(suffixed.len(), 1);
+        assert_eq!(suffixed[0].kind, TokenKind::AnnCustom);
+        assert_eq!(suffixed[0].text.as_str(), "&МояАннотацияx");
+    }
+
+    #[test]
+    fn long_custom_annotation_lexes_iteratively_on_a_small_stack() {
+        let source = format!("&{}", "я".repeat(1_500_000));
+        let byte_length = source.len();
+        std::thread::Builder::new()
+            .name("lexer-long-custom-annotation-small-stack".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let tokens = tokenize(&source);
+                assert_eq!(tokens.len(), 1);
+                assert_eq!(tokens[0].kind, TokenKind::AnnCustom);
+                assert_eq!(tokens[0].offset, 0);
+                assert_eq!(tokens[0].text.len(), byte_length);
+                assert_eq!(tokens[0].text.as_str(), source.as_str());
+            })
+            .expect("spawn small-stack lexer thread")
+            .join()
+            .expect("long custom annotation must not overflow the lexer stack");
+    }
+
+    #[test]
+    fn identifier_and_custom_annotation_stop_before_punctuation_and_nonletters() {
+        let tokens = tokenize("Name_9;Следующее &Custom_9;Следующее");
+        assert_eq!(
+            tokens.iter().map(|token| token.kind).collect::<Vec<_>>(),
+            vec![
+                TokenKind::Ident,
+                TokenKind::Semicolon,
+                TokenKind::Ident,
+                TokenKind::Whitespace,
+                TokenKind::AnnCustom,
+                TokenKind::Semicolon,
+                TokenKind::Ident,
+            ]
+        );
+        assert_eq!(tokens[0].text.as_str(), "Name_9");
+        assert_eq!(tokens[4].text.as_str(), "&Custom_9");
+
+        for input in ["Name\u{0301}", "Name١", "&Custom\u{0301}", "&Custom١"] {
+            let tokens = tokenize(input);
+            assert_eq!(tokens.len(), 2, "{input:?}");
+            assert_eq!(
+                tokens[0].kind,
+                if input.starts_with('&') { TokenKind::AnnCustom } else { TokenKind::Ident }
+            );
+            assert_eq!(tokens[1].kind, TokenKind::Error, "{input:?}");
+        }
     }
 
     #[test]

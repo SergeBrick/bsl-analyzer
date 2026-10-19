@@ -1,5 +1,6 @@
 pub use base_db;
 pub use hir::is_bsl_source;
+pub use parking_lot::FairMutex;
 pub use syntax::TextRange;
 pub use vfs;
 

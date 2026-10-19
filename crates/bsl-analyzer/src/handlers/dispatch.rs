@@ -293,6 +293,18 @@ impl RequestDispatcher<'_> {
             return self;
         }
 
+        if self.global_state.analysis_host.is_shared()
+            && self.global_state.request_lifecycles.len()
+                >= self.global_state.task_pool.pool.capacity().unwrap_or(1)
+        {
+            self.global_state.respond(Response::new_err(
+                req.id,
+                ErrorCode::ContentModified as i32,
+                "server is busy, please retry".to_string(),
+            ));
+            return self;
+        }
+
         match executor {
             LatencyExecutor::TaskPool if !self.global_state.task_pool.pool.has_capacity() => {
                 tracing::warn!(method = R::METHOD, id = ?req.id, "declining request: task pool saturated");
@@ -360,6 +372,15 @@ impl RequestDispatcher<'_> {
         };
 
         let (ctx, token) = self.latency_context();
+        if self.global_state.analysis_host.is_shared() {
+            self.global_state.shared_request_stamps.insert(
+                req.id.clone(),
+                (
+                    self.global_state.shared_request_generation,
+                    salsa::plumbing::current_revision(ctx.analysis.database()),
+                ),
+            );
+        }
         self.global_state.request_token_owners.insert(req.id.clone(), key.clone());
         self.global_state.request_tokens.insert(req.id.clone(), token);
 
@@ -395,10 +416,30 @@ impl RequestDispatcher<'_> {
     /// the queries it runs.
     fn latency_context(&self) -> (LatencyRequestContext, salsa::CancellationToken) {
         let state = &*self.global_state;
-        let db = state.analysis_host.raw_database().clone();
-        let token = db.cancellation_token();
+        let analysis = state.analysis_host.analysis();
+        let token = analysis.database().cancellation_token();
+        let file_paths = if state.analysis_host.is_shared() {
+            let bindings = state.open_file_uri_ids.iter().filter_map(|(uri, &file_id)| {
+                if !state.open_files.contains(&file_id) || !state.mem_docs.contains(uri) {
+                    return None;
+                }
+                let path = uri.to_file_path().ok()?;
+                if !project_model::is_bsl_source_path(&path)
+                    || state
+                        .project
+                        .as_ref()
+                        .is_some_and(|project| project.is_source_excluded(&path))
+                {
+                    return None;
+                }
+                Some((uri.clone(), file_id))
+            });
+            FrozenFilePaths::freeze_database(analysis.database()).with_open_uri_ids(bindings)
+        } else {
+            FrozenFilePaths::freeze(&state.vfs.read())
+        };
         let ctx = LatencyRequestContext {
-            analysis: ide::Analysis::from_database(db),
+            analysis,
             workspace_root: state.workspace_root.clone(),
             project: state.project.clone(),
             diagnostics_baseline: Arc::clone(&state.diagnostics_baseline),
@@ -416,7 +457,7 @@ impl RequestDispatcher<'_> {
             call_hierarchy_wait_policy: state.call_hierarchy_wait_policy,
             client_sender: state.sender.clone(),
             mem_docs: state.mem_docs.freeze(),
-            file_paths: FrozenFilePaths::freeze(&state.vfs.read()),
+            file_paths,
             scope_dirty_docs: state.scope_dirty_docs.clone(),
         };
         (ctx, token)
@@ -437,6 +478,7 @@ impl RequestDispatcher<'_> {
                 && lifecycle.phase == RequestLifecyclePhase::Running
         }) {
             self.global_state.request_lifecycles.remove(&key.id);
+            self.global_state.shared_request_stamps.remove(&key.id);
         }
         self.global_state.respond(Response::new_err(
             key.id.clone(),
@@ -591,18 +633,16 @@ where
     let key = RequestAttemptKey { id, generation: 0, attempt: 1 };
     match run_latency_attempt::<R>(key.clone(), ctx, params, f) {
         LatencyAttemptOutcome::Response(response) => response,
-        LatencyAttemptOutcome::Cancelled { kind, revision } => match kind {
-            salsa::Cancelled::PropagatedPanic if !crate::panic_watch::panicked_in(revision) => {
-                Response::new_err(
-                    key.id,
-                    ErrorCode::ContentModified as i32,
-                    "content modified".to_string(),
-                )
-            }
+        LatencyAttemptOutcome::Panicked { .. } => Response::new_err(
+            key.id,
+            ErrorCode::InternalError as i32,
+            "internal handler panic".to_string(),
+        ),
+        LatencyAttemptOutcome::Cancelled { kind, .. } => match kind {
             salsa::Cancelled::PropagatedPanic => Response::new_err(
                 key.id,
-                ErrorCode::InternalError as i32,
-                "internal handler panic".to_string(),
+                ErrorCode::ContentModified as i32,
+                "content modified".to_string(),
             ),
             _ => Response::new_err(
                 key.id,
@@ -650,7 +690,13 @@ where
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "async LSP request unwound"
                 );
-                LatencyAttemptOutcome::Cancelled { kind, revision }
+                if matches!(kind, salsa::Cancelled::PropagatedPanic)
+                    && crate::panic_watch::panicked_in(ctx.analysis.database(), revision)
+                {
+                    LatencyAttemptOutcome::Panicked { revision }
+                } else {
+                    LatencyAttemptOutcome::Cancelled { kind, revision }
+                }
             }
         }
     };
@@ -789,6 +835,50 @@ mod tests {
         assert_eq!(response.id, lsp_server::RequestId::from(42));
         assert!(response.error.is_none(), "happy path must not set error");
         assert_eq!(response.result, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn shared_admission_declines_before_launching_an_extra_waiter() {
+        let backend = mcp_server::SharedState::shared();
+        let (sender, receiver) = unbounded();
+        let mut state = GlobalState::new_shared(sender, backend.workspace_handle());
+        state.vfs_done = true;
+        let capacity = state.task_pool.pool.capacity().unwrap();
+        for index in 0..capacity {
+            state.request_lifecycles.insert(
+                lsp_server::RequestId::from(index as i32),
+                RequestLifecycle {
+                    generation: 1,
+                    method: HoverRequest::METHOD.to_owned(),
+                    request: None,
+                    attempt: 1,
+                    phase: RequestLifecyclePhase::Running,
+                    retry_origin_revision: None,
+                    retry_eligible: false,
+                    origin: None,
+                    client_cancelled: false,
+                },
+            );
+        }
+        let id = lsp_server::RequestId::from(capacity as i32);
+        let request = Request::new(
+            id.clone(),
+            HoverRequest::METHOD.to_owned(),
+            serde_json::to_value(hover_params()).unwrap(),
+        );
+        RequestDispatcher { req: Some(request), global_state: &mut state }
+            .on_waiting_latency::<HoverRequest>(|_, _| {
+                panic!("a saturated session must not launch")
+            })
+            .finish();
+        let lsp_server::Message::Response(response) = receiver.recv().unwrap() else {
+            panic!("busy admission returns a response");
+        };
+        assert_eq!(response.id, id);
+        assert_eq!(response.error.unwrap().code, ErrorCode::ContentModified as i32);
+        assert!(!state.request_tokens.contains_key(&id));
+        assert_eq!(state.request_lifecycles.len(), capacity);
+        assert!(state.task_pool.receiver.try_recv().is_err());
     }
 
     #[test]
@@ -948,7 +1038,6 @@ mod tests {
     fn propagated_unwind_without_a_panic_is_content_modified() {
         let _guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
 
         let (sender, _receiver) = unbounded();
         let mut state = GlobalState::new(sender);
@@ -964,6 +1053,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_panic_in_another_storage_does_not_change_the_request_verdict() {
+        let _guard = crate::panic_watch::panic_test_guard();
+        crate::panic_watch::install();
+        let (sender, _) = unbounded();
+        let mut state = GlobalState::new(sender);
+        state.vfs_done = true;
+        let (other_sender, _) = unbounded();
+        let other = GlobalState::new(other_sender);
+        assert_eq!(
+            salsa::plumbing::current_revision(state.analysis_host.raw_database()),
+            salsa::plumbing::current_revision(other.analysis_host.raw_database()),
+        );
+        panic_inside_a_query(&other, "another editor query panicked");
+        let response = propagated_unwind_response(&state, lsp_server::RequestId::from(18));
+        assert_eq!(response.error.unwrap().code, ErrorCode::ContentModified as i32);
+    }
+
     /// The other half of the same verdict: when a panic really did happen while
     /// the request was waiting, the propagated unwind keeps reporting one.
     /// Without this, mapping every propagated unwind to `ContentModified` would
@@ -972,7 +1079,6 @@ mod tests {
     fn propagated_unwind_after_a_real_panic_stays_internal_error() {
         let _guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
 
         let (sender, _receiver) = unbounded();
         let mut state = GlobalState::new(sender);
@@ -1007,7 +1113,6 @@ mod tests {
     fn propagated_unwind_replaying_an_earlier_panic_stays_internal_error() {
         let _guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
 
         let (sender, _receiver) = unbounded();
         let mut state = GlobalState::new(sender);
@@ -1032,7 +1137,6 @@ mod tests {
     fn an_lru_trim_between_the_panic_and_the_reader_changes_nothing() {
         let _guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
 
         let (sender, _receiver) = unbounded();
         let mut state = GlobalState::new(sender);
@@ -1059,7 +1163,6 @@ mod tests {
     fn a_write_between_the_panic_and_the_reader_clears_the_verdict() {
         let _guard = crate::panic_watch::panic_test_guard();
         crate::panic_watch::install();
-        crate::panic_watch::reset_for_test();
 
         let (sender, _receiver) = unbounded();
         let mut state = GlobalState::new(sender);

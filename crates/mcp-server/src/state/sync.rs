@@ -2072,11 +2072,32 @@ mod tests {
             );
         }
 
-        fs::write(workspace.join("Late.bsl"), "Процедура Поздняя() КонецПроцедуры\n").unwrap();
-        assert!(
-            rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
-            "work delivered after the budget ran out must open the next one"
-        );
+        // The waiter reads the hub's generation only once it runs, so a single write may be
+        // taken by the hub before that read and never count as late. Writing again after every
+        // batch the hub takes, until the waiter answers, leaves the outcome to the order of
+        // events alone. The timing profile bounds the attempts, as it bounds every wait.
+        let attempts = if cfg!(timing_contract) { 100 } else { u32::MAX };
+        let mut seen = hub.generation();
+        let mut attempt = 0u32;
+        while rx.try_recv().is_err() {
+            attempt += 1;
+            assert!(
+                attempt <= attempts,
+                "work delivered after the budget ran out must open the next one"
+            );
+            fs::write(
+                workspace.join("Late.bsl"),
+                format!("Процедура Поздняя{attempt}() КонецПроцедуры\n"),
+            )
+            .unwrap();
+            let next = hub.wait_for_change_or(
+                seen,
+                crate::change_hub::test_support::STATE_CEILING,
+                || false,
+            );
+            assert!(next > seen, "the hub took no batch for the late write");
+            seen = next;
+        }
         waiter.join().unwrap();
         hub.shutdown();
     }

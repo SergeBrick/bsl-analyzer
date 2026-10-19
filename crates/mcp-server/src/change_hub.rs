@@ -10191,6 +10191,39 @@ mod tests {
         );
     }
 
+    /// A file that an exclusion pattern names is left out of the runtime walk just as a
+    /// directory it names is, so drift is never reported for a file the scan does not serve.
+    /// The same walk without the pattern collects the file, which is what tells the two apart.
+    #[test]
+    fn a_runtime_subtree_leaves_out_files_matched_by_an_exclusion_pattern() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("runtime");
+        for relative in ["Allowed.bsl", "temp/Hidden.bsl", "Ext/Template.Queries.bsl"] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let collected = |excluded: &ExcludedPaths| {
+            let mut records = Vec::new();
+            collect_subtree_within(&root, &mut records, excluded);
+            let mut files: Vec<PathBuf> = records
+                .into_iter()
+                .map(|(_, path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+                .collect();
+            files.sort();
+            files
+        };
+
+        assert_eq!(
+            collected(&ExcludedPaths::default()),
+            ["Allowed.bsl", "Ext/Template.Queries.bsl", "temp/Hidden.bsl"].map(PathBuf::from),
+            "positive control: without a pattern every file is collected"
+        );
+        let patterns =
+            ExcludedPaths::default().with_patterns(&root, ["temp", "**/*.Queries.bsl"]).unwrap();
+        assert_eq!(collected(&patterns), [PathBuf::from("Allowed.bsl")]);
+    }
+
     /// The default cache is lazy: it does not exist when the hub starts. The exclusion
     /// still has to hold once the first index write creates it.
     #[test]

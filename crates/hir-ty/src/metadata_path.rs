@@ -159,7 +159,12 @@ fn predefined_value_missing(
         MdoType::Catalog
         | MdoType::ChartOfAccounts
         | MdoType::ChartOfCharacteristicTypes
-        | MdoType::ChartOfCalculationTypes => mdo.find_predefined_item(value).is_some(),
+        | MdoType::ChartOfCalculationTypes => {
+            if mdo.predefined_unreadable {
+                return None;
+            }
+            mdo.find_predefined_item(value).is_some()
+        }
         _ => return None,
     };
     (!found).then(|| MissingMetadata::PredefinedValue {

@@ -579,3 +579,26 @@ fn a_report_spelled_with_yo_is_judged_like_one_spelled_with_ye() {
         ]
     );
 }
+
+#[test]
+fn predefined_items_that_cannot_be_read_are_not_judged() {
+    let source = r#"
+Процедура Тест() Экспорт
+    З = ПредопределенноеЗначение("Справочник.Товары.Основной");
+КонецПроцедуры
+"#;
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let cf = dir.path().join("cf");
+    write_configuration(&cf);
+    write(&cf, "Catalogs/Товары/Ext/Predefined.xml", "<PredefinedData");
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf)],
+            None,
+            "cf/CommonModules/Тест/Ext/Module.bsl",
+            source,
+        ),
+        Vec::<String>::new()
+    );
+}

@@ -148,6 +148,7 @@ mod tests {
             children: vec![],
             enum_values: vec![],
             predefined_items: vec![],
+            predefined_unreadable: false,
             check_unique: false,
             code_series: bsl_metadata::CodeSeries::default(),
             constant_type: None,

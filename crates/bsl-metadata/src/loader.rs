@@ -667,7 +667,10 @@ where
     let mut mdo = parser(main_xml).ok()?;
 
     if let Some(predefined_xml) = predefined_xml {
-        mdo.predefined_items = xml_parser::parse_predefined_xml(predefined_xml);
+        match xml_parser::parse_predefined_xml(predefined_xml) {
+            Some(items) => mdo.predefined_items = items,
+            None => mdo.predefined_unreadable = true,
+        }
         tracing::debug!(
             name = %mdo.name,
             count = mdo.predefined_items.len(),

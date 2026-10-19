@@ -108,7 +108,7 @@ fn at_end_function(p: &Parser) -> bool {
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D5.
 pub fn procedure_def_content(p: &mut Parser) {
     p.forget_inline_inserts();
-    p.forget_crossed_preproc_ifs();
+    let outer_crossed = p.take_crossed_preproc_ifs();
     p.eat(T![KwAsync]);
 
     p.expect(T![KwProcedure]);
@@ -139,6 +139,7 @@ pub fn procedure_def_content(p: &mut Parser) {
     });
 
     statements::expect_stmt_list_terminator(p, T![KwEndProcedure], recovered);
+    p.restore_crossed_preproc_ifs(outer_crossed);
 }
 
 pub fn function_def(p: &mut Parser) {
@@ -156,7 +157,7 @@ pub fn function_def(p: &mut Parser) {
 /// Provenance: `docs/legal/bsl-clean-room-slice-b3.md`, finding D6.
 pub fn function_def_content(p: &mut Parser) {
     p.forget_inline_inserts();
-    p.forget_crossed_preproc_ifs();
+    let outer_crossed = p.take_crossed_preproc_ifs();
     p.eat(T![KwAsync]);
 
     p.expect(T![KwFunction]);
@@ -181,6 +182,7 @@ pub fn function_def_content(p: &mut Parser) {
     });
 
     statements::expect_stmt_list_terminator(p, T![KwEndFunction], recovered);
+    p.restore_crossed_preproc_ifs(outer_crossed);
 }
 
 fn param_list(p: &mut Parser) {

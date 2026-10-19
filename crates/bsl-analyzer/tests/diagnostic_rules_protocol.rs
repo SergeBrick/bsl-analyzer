@@ -35,12 +35,25 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         rules::expected(&source, false, true)
     );
 
-    let log_file = dir.path().join("lsp.log");
+    // The LSP process hands the session to a backend process that inherits
+    // `BSL_LOG_FILE`. One shared path would be truncated by the second process
+    // and written at two independent offsets, losing lines of either one, so
+    // each process gets its own file and the warnings are counted over all of them.
     let mut lsp = Lsp::start_with_capabilities_and_log(
         dir.path(),
         json!({"general":{"positionEncodings":["utf-16"]}}),
-        Some(&log_file),
+        Some(&dir.path().join("lsp.{pid}.log")),
     );
+    let warnings = || {
+        let mut logs = String::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if name.starts_with("lsp.") && name.ends_with(".log") {
+                logs += &std::fs::read_to_string(dir.path().join(name)).unwrap();
+            }
+        }
+        rules::warning_count(&logs)
+    };
     let file = dir.path().join("src/Module.bsl");
     lsp.open(&file, &source);
     let uri = lsp_types::Url::from_file_path(&file).unwrap();
@@ -71,7 +84,7 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         pull(&mut lsp, Instant::now() + Duration::from_secs(60)),
         rules::expected(&source, true, true)
     );
-    let initial = rules::warning_count(&std::fs::read_to_string(&log_file).unwrap());
+    let initial = warnings();
     assert!(initial > 0);
     for _ in 0..2 {
         assert_eq!(
@@ -79,7 +92,7 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
             rules::expected(&source, true, true)
         );
     }
-    assert_eq!(rules::warning_count(&std::fs::read_to_string(&log_file).unwrap()), initial);
+    assert_eq!(warnings(), initial);
 
     rules::replace_config(dir.path(), 7);
     let config_uri = lsp_types::Url::from_file_path(dir.path().join("bsl-analyzer.toml")).unwrap();
@@ -92,7 +105,7 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         assert!(Instant::now() < deadline, "changed Typo config never reached diagnostics");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let reloaded = rules::warning_count(&std::fs::read_to_string(&log_file).unwrap());
+    let reloaded = warnings();
     assert!(reloaded > initial);
     for _ in 0..2 {
         assert_eq!(
@@ -100,7 +113,7 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
             rules::expected(&source, true, false)
         );
     }
-    assert_eq!(rules::warning_count(&std::fs::read_to_string(&log_file).unwrap()), reloaded);
+    assert_eq!(warnings(), reloaded);
     assert!(lsp.shutdown(1000).success());
     lsp.assert_protocol_clean();
 }

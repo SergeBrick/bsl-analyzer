@@ -199,10 +199,19 @@ impl<'a> Parser<'a> {
         self.open_inline_inserts = 0;
     }
 
-    /// Drops the crossed `#Если` blocks still waiting for their closer, for
-    /// the same reason as [`Self::forget_inline_inserts`].
-    pub(crate) fn forget_crossed_preproc_ifs(&mut self) {
-        self.crossed_preproc_ifs.clear();
+    /// Sets aside the crossed `#Если` blocks still waiting for their closer, so
+    /// that a method starts without them, for the same reason as
+    /// [`Self::forget_inline_inserts`].
+    pub(crate) fn take_crossed_preproc_ifs(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.crossed_preproc_ifs)
+    }
+
+    /// Puts back what [`Self::take_crossed_preproc_ifs`] set aside, dropping
+    /// the blocks the method left open: one of those would otherwise take the
+    /// `#КонецЕсли` after the method, which closes the region around it. A
+    /// method nested in another's body hands the outer blocks back intact.
+    pub(crate) fn restore_crossed_preproc_ifs(&mut self, outer: Vec<u32>) {
+        self.crossed_preproc_ifs = outer;
     }
 
     /// Counts the `#Если` blocks being parsed, so that a closer can be told

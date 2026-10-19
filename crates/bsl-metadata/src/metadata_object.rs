@@ -97,7 +97,7 @@ impl FromStr for MdoType {
             "внешнийотчет" | "внешнийотчёт" | "externalreport" => {
                 Ok(Self::ExternalReport)
             }
-            "отчет" | "report" => Ok(Self::Report),
+            "отчет" | "отчёт" | "report" => Ok(Self::Report),
             "общиймодуль" | "commonmodule" => Ok(Self::CommonModule),
             "подписканасобытие" | "eventsubscription" => {
                 Ok(Self::EventSubscription)
@@ -465,6 +465,10 @@ pub struct MetadataObject {
     /// predefined set, so `predefined_items` may miss items that exist.
     #[serde(default)]
     pub predefined_unread: bool,
+    /// The base layer's `Ext/Predefined.xml` was read, so an empty `predefined_items`
+    /// means the object declares none; without the file the set is not known.
+    #[serde(default)]
+    pub predefined_read: bool,
     #[serde(default)]
     pub check_unique: bool,
     #[serde(default)]
@@ -842,6 +846,7 @@ impl MetadataObject {
             enum_values: Vec::new(),
             predefined_items: Vec::new(),
             predefined_unread: false,
+            predefined_read: false,
             check_unique: false,
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
@@ -871,6 +876,7 @@ impl MetadataObject {
             enum_values: Vec::new(),
             predefined_items: Vec::new(),
             predefined_unread: false,
+            predefined_read: false,
             check_unique: false,
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
@@ -943,10 +949,12 @@ impl MetadataObject {
             self.enum_values.push(enum_value.clone());
         }
 
-        // An empty base set is «not read», so items an extension adds on top of it
-        // do not make the merged set complete.
+        // A base set nobody read is not known to be empty, so items an extension adds
+        // on top of it do not make the merged set complete.
         self.predefined_unread |= overlay.predefined_unread
-            || (self.predefined_items.is_empty() && !overlay.predefined_items.is_empty());
+            || (self.predefined_items.is_empty()
+                && !self.predefined_read
+                && !overlay.predefined_items.is_empty());
         for predefined_item in &overlay.predefined_items {
             self.predefined_items.retain(|existing| {
                 !stdx::case::eq_ignore_case(&existing.name, &predefined_item.name)
@@ -1068,6 +1076,13 @@ impl MetadataObject {
             stdx::case::eq_ignore_case(&ev.name, name)
                 || ev.name_en.as_ref().is_some_and(|en| stdx::case::eq_ignore_case(en, name))
         })
+    }
+
+    /// Whether `predefined_items` is the object's whole predefined set, so a name it
+    /// lacks is not a predefined item: every layer was read, and the base either had its
+    /// file read or yielded items. Without the file the set is not known to be empty.
+    pub fn predefined_set_known(&self) -> bool {
+        !self.predefined_unread && (self.predefined_read || !self.predefined_items.is_empty())
     }
 
     pub fn find_predefined_item(&self, name: &str) -> Option<&PredefinedItem> {

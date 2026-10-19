@@ -631,9 +631,16 @@ where
                 let name = path.file_name()?.to_str()?;
                 let xml_path = probe_sibling_xml(scope, dir, name)?;
                 let main_xml = fs::read_to_string(&xml_path).ok()?;
+                // A sidecar that exists but cannot be read as text goes on as empty text:
+                // it does not parse, so the items are recorded as unreadable, not absent.
                 let predefined_xml =
                     probe_ext_child(scope, &path, bsl_conventions::ConventionalName::PredefinedXml)
-                        .and_then(|p| fs::read_to_string(p).ok());
+                        .map(|p| {
+                            fs::read_to_string(&p).unwrap_or_else(|error| {
+                        tracing::warn!(%error, path = %p.display(), "cannot read Predefined.xml");
+                        String::new()
+                    })
+                        });
 
                 build_metadata_object(&main_xml, predefined_xml.as_deref(), &parser)
             } else if bsl_conventions::has_extension(&path, bsl_conventions::XML_EXTENSION) {
@@ -668,7 +675,10 @@ where
 
     if let Some(predefined_xml) = predefined_xml {
         match xml_parser::parse_predefined_xml(predefined_xml) {
-            Some(items) => mdo.predefined_items = items,
+            Some(items) => {
+                mdo.predefined_items = items;
+                mdo.predefined_read = true;
+            }
             None => mdo.predefined_unread = true,
         }
         tracing::debug!(
@@ -2020,6 +2030,11 @@ mod tests {
         )
         .expect("catalog parsed from text");
         assert!(!empty.predefined_unread, "a readable empty set is a known set");
+        assert!(empty.predefined_read);
+
+        let absent = parse_metadata_object_from_texts(MdoType::Catalog, xml, None)
+            .expect("catalog parsed from text");
+        assert!(!absent.predefined_read, "without the file the set is not known");
     }
 
     #[test]

@@ -573,11 +573,8 @@ impl LoweringContext<'_> {
                     self.resolver
                         .and_then(|r| r.resolve_metadata_object(mdo_type, object_name))
                         .map(|obj| {
-                            if obj.predefined_items.is_empty() {
-                                true
-                            } else {
-                                obj.find_predefined_item(value_name).is_some()
-                            }
+                            !obj.predefined_set_known()
+                                || obj.find_predefined_item(value_name).is_some()
                         })
                         .unwrap_or(true)
                 } else {

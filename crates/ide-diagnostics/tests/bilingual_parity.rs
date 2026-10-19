@@ -298,6 +298,10 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
     (DiagnosticCode::TypeMismatch, "known bug: message embeds localized type names"),
     (DiagnosticCode::TypeMismatchByDocComment, "known bug: message embeds localized type names"),
     (DiagnosticCode::UnresolvedField, "known bug: message embeds field/type names"),
+    (
+        DiagnosticCode::UnresolvedMetadataPath,
+        "message names the metadata object or predefined value the string literal spells, by design",
+    ),
     (DiagnosticCode::ReadOnlyPropertyAssignment, "known bug: message embeds property/type names"),
     (
         DiagnosticCode::GlobalPropertyNotWritable,
@@ -633,7 +637,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 201, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 202, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

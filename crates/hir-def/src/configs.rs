@@ -442,6 +442,14 @@ pub trait ConfigsDatabase: DefDatabase {
     /// extension configuration without loading the merged configuration.
     fn file_has_visible_config(&self, file_id: FileId) -> bool;
 
+    /// Whether `file_id` lies in the main configuration root or in one of its
+    /// extension roots, and that main root holds `Configuration.xml`. `false` for an
+    /// external data processor or report, a file outside every configuration root,
+    /// and a project without a main configuration (only extensions, only external
+    /// objects, or a bare directory of sources): what such a module refers to by
+    /// name is not described anywhere the analyzer can read.
+    fn file_in_main_configuration(&self, file_id: FileId) -> bool;
+
     /// The documents recording into the register `(parent, register_name)` visible
     /// to `file_id` — a cross-MDO reverse relation aggregated across the base and
     /// the file's extension. Returns owned names (not a borrow) so a db-backed

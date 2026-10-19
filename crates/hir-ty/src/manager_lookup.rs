@@ -118,33 +118,40 @@ pub(crate) fn lookup_predefined(
 /// already knows: an enum manager offers exactly its values, a catalog or chart
 /// manager exactly its predefined items, beside the manager module's exported
 /// variables. A miss there is the platform's «Возможно ошибочное свойство».
-///
-/// An object whose predefined items were not read (no `Ext/Predefined.xml`, or one
-/// that failed to parse, in the base or in any extension layer) leaves the set
-/// unknown, as does an object adopted by an extension whose base is not visible:
-/// the base may hold the missing item.
 pub(crate) fn manager_members_closed(
     db: &dyn TypeKernelDb,
     resolver: &dyn ObjectResolver,
     receiver: TypeId,
 ) -> bool {
-    let (kind, name) = match db.lookup_type(receiver) {
-        TypeKind::ObjectManager(facet) => (facet.mdo, facet.name.clone()),
-        _ => return false,
-    };
-    if predefined_ref_kind_for(kind).is_none() {
-        return false;
+    match db.lookup_type(receiver) {
+        TypeKind::ObjectManager(facet) => {
+            closed_member_owner(resolver, facet.mdo, &facet.name).is_some()
+        }
+        _ => false,
     }
-    let Some(mdo) = find_mdo(resolver, kind, &name) else {
-        return false;
-    };
-    if mdo.object_belonging() == bsl_metadata::ObjectBelonging::Adopted {
-        return false;
-    }
-    match kind {
-        MdoType::Enum => true,
-        _ => !mdo.predefined_unread && !mdo.predefined_items.is_empty(),
-    }
+}
+
+/// The enum, catalog or chart `name` of `kind` when its values or predefined items
+/// are the whole set a member name can be judged against.
+///
+/// An object whose predefined items were not read (no `Ext/Predefined.xml`, or one
+/// that failed to parse, in the base or in any extension layer) leaves the set
+/// unknown, as does an object adopted by an extension whose base is not visible:
+/// the base may hold the missing item. A file that is read and lists nothing is a
+/// known empty set.
+pub(crate) fn closed_member_owner(
+    resolver: &dyn ObjectResolver,
+    kind: MdoType,
+    name: &str,
+) -> Option<Arc<MetadataObject>> {
+    predefined_ref_kind_for(kind)?;
+    let mdo = find_mdo(resolver, kind, name)?;
+    let closed = mdo.object_belonging() != bsl_metadata::ObjectBelonging::Adopted
+        && match kind {
+            MdoType::Enum => true,
+            _ => mdo.predefined_set_known(),
+        };
+    closed.then_some(mdo)
 }
 
 fn predefined_ref_kind_for(kind: MdoType) -> Option<MetadataKind> {
@@ -474,6 +481,45 @@ mod tests {
         assert!(!closed(&db, &configs, MdoType::Catalog, "Хранилища"));
         assert!(!closed(&db, &configs, MdoType::Document, "ПКО"));
         assert!(!closed(&db, &configs, MdoType::Catalog, "НетТакого"));
+    }
+
+    #[test]
+    fn a_read_empty_predefined_set_is_closed() {
+        let mut config = Configuration::new("Test");
+        let mut empty = catalog("Хранилища", vec![]);
+        empty.predefined_read = true;
+        config.add_metadata_object(empty);
+        let configs = wrap(config);
+        let db = InMemoryDb::new();
+
+        assert!(closed(&db, &configs, MdoType::Catalog, "Хранилища"));
+    }
+
+    #[test]
+    fn extension_items_over_a_read_empty_base_close_the_set() {
+        use bsl_metadata::ObjectBelonging;
+
+        let base_uuid = uuid::Uuid::new_v4();
+        let mut main = Configuration::new("Main");
+        let mut base = catalog("Валюты", vec![]);
+        base.predefined_read = true;
+        base.set_uuid(base_uuid);
+        main.add_metadata_object(base);
+
+        let mut ext = Configuration::new("Ext");
+        let mut adopted = catalog("Валюты", vec!["Евро"]);
+        adopted.predefined_read = true;
+        adopted.set_object_belonging(ObjectBelonging::Adopted);
+        adopted.set_extends_uuid(base_uuid);
+        ext.add_metadata_object(adopted);
+
+        let configs = vec![
+            VisibleConfig { name: None, configuration: Arc::new(main) },
+            VisibleConfig { name: Some("Ext".into()), configuration: Arc::new(ext) },
+        ];
+        let db = InMemoryDb::new();
+
+        assert!(closed(&db, &configs, MdoType::Catalog, "Валюты"));
     }
 
     #[test]

@@ -4333,7 +4333,9 @@ impl<'db> InferenceContext<'db> {
             return;
         };
         let text = text.clone();
-        if self.in_uncompiled_branch
+        // While the host loads the workspace every configuration reads as empty.
+        if !self.db.workspace_load_complete()
+            || self.in_uncompiled_branch
             || self.module_compiles_nowhere()
             || !self.db.file_has_visible_config(self.context_file_id)
             || self.bare_module_method_exists(name)

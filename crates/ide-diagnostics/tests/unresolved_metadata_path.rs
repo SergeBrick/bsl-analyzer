@@ -179,11 +179,12 @@ fn reported(source: &str) -> Vec<String> {
 /// [`reported`], with an extension that adds the catalog `Услуги` registered beside
 /// the configuration.
 fn reported_in(source: &str, with_extension: bool) -> Vec<String> {
-    findings_in(source, with_extension).into_iter().map(|(message, _)| message).collect()
+    findings_in(source, with_extension, true).into_iter().map(|(message, _)| message).collect()
 }
 
-/// The messages of the rule with the source text each one points at.
-fn findings_in(source: &str, with_extension: bool) -> Vec<(String, String)> {
+/// The messages of the rule with the source text each one points at; `loaded` is
+/// whether the host has finished loading the workspace.
+fn findings_in(source: &str, with_extension: bool, loaded: bool) -> Vec<(String, String)> {
     let dir = tempfile::tempdir().expect("create fixture directory");
     let root = dir.path().join("cf");
     let root = root.as_path();
@@ -205,6 +206,7 @@ fn findings_in(source: &str, with_extension: bool) -> Vec<(String, String)> {
     db.set_file_source_root(file_id, SourceRootId(0));
     db.set_file_text(file_id, source);
     db.set_all_config_paths(config_paths, Some(bsl_metadata::ExtensionScope::InfoBase));
+    db.set_workspace_load_complete(loaded);
     ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
         .into_iter()
         .filter(|diag| diag.code.as_str() == CODE)
@@ -370,7 +372,7 @@ fn the_finding_points_at_the_string_literal() {
 КонецПроцедуры
 "#;
     let ranges: Vec<String> =
-        findings_in(source, false).into_iter().map(|(_, text)| text).collect();
+        findings_in(source, false, true).into_iter().map(|(_, text)| text).collect();
     assert_eq!(ranges, vec!["\"СправочникСсылка.Услуги\"", "\"Перечисление.Цвета.Зеленый\""]);
 }
 
@@ -541,5 +543,22 @@ fn a_directory_of_sources_without_a_configuration_is_silent() {
             MISSING_CATALOG
         ),
         Vec::<String>::new()
+    );
+}
+
+#[test]
+fn nothing_is_judged_while_the_workspace_is_loading() {
+    let source = r#"
+Процедура Тест() Экспорт
+    Т = Тип("СправочникСсылка.Товары");
+    З = ПредопределенноеЗначение("Перечисление.Цвета.Красный");
+    ОткрытьФорму("Обработка.Загрузка.Форма");
+КонецПроцедуры
+"#;
+    assert_eq!(reported(source), Vec::<String>::new(), "loaded, every object exists");
+    assert_eq!(
+        findings_in(source, false, false),
+        Vec::<(String, String)>::new(),
+        "while loading, the configuration reads as empty"
     );
 }

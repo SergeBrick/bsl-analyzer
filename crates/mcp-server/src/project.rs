@@ -43,8 +43,23 @@ pub fn source_set_override() -> Option<&'static SourceSetOverride> {
     OVERRIDE.get()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Derivations performed by [`at`] on this thread. Thread-local, because tests share one
+    /// process: a process-wide count would absorb whatever the other tests load meanwhile.
+    static AT_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`at`] derivations this thread has performed so far.
+#[cfg(test)]
+pub(crate) fn at_derivations() -> usize {
+    AT_DERIVATIONS.with(std::cell::Cell::get)
+}
+
 /// Builds the project at `root` under this process's source set.
 pub fn at(root: &Path) -> Result<Project, ProjectError> {
+    #[cfg(test)]
+    AT_DERIVATIONS.with(|derivations| derivations.set(derivations.get() + 1));
     let mut config = ProjectConfig::load(root)?.unwrap_or_default();
     if let Some(source_set) = OVERRIDE.get() {
         source_set.apply_to(&mut config);

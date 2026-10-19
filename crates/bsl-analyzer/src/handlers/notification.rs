@@ -527,7 +527,25 @@ pub fn handle_did_close(state: &mut GlobalState, params: DidCloseTextDocumentPar
 
     if let Some(owner) = state.analysis_host.owner().cloned() {
         let mut caught_up = false;
-        if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
+        // A shared session keys open documents by canonical path, so another spelling of
+        // this file (a symlinked directory) can still hold it open; that buffer then
+        // becomes the file's text instead of the file closing under it. With several left,
+        // the least URI is taken so the choice does not follow hash order.
+        let still_open = crate::lsp::file_id(state, &uri).ok().and_then(|file_id| {
+            state
+                .open_file_uri_ids
+                .iter()
+                .filter(|(other, id)| **other != uri && **id == file_id)
+                .map(|(other, _)| other)
+                .min()
+                .and_then(|other| state.mem_docs.get(other))
+                .map(|text| (file_id, Arc::<str>::from(text.as_str())))
+        });
+        if let Some((file_id, text)) = still_open {
+            if let Some(view) = state.analysis_host.view_mut() {
+                view.change(file_id, text);
+            }
+        } else if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
             let path = state.vfs.read().file_path(file_id).as_path().to_path_buf();
             if let Some(token) = state.preload_tokens.remove(&file_id) {
                 token.cancel();
@@ -702,7 +720,11 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
             state.mark_shared_view_changed();
             refresh_after_shared_catch_up(state);
         }
-        state.scope_dirty_docs.remove(&uri);
+        if state.scope_dirty_docs.remove(&uri) && state.diagnostics_config().scope.is_some() {
+            schedule_diagnostics(state, &uri);
+        }
+        state.request_scope_rebuild();
+        state.maybe_spawn_scope_build();
         return Ok(());
     }
 

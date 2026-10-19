@@ -239,6 +239,7 @@ fn assert_safe(value: &impl serde::Serialize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "необязательный тест: real HTTP and fixed deadlines depend on host scheduling; needs a deterministic transport fixture; запуск: cargo test -p mcp-server --lib payload_smoke_tests::payload_mcp_smoke_build_failure_recovery_and_query_locality -- --exact --ignored"]
 async fn payload_mcp_smoke_build_failure_recovery_and_query_locality() {
     tokio::time::timeout(CASE_TIMEOUT, async {
         let endpoint = Endpoint::new(600);

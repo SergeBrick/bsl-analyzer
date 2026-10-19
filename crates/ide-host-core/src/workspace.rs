@@ -56,6 +56,39 @@ pub struct WorkspaceSnapshot {
 struct CatalogState {
     vfs: Vfs,
     files: HashMap<PathBuf, CatalogFile>,
+    /// Shared-VFS ids below this value each have a listing in `files`.
+    listed: u32,
+}
+
+impl CatalogState {
+    fn new(vfs: Vfs) -> Self {
+        let mut state = Self { vfs, files: HashMap::new(), listed: 0 };
+        state.list_allocated();
+        state
+    }
+
+    fn alloc(&mut self, path: PathBuf) -> FileId {
+        let id = self.vfs.alloc_file_id(VfsPath::new(path));
+        self.list_allocated();
+        id
+    }
+
+    /// Every id the shared VFS hands out is listed under its path at once. A consumer that
+    /// mirrors the ids walks the listing in id order, so a VFS id without a listing is a gap
+    /// it cannot reproduce. A new listing stays `Deleted` until a publication reconciles it,
+    /// so an interned but unpublished path is not served.
+    fn list_allocated(&mut self) {
+        while self.listed < self.vfs.num_file_ids() {
+            let file_id = FileId(self.listed);
+            let path = self.vfs.file_path(file_id).as_path().to_path_buf();
+            self.files.entry(path.clone()).or_insert(CatalogFile {
+                file_id,
+                path,
+                state: DiskFileState::Deleted,
+            });
+            self.listed += 1;
+        }
+    }
 }
 
 /// One path interner shared by every adapter for a workspace, available before
@@ -71,22 +104,15 @@ impl Default for WorkspaceCatalog {
 
 impl WorkspaceCatalog {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(CatalogState { vfs: Vfs::new(), files: HashMap::new() })))
+        Self(Arc::new(Mutex::new(CatalogState::new(Vfs::new()))))
     }
 
     pub fn from_vfs(vfs: Vfs) -> Self {
-        Self(Arc::new(Mutex::new(CatalogState { vfs, files: HashMap::new() })))
+        Self(Arc::new(Mutex::new(CatalogState::new(vfs))))
     }
 
     pub fn intern_path(&self, path: PathBuf) -> FileId {
-        let mut state = self.0.lock().expect("workspace catalog mutex poisoned");
-        let id = state.vfs.alloc_file_id(VfsPath::new(path.clone()));
-        state.files.entry(path.clone()).or_insert(CatalogFile {
-            file_id: id,
-            path,
-            state: DiskFileState::Deleted,
-        });
-        id
+        self.0.lock().expect("workspace catalog mutex poisoned").alloc(path)
     }
 
     pub fn register_path(&self, path: PathBuf, file_id: FileId) -> Result<(), FileId> {
@@ -94,13 +120,10 @@ impl WorkspaceCatalog {
         if let Some(existing) = state.files.get(&path) {
             return if existing.file_id == file_id { Ok(()) } else { Err(existing.file_id) };
         }
-        let id = state.vfs.alloc_file_id(VfsPath::new(path.clone()));
+        let id = state.alloc(path);
         if id != file_id {
             return Err(id);
         }
-        state
-            .files
-            .insert(path.clone(), CatalogFile { file_id, path, state: DiskFileState::Deleted });
         Ok(())
     }
 
@@ -130,8 +153,13 @@ impl WorkspaceCatalog {
             .insert(file.path.clone(), file);
     }
 
+    /// Ids allocated inside `f` are listed before the lock is released, so no other caller
+    /// can observe the VFS ahead of the listing.
     pub fn with_vfs<R>(&self, f: impl FnOnce(&mut Vfs) -> R) -> R {
-        f(&mut self.0.lock().expect("workspace catalog mutex poisoned").vfs)
+        let mut state = self.0.lock().expect("workspace catalog mutex poisoned");
+        let result = f(&mut state.vfs);
+        state.list_allocated();
+        result
     }
 }
 
@@ -1336,5 +1364,77 @@ mod tests {
             catalog.files().into_iter().find(|file| file.file_id == FileId(0)).unwrap().state,
             DiskFileState::Readable { revision: 99 }
         ));
+    }
+
+    /// `bsl-analyzer` mirrors the shared catalog into its own VFS by walking the catalog
+    /// in id order and allocating each path locally. That mirror is only correct when the
+    /// catalog lists every id the shared VFS has handed out, so a gap is where it diverges.
+    fn assert_catalog_lists_every_allocated_id(catalog: &WorkspaceCatalog) {
+        let allocated = catalog.with_vfs(|vfs| vfs.num_file_ids());
+        let mut listed: Vec<u32> = catalog.files().iter().map(|file| file.file_id.0).collect();
+        listed.sort_unstable();
+        assert_eq!(listed, (0..allocated).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn rejected_candidate_metadata_id_stays_catalogued() {
+        let catalog = WorkspaceCatalog::new();
+        assert_eq!(catalog.intern_path(PathBuf::from("/ws/Module.bsl")), FileId(0));
+        // The candidate interns its new source file, then its metadata bootstrap allocates a
+        // composing XML id directly in the shared VFS. The candidate is rejected, so no
+        // publication ever lists that XML id.
+        let _candidate_source = catalog.intern_path(PathBuf::from("/ws/New.bsl"));
+        let _candidate_metadata = catalog
+            .with_vfs(|vfs| vfs.alloc_file_id(VfsPath::new(PathBuf::from("/ws/Catalog.xml"))));
+        assert_eq!(catalog.intern_path(PathBuf::from("/ws/Extra.bsl")), FileId(3));
+
+        assert_catalog_lists_every_allocated_id(&catalog);
+    }
+
+    #[test]
+    fn uncatalogued_metadata_id_survives_a_successful_publish_once_its_file_is_gone() {
+        let catalog = WorkspaceCatalog::new();
+        let _module = catalog.intern_path(PathBuf::from("/ws/Module.bsl"));
+        let _metadata = catalog
+            .with_vfs(|vfs| vfs.alloc_file_id(VfsPath::new(PathBuf::from("/ws/Catalog.xml"))));
+        // The XML file is gone before the next candidate, which is accepted without it. Nothing
+        // in that publication refers to the id, so it must not stay a gap in the catalog.
+        let mut next = WorkspaceBackend::with_catalog(AnalysisHost::default(), catalog.clone());
+        assert_eq!(next.publish_full_rebuild_from(0), 1);
+
+        assert_catalog_lists_every_allocated_id(&catalog);
+    }
+
+    #[test]
+    fn mismatched_register_path_does_not_leave_an_uncatalogued_id() {
+        let catalog = WorkspaceCatalog::new();
+        let _module = catalog.intern_path(PathBuf::from("/ws/Module.bsl"));
+        assert_eq!(
+            catalog.register_path(PathBuf::from("/ws/Other.bsl"), FileId(5)),
+            Err(FileId(1))
+        );
+
+        assert_catalog_lists_every_allocated_id(&catalog);
+    }
+
+    #[test]
+    fn unpublished_candidate_path_is_catalogued_deleted_and_not_served() {
+        let (_dir, backend, path) = disk_backend();
+        let catalog = backend.catalog();
+        let generation = backend.snapshot().generation;
+        let candidate_path = path.with_file_name("New.bsl");
+        let candidate_id = catalog.intern_path(candidate_path.clone());
+
+        let snapshot = backend.snapshot();
+        let pending = snapshot
+            .catalog
+            .iter()
+            .find(|file| file.path == candidate_path)
+            .expect("an interned path is listed by the catalog");
+        assert_eq!(pending.file_id, candidate_id);
+        assert_eq!(pending.state, DiskFileState::Deleted);
+        assert_eq!(snapshot.generation, generation);
+        assert!(base_db::SourceDatabase::try_file_revision_input(backend.database(), candidate_id)
+            .is_none());
     }
 }

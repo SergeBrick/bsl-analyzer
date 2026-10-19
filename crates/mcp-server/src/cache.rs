@@ -383,6 +383,12 @@ fn project_scope(project: &project_model::Project) -> std::io::Result<[u8; 32]> 
     for exclusion in exclusions {
         append_field(&mut hasher, &exclusion);
     }
+    // Patterns are folded in only when declared, so a project without them keeps the
+    // stamp it had before patterns existed. The NUL in the tag keeps a pattern apart
+    // from a literal exclusion: no file system path holds one.
+    for pattern in project.source_exclusions().patterns() {
+        append_field(&mut hasher, &[b"pattern\0".as_slice(), pattern.as_bytes()].concat());
+    }
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -675,6 +681,39 @@ mod tests {
             c.root(),
             d.root(),
             "creating an excluded directory is not a declaration change"
+        );
+
+        std::fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nexclude = [\"ignored\"]\nexclude_globs = [\"**/*.Queries.bsl\"]\n",
+        )
+        .unwrap();
+        let patterns_added = project(workspace.path());
+        let e = WorkspaceCacheLayout::for_project(
+            &patterns_added,
+            Some(Path::new("cache")),
+            cwd.path(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(c.root(), e.root(), "declared exclusion patterns identify the scan topology");
+
+        let stamp = |config: &str| {
+            std::fs::write(workspace.path().join("bsl-analyzer.toml"), config).unwrap();
+            WorkspaceCacheLayout::for_project(
+                &project(workspace.path()),
+                Some(Path::new("cache")),
+                cwd.path(),
+                None,
+            )
+            .unwrap()
+            .root()
+            .to_path_buf()
+        };
+        assert_ne!(
+            stamp("[source]\nexclude = [\"a\", \"pattern\", \"q\"]\n"),
+            stamp("[source]\nexclude = [\"a\"]\nexclude_globs = [\"q\"]\n"),
+            "a pattern is told apart from a literal exclusion spelled like its tag"
         );
     }
 

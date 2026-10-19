@@ -257,8 +257,23 @@ impl RequestDispatcher<'_> {
         // that freezes the load. Decline instead: ContentModified is the
         // benign "state changed, retry if still needed" code clients swallow
         // silently, and the vfs_done finalize replays diagnostics and requests
-        // a semantic-tokens refresh, so nothing is permanently lost.
-        if !self.global_state.vfs_done {
+        // a semantic-tokens refresh, so nothing is permanently lost. A shared session
+        // without an editor view is loading too while its owner has no analysis published,
+        // a state that moves without an event resetting `vfs_done`.
+        let serving = if self.global_state.vfs_done {
+            self.global_state.analysis_host.serving_analysis()
+        } else {
+            None
+        };
+        let Some(analysis) = serving else {
+            // A shared session without an editor view has no store holding the file a
+            // syntax request names, only its empty fallback.
+            let host = &self.global_state.analysis_host;
+            let while_loading = if host.is_shared() && host.view().is_none() {
+                WhileLoading::Decline
+            } else {
+                while_loading
+            };
             match while_loading {
                 WhileLoading::Decline => {
                     tracing::debug!(
@@ -285,13 +300,14 @@ impl RequestDispatcher<'_> {
                     );
                     // No cancellation token is registered: a `$/cancelRequest` is read by
                     // this same loop, so it cannot arrive while the handler runs.
-                    let (ctx, _token) = self.latency_context();
+                    let (ctx, _token) =
+                        self.latency_context(self.global_state.analysis_host.analysis());
                     let response = run_latency_handler::<R>(req.id, ctx, params, f);
                     self.global_state.respond(response);
                 }
             }
             return self;
-        }
+        };
 
         if self.global_state.analysis_host.is_shared()
             && self.global_state.request_lifecycles.len()
@@ -371,7 +387,7 @@ impl RequestDispatcher<'_> {
             RequestAttemptKey { id: req.id.clone(), generation, attempt: 1 }
         };
 
-        let (ctx, token) = self.latency_context();
+        let (ctx, token) = self.latency_context(analysis);
         if self.global_state.analysis_host.is_shared() {
             self.global_state.shared_request_stamps.insert(
                 req.id.clone(),
@@ -412,11 +428,13 @@ impl RequestDispatcher<'_> {
         self
     }
 
-    /// A frozen view of the server for one latency handler, with the token that cancels
-    /// the queries it runs.
-    fn latency_context(&self) -> (LatencyRequestContext, salsa::CancellationToken) {
+    /// A frozen view of the server over `analysis` for one latency handler, with the token
+    /// that cancels the queries it runs.
+    fn latency_context(
+        &self,
+        analysis: ide::Analysis,
+    ) -> (LatencyRequestContext, salsa::CancellationToken) {
         let state = &*self.global_state;
-        let analysis = state.analysis_host.analysis();
         let token = analysis.database().cancellation_token();
         let file_paths = if state.analysis_host.is_shared() {
             let bindings = state.open_file_uri_ids.iter().filter_map(|(uri, &file_id)| {

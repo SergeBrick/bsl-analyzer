@@ -335,6 +335,7 @@ pub struct Project {
     extension_in_config_location: Option<PathBuf>,
     extension_paths: Vec<(String, PathBuf)>,
     external_paths: Vec<(String, PathBuf)>,
+    external_discovery_rejections: Vec<ExternalDiscoveryRejection>,
     topology: ExtensionTopology,
     /// `[source].exclude`, resolved. Wins over every root, declared or discovered.
     exclusions: ExcludedPaths,
@@ -342,6 +343,55 @@ pub struct Project {
     /// Such a project must not fall back to the workspace root as an anonymous source
     /// root: the user narrowed the project, and the fallback would widen it instead.
     sources_cut: bool,
+}
+
+/// A current, zero-config external directory that was skipped during discovery.
+/// Paths are relative to the project and reasons are stable codes, not parser text.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExternalDiscoveryRejection {
+    pub relative_path: PathBuf,
+    pub reason: ExternalDiscoveryRejectionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExternalDiscoveryRejectionReason {
+    Configuration,
+    MissingObjectXml,
+    AmbiguousObjectXml,
+    MissingMetadataElement,
+    NotExternalObject,
+    MissingObjectDirectory,
+    EmptyName,
+    AlreadyRoot,
+    RootNameCollision,
+    DuplicateObject,
+}
+
+impl ExternalDiscoveryRejectionReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::MissingObjectXml => "missing_object_xml",
+            Self::AmbiguousObjectXml => "ambiguous_object_xml",
+            Self::MissingMetadataElement => "missing_metadata_element",
+            Self::NotExternalObject => "not_external_object",
+            Self::MissingObjectDirectory => "missing_object_directory",
+            Self::EmptyName => "empty_name",
+            Self::AlreadyRoot => "already_root",
+            Self::RootNameCollision => "root_name_collision",
+            Self::DuplicateObject => "duplicate_object",
+        }
+    }
+}
+
+/// Bounded diagnostic view of the current discovery result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDiscoverySummary {
+    pub fingerprint: [u8; 32],
+    pub rejected_count: usize,
+    pub reason_counts: Vec<(ExternalDiscoveryRejectionReason, usize)>,
+    pub examples: Vec<ExternalDiscoveryRejection>,
+    pub omitted_count: usize,
 }
 
 /// What discovery found at the places a main configuration is expected.
@@ -368,14 +418,20 @@ impl Project {
     ) -> Result<Self, ProjectError> {
         let root = root.into();
         let exclusions = config.source_exclusions(&root)?;
+        let mut external_discovery_rejections = Vec::new();
         let DiscoveredSource {
             configuration: source_path,
             extension: extension_in_config_location,
             excluded: base_excluded,
         } = Self::discover_source_path(&root, &config, &exclusions)?;
         let mut candidates_cut = false;
-        let specs =
-            Self::resolve_extension_specs(&root, &config, &exclusions, &mut candidates_cut)?;
+        let specs = Self::resolve_extension_specs(
+            &root,
+            &config,
+            &exclusions,
+            &mut candidates_cut,
+            &mut external_discovery_rejections,
+        )?;
         let base_path = source_path.as_deref().unwrap_or(&root);
         let canonical_base =
             std::fs::canonicalize(base_path).unwrap_or_else(|_| base_path.to_path_buf());
@@ -404,6 +460,7 @@ impl Project {
             extension_in_config_location,
             extension_paths,
             external_paths,
+            external_discovery_rejections,
             topology,
             exclusions,
             sources_cut: base_excluded || candidates_cut || nodes_cut,
@@ -1031,6 +1088,56 @@ impl Project {
         &self.external_paths
     }
 
+    /// Rejections from this fresh discovery pass; no discovery result is cached.
+    pub fn external_discovery_rejections(&self) -> &[ExternalDiscoveryRejection] {
+        &self.external_discovery_rejections
+    }
+
+    /// Summarizes the current result with deterministic ordering and at most ten paths.
+    pub fn external_discovery_summary(&self) -> ExternalDiscoverySummary {
+        use std::collections::BTreeMap;
+
+        const EXAMPLE_LIMIT: usize = 10;
+        let mut rejections = self.external_discovery_rejections.clone();
+        rejections.sort();
+        let mut reason_counts = BTreeMap::new();
+        let mut hasher = blake3::Hasher::new();
+        for rejection in &rejections {
+            let path = format!("{:?}", rejection.relative_path);
+            let reason = rejection.reason.code();
+            hasher.update(&(path.len() as u64).to_le_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(&(reason.len() as u64).to_le_bytes());
+            hasher.update(reason.as_bytes());
+            *reason_counts.entry(rejection.reason).or_insert(0) += 1;
+        }
+        let rejected_count = rejections.len();
+        let examples = rejections.into_iter().take(EXAMPLE_LIMIT).collect::<Vec<_>>();
+        ExternalDiscoverySummary {
+            fingerprint: *hasher.finalize().as_bytes(),
+            rejected_count,
+            reason_counts: reason_counts.into_iter().collect(),
+            omitted_count: rejected_count.saturating_sub(examples.len()),
+            examples,
+        }
+    }
+
+    /// Emit one bounded summary at a user-facing project-load boundary.
+    pub fn warn_about_external_discovery_rejections(&self) {
+        let summary = self.external_discovery_summary();
+        if summary.rejected_count == 0 {
+            return;
+        }
+        tracing::warn!(
+            target: "project_model::external_discovery",
+            rejected = summary.rejected_count,
+            reasons = ?summary.reason_counts.iter().map(|(reason, count)| (reason.code(), count)).collect::<Vec<_>>(),
+            examples = ?summary.examples.iter().map(|rejection| (&rejection.relative_path, rejection.reason.code())).collect::<Vec<_>>(),
+            omitted = summary.omitted_count,
+            "auto-discovered external directories were skipped"
+        );
+    }
+
     /// The validated extension dependency topology. Holding a `Project` implies
     /// the topology is valid — invalid graphs fail construction instead.
     pub fn extension_topology(&self) -> &ExtensionTopology {
@@ -1044,8 +1151,13 @@ impl Project {
         root: &Path,
         config: &ProjectConfig,
     ) -> Result<Vec<(String, PathBuf)>, TopologyError> {
-        let specs =
-            Self::resolve_extension_specs(root, config, &ExcludedPaths::default(), &mut false)?;
+        let specs = Self::resolve_extension_specs(
+            root,
+            config,
+            &ExcludedPaths::default(),
+            &mut false,
+            &mut Vec::new(),
+        )?;
         Ok(specs.into_iter().map(|spec| (spec.name, spec.path)).collect())
     }
 
@@ -1067,6 +1179,7 @@ impl Project {
         config: &ProjectConfig,
         exclusions: &ExcludedPaths,
         cut: &mut bool,
+        external_discovery_rejections: &mut Vec<ExternalDiscoveryRejection>,
     ) -> Result<Vec<ExtensionNodeSpec>, TopologyError> {
         enum Candidate {
             Legacy(PathBuf),
@@ -1189,7 +1302,14 @@ impl Project {
         // and enters with a unique name so that it is indistinguishable from a
         // declared one afterwards.
         match &config.externals {
-            None => Self::discover_externals(root, exclusions, cut, &mut specs, &mut seen),
+            None => Self::discover_externals(
+                root,
+                exclusions,
+                cut,
+                &mut specs,
+                &mut seen,
+                external_discovery_rejections,
+            ),
             Some(list) => Self::declare_externals(root, list, &mut specs, &mut seen)?,
         }
         Ok(specs)
@@ -1260,6 +1380,7 @@ impl Project {
         cut: &mut bool,
         specs: &mut Vec<ExtensionNodeSpec>,
         seen: &mut std::collections::HashMap<PathBuf, usize>,
+        rejections: &mut Vec<ExternalDiscoveryRejection>,
     ) {
         let mut taken_names: std::collections::HashMap<String, usize> = specs
             .iter()
@@ -1272,47 +1393,44 @@ impl Project {
             let (kind, object) = match classify_external_root(&path) {
                 Ok(classified) => classified,
                 Err(problem) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        problem = %problem.into_error(String::new(), path.clone()),
-                        "discovered directory is not one external object export, skipping"
-                    );
+                    rejections.push(ExternalDiscoveryRejection {
+                        relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                        reason: problem.reason(),
+                    });
                     continue;
                 }
             };
             let name =
                 path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             if name.trim().is_empty() {
-                tracing::warn!(path = %path.display(), "discovered external has an empty name, skipping");
+                rejections.push(ExternalDiscoveryRejection {
+                    relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                    reason: ExternalDiscoveryRejectionReason::EmptyName,
+                });
                 continue;
             }
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if let Some(&first) = seen.get(&canonical) {
-                tracing::warn!(
-                    path = %path.display(),
-                    first = %specs[first].name,
-                    "discovered external is already a root, skipping"
-                );
+            if seen.contains_key(&canonical) {
+                rejections.push(ExternalDiscoveryRejection {
+                    relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                    reason: ExternalDiscoveryRejectionReason::AlreadyRoot,
+                });
                 continue;
             }
             let folded_name = stdx::case::fold_lower_per_char(&name);
-            if let Some(&first) = taken_names.get(&folded_name) {
-                tracing::warn!(
-                    path = %path.display(),
-                    first = %specs[first].path.display(),
-                    name = %name,
-                    "discovered external shares a root name, skipping"
-                );
+            if taken_names.contains_key(&folded_name) {
+                rejections.push(ExternalDiscoveryRejection {
+                    relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                    reason: ExternalDiscoveryRejectionReason::RootNameCollision,
+                });
                 continue;
             }
             let object_key = (kind, stdx::case::fold_lower_per_char(&object));
-            if let Some(&first) = seen_objects.get(&object_key) {
-                tracing::warn!(
-                    path = %path.display(),
-                    first = %specs[first].path.display(),
-                    object = %object,
-                    "discovered external exports an object another root already exports, skipping"
-                );
+            if seen_objects.contains_key(&object_key) {
+                rejections.push(ExternalDiscoveryRejection {
+                    relative_path: path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
+                    reason: ExternalDiscoveryRejectionReason::DuplicateObject,
+                });
                 continue;
             }
             tracing::info!(name = %name, path = %path.display(), ?kind, "discovered external");
@@ -1944,6 +2062,19 @@ enum ExternalRootProblem {
 }
 
 impl ExternalRootProblem {
+    fn reason(&self) -> ExternalDiscoveryRejectionReason {
+        match self {
+            Self::IsAConfiguration => ExternalDiscoveryRejectionReason::Configuration,
+            Self::NoObjectXml => ExternalDiscoveryRejectionReason::MissingObjectXml,
+            Self::AmbiguousObjectXml => ExternalDiscoveryRejectionReason::AmbiguousObjectXml,
+            Self::ObjectElementMissing => ExternalDiscoveryRejectionReason::MissingMetadataElement,
+            Self::NotAnExternalObject { .. } => ExternalDiscoveryRejectionReason::NotExternalObject,
+            Self::ObjectDirMissing { .. } => {
+                ExternalDiscoveryRejectionReason::MissingObjectDirectory
+            }
+        }
+    }
+
     fn into_error(self, name: String, path: PathBuf) -> TopologyError {
         match self {
             Self::IsAConfiguration => TopologyError::ExternalIsAConfiguration { name, path },
@@ -2382,6 +2513,12 @@ pub struct ProjectConfig {
     #[serde(skip)]
     pub source_exclude: Vec<String>,
 
+    /// `[source].exclude_globs`: glob patterns of files and directories taken out of
+    /// the project, matched against paths relative to the directory of the config file.
+    /// Only the TOML config carries it.
+    #[serde(skip)]
+    pub source_exclude_globs: Vec<String>,
+
     #[serde(default, alias = "target_platform_version")]
     pub target_platform_version: Option<String>,
 
@@ -2695,7 +2832,19 @@ impl ProjectConfig {
                 )));
             }
         }
+        self.source_exclude_patterns(Path::new("."))?;
         Ok(())
+    }
+
+    /// `[source].exclude_globs` compiled against `base`; an unusable pattern is a
+    /// configuration error, for the same reason an unusable `exclude` entry is.
+    fn source_exclude_patterns(
+        &self,
+        base: &Path,
+    ) -> Result<stdx::path_exclusion::ExcludedPaths, ConfigLoadError> {
+        stdx::path_exclusion::ExcludedPaths::default()
+            .with_patterns(base, &self.source_exclude_globs)
+            .map_err(|error| self.config_error(format!("source.exclude_globs {error}")))
     }
 
     /// `[source].exclude` resolved against the directory of the config file — not the
@@ -2706,9 +2855,12 @@ impl ProjectConfig {
         project_root: &Path,
     ) -> Result<stdx::path_exclusion::ExcludedPaths, ConfigLoadError> {
         self.validate_source_exclude()?;
-        Ok(stdx::path_exclusion::ExcludedPaths::new(
+        let base = self.config_file_path.as_deref().and_then(Path::parent).unwrap_or(project_root);
+        stdx::path_exclusion::ExcludedPaths::new(
             self.source_exclude.iter().map(|value| self.resolve_config_path(project_root, value)),
-        ))
+        )
+        .with_patterns(base, &self.source_exclude_globs)
+        .map_err(|error| self.config_error(format!("source.exclude_globs {error}")))
     }
 
     pub fn resolve_configuration_path(
@@ -3467,6 +3619,8 @@ struct TomlSourceConfig {
     externals: Option<Vec<ExternalDecl>>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    exclude_globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3533,6 +3687,7 @@ impl From<TomlConfig> for ProjectConfig {
             configuration_root: toml.source.root,
             configuration_dependency: toml.source.configuration,
             source_exclude: toml.source.exclude,
+            source_exclude_globs: toml.source.exclude_globs,
             target_platform_version: toml.target_platform_version,
             platform_help: toml.platform_help,
             min_platform_version: toml.min_platform_version,
@@ -5814,6 +5969,108 @@ extensions = [{ name = "T" }]
     }
 
     #[test]
+    fn source_exclude_globs_take_matching_files_out_of_the_scan() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for relative in [
+            "Allowed.bsl",
+            "temp/Hidden.bsl",
+            ".tool/Hidden.bsl",
+            "Reports/R/Templates/T/Ext/Template.Queries.bsl",
+            "Reports/R/Ext/ObjectModule.bsl",
+            "temporary/Visible.bsl",
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let path = root.join("bsl-analyzer.toml");
+        let scan = |body: &str| {
+            fs::write(&path, body).unwrap();
+            let config = ProjectConfig::load_from_file(&path).unwrap();
+            let project = Project::with_config(root, config).unwrap();
+            let set =
+                SourceSet::scan_in_scope(&project.source_roots(), &[], project.source_exclusions());
+            let mut walked: Vec<String> = set
+                .files
+                .iter()
+                .map(|file| {
+                    let relative = file.walked.strip_prefix(root).unwrap();
+                    relative.to_string_lossy().replace('\\', "/")
+                })
+                .filter(|relative| relative.ends_with(".bsl"))
+                .collect();
+            walked.sort();
+            (walked, project)
+        };
+
+        let (without, _) = scan("[source]\nroot = \".\"\n");
+        assert_eq!(without.len(), 6, "positive control: every file is scanned without patterns");
+
+        let (with, project) = scan(
+            "[source]\nroot = \".\"\nexclude_globs = [\"temp\", \".tool/**\", \"**/*.Queries.bsl\"]\n",
+        );
+        assert_eq!(
+            with,
+            ["Allowed.bsl", "Reports/R/Ext/ObjectModule.bsl", "temporary/Visible.bsl"]
+        );
+        assert!(project.is_source_excluded(&root.join("temp/Hidden.bsl")));
+        assert!(project
+            .is_source_excluded(&root.join("Reports/R/Templates/T/Ext/Template.Queries.bsl")));
+        assert!(!project.is_source_excluded(&root.join("temporary/Visible.bsl")));
+    }
+
+    #[test]
+    fn source_exclude_globs_are_relative_to_the_config_directory() {
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        let config_dir = project_root.join("ci");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("bsl-analyzer.toml");
+        fs::write(&path, "[source]\nroot = \"../src\"\nexclude_globs = [\"gen/**\"]\n").unwrap();
+
+        let excluded =
+            ProjectConfig::load_from_file(&path).unwrap().source_exclusions(&project_root).unwrap();
+
+        assert!(excluded.is_excluded(&config_dir.join("gen/Module.bsl")));
+        assert!(!excluded.is_excluded(&project_root.join("gen/Module.bsl")));
+    }
+
+    #[test]
+    fn an_absent_or_empty_exclude_globs_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("bsl-analyzer.toml");
+        let load = |body: &str| {
+            fs::write(&path, body).unwrap();
+            ProjectConfig::load_from_file(&path).unwrap().source_exclusions(root).unwrap()
+        };
+
+        let absent = load("[source]\nroot = \".\"\nexclude = [\".tmp\"]\n");
+        let empty = load("[source]\nroot = \".\"\nexclude = [\".tmp\"]\nexclude_globs = []\n");
+        assert_eq!(absent, empty);
+        assert_eq!(absent, crate::ExcludedPaths::new([root.join(".tmp")]));
+        assert!(absent.patterns().next().is_none());
+    }
+
+    #[test]
+    fn source_exclude_globs_reject_unusable_patterns() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bsl-analyzer.toml");
+
+        fs::write(&path, "[source]\nexclude_globs = \"temp\"\n").unwrap();
+        assert!(ProjectConfig::load_from_file(&path).is_err(), "a string is not the list contract");
+
+        for pattern in ["", "!temp", "/temp", "a[", "../shared"] {
+            fs::write(&path, format!("[source]\nexclude_globs = [{pattern:?}]\n")).unwrap();
+            let error = ProjectConfig::load_from_file(&path)
+                .expect_err(&format!("{pattern:?} was accepted"))
+                .to_string();
+            assert!(error.contains("source.exclude_globs"), "{pattern:?}: {error}");
+        }
+    }
+
+    #[test]
     fn source_exclude_rejects_non_lists_absolute_paths_and_empty_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bsl-analyzer.toml");
@@ -7429,10 +7686,11 @@ type_narrowing = false
 #[cfg(test)]
 mod external_root_tests {
     use super::{
-        DiagnosticsBaselinePartitionIdentity, ExtensionDecl, ExternalDecl, ExternalObjectKind,
-        NodeKind, Project, ProjectConfig, ProjectError, StructuredExtensionDecl, TopologyError,
+        DiagnosticsBaselinePartitionIdentity, ExtensionDecl, ExternalDecl,
+        ExternalDiscoveryRejection, ExternalDiscoveryRejectionReason, ExternalObjectKind, NodeKind,
+        Project, ProjectConfig, ProjectError, StructuredExtensionDecl, TopologyError,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     fn structured(name: &str, path: &str, deps: &[&str]) -> ExtensionDecl {
@@ -8092,7 +8350,7 @@ externals = [
 
     /// Whatever lies under a container must not stop a project that loaded
     /// before the container was looked at: every refusal of a declared external
-    /// is a warning and a skip for a discovered one.
+    /// is an error for a declared one and a recorded rejection for a discovered one.
     #[test]
     fn discovery_skips_what_a_declaration_would_refuse() {
         let dir = tempdir().unwrap();
@@ -8109,6 +8367,19 @@ externals = [
             ProjectConfig { configuration_root: Some("src/cf".into()), ..Default::default() };
         let project = Project::with_config(dir.path(), config.clone()).unwrap();
         assert!(project.external_paths().is_empty(), "{:?}", project.external_paths());
+        assert_eq!(
+            project.external_discovery_rejections(),
+            &[
+                ExternalDiscoveryRejection {
+                    relative_path: PathBuf::from("src/epf/Битый"),
+                    reason: ExternalDiscoveryRejectionReason::NotExternalObject,
+                },
+                ExternalDiscoveryRejection {
+                    relative_path: PathBuf::from("src/epf/Расш"),
+                    reason: ExternalDiscoveryRejectionReason::Configuration,
+                },
+            ]
+        );
 
         // The controls: declared, the same directories are refused by name.
         for (path, expect) in [
@@ -8119,6 +8390,28 @@ externals = [
                 ProjectConfig { externals: Some(vec![external("X", path)]), ..config.clone() };
             let err = Project::with_config(dir.path(), declared).unwrap_err();
             assert!(format!("{err:?}").contains(expect), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn external_discovery_summary_is_relative_deterministic_and_bounded() {
+        let dir = tempdir().unwrap();
+        for index in 0..11 {
+            std::fs::create_dir_all(dir.path().join(format!("src/epf/invalid-{index:02}")))
+                .unwrap();
+        }
+        let project = Project::with_config(dir.path(), ProjectConfig::default()).unwrap();
+        let first = project.external_discovery_summary();
+        assert_eq!(first.rejected_count, 11);
+        assert_eq!(first.examples.len(), 10);
+        assert_eq!(first.omitted_count, 1);
+        assert!(first.examples.iter().all(|example| {
+            example.reason == ExternalDiscoveryRejectionReason::MissingObjectXml
+                && !example.relative_path.is_absolute()
+        }));
+        assert!(first.examples.windows(2).all(|pair| pair[0] <= pair[1]));
+        for _ in 0..10_000 {
+            assert_eq!(project.external_discovery_summary().fingerprint, first.fingerprint);
         }
     }
 

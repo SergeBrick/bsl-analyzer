@@ -100,7 +100,8 @@ fn collect_bsl_files(source_roots: &[PathBuf]) -> Result<Vec<PathBuf>, walkdir::
 
 /// The analysis file universe: every module body under the source roots, first
 /// spelling wins across overlapping roots. A directory the project excluded is not
-/// entered, under whatever spelling the walk reaches it.
+/// entered, under whatever spelling the walk reaches it, and a file an exclusion
+/// pattern matches is left out.
 fn collect_bsl_files_in_scope(
     source_roots: &[PathBuf],
     exclusions: &project_model::ExcludedPaths,
@@ -112,12 +113,15 @@ fn collect_bsl_files_in_scope(
         let mut resolved = project_model::ResolvedDirs::default();
         let walk =
             walkdir::WalkDir::new(root).follow_links(true).into_iter().filter_entry(|entry| {
-                !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
-                    || !exclusions.prunes_walked_dir(
+                if entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink() {
+                    !exclusions.prunes_walked_dir(
                         entry.path(),
                         entry.path_is_symlink(),
                         &mut resolved,
                     )
+                } else {
+                    !exclusions.excludes_walked_file(entry.path(), &mut resolved)
+                }
             });
         for entry in walk {
             let entry = entry?;
@@ -429,6 +433,7 @@ fn analyze_salsa(
     // instead of the raw `-s` dir, so vendored/build copies such as
     // `.build/vendor` are not analyzed as a duplicate configuration.
     let project = project_model::Project::with_config(&source_dir, proj_config.clone())?;
+    project.warn_about_external_discovery_rejections();
     if baseline_command.is_some() && project.diagnostics_baseline()?.is_none() {
         return Err("[diagnostics.baseline].path is not configured".into());
     }

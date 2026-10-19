@@ -127,6 +127,19 @@ impl SessionAnalysisHost {
         }
     }
 
+    /// [`Self::analysis`] for answering a request, or `None` while a shared session without
+    /// an editor view has no published owner analysis: the empty fallback store would answer
+    /// as an empty workspace instead of as one that is not ready.
+    pub fn serving_analysis(&self) -> Option<Analysis> {
+        match self {
+            Self::Shared { owner, view: None, .. } => match owner.request_analysis() {
+                mcp_server::WorkspaceRead::Ready(analysis) => Some(analysis),
+                _ => None,
+            },
+            _ => Some(self.analysis()),
+        }
+    }
+
     /// The revision of the store [`Self::analysis`] reads, which is the store a request takes
     /// its own revision from. Without an editor view that is the owner's database, not the
     /// fallback [`Self::raw_database`] returns, and the two count revisions independently.

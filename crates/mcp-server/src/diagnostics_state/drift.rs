@@ -1738,18 +1738,39 @@ pub(super) fn config_identity(
     hasher.finish()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Probes run by [`config_identity_probe`] on this thread. Thread-local for the same reason as
+    /// the derivation count in `project::at`: tests share one process.
+    static CONFIG_IDENTITY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of [`config_identity_probe`] runs this thread has performed so far.
+#[cfg(test)]
+pub(super) fn config_identity_probes() -> usize {
+    CONFIG_IDENTITY_PROBES.with(std::cell::Cell::get)
+}
+
 /// [`config_identity`] against a freshly derived project state — the cheap
 /// (config-file stat + config parse + extension discovery, no tree walk) probe
 /// the post-publication re-check and the throttled scan use. The stat is taken
 /// BEFORE the project load, pairing with how the build captures its baseline.
 pub(super) fn config_identity_now(root: &Path) -> u64 {
+    config_identity_probe(root).0
+}
+
+/// [`config_identity_now`] together with the verdict of the same load: whether the project at
+/// `root` validates. One derivation answers both, so a caller that needs the verdict does not
+/// pay a second project load for it, and the identity it is judged against is taken from the
+/// very state that produced the verdict.
+pub(super) fn config_identity_probe(root: &Path) -> (u64, bool) {
+    #[cfg(test)]
+    CONFIG_IDENTITY_PROBES.with(|probes| probes.set(probes.get() + 1));
     let config_files_fp = config_files_fingerprint(root);
     // No exclusions, and none are needed: this snapshot is read for its configs alone
     // and never walked, so what the tree contains does not reach the answer.
-    config_identity(
-        config_files_fp,
-        &crate::graph::input::ProjectSnapshot::load_excluding(root, &[]).configs,
-    )
+    let snapshot = crate::graph::input::ProjectSnapshot::load_excluding(root, &[]);
+    (config_identity(config_files_fp, &snapshot.configs), snapshot.validated)
 }
 
 /// Whether the ignored-authors filter must be (re)built. Fail-open logic:

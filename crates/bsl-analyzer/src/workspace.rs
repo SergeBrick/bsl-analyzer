@@ -465,21 +465,8 @@ impl GlobalState {
                 }
             }
         }
-        // A `<DefaultRunMode>` edit can change the derived `ordinaryAppSupport` of the
-        // diagnostics too; rebuild their config only when it did.
         if configuration_xml_changed {
-            let derived = self
-                .project
-                .as_ref()
-                .and_then(project_model::Project::ordinary_app_support)
-                .is_some_and(|(value, _)| value);
-            if derived != self.diagnostics_config.ordinary_app_support {
-                tracing::info!(
-                    ordinary_app_support = derived,
-                    "Configuration.xml changed the derived ordinaryAppSupport"
-                );
-                self.update_diagnostics_config();
-            }
+            self.rederive_diagnostics_ordinary_app_support();
         }
 
         // A listed module body `.bsl` add/remove (common module or service) changes its
@@ -1093,6 +1080,25 @@ impl GlobalState {
         // A `Configuration.xml` edit made during the initial load arrives in a batch
         // that skips the reread; the complete workspace is read here.
         self.apply_configuration_xml_settings();
+        self.rederive_diagnostics_ordinary_app_support();
+    }
+
+    /// A `<DefaultRunMode>` edit can change the derived `ordinaryAppSupport` of the
+    /// diagnostics as well as the execution model; rebuild the diagnostics config
+    /// only when it did.
+    fn rederive_diagnostics_ordinary_app_support(&mut self) {
+        let derived = self
+            .project
+            .as_ref()
+            .and_then(project_model::Project::ordinary_app_support)
+            .is_some_and(|(value, _)| value);
+        if derived != self.diagnostics_config.ordinary_app_support {
+            tracing::info!(
+                ordinary_app_support = derived,
+                "Configuration.xml changed the derived ordinaryAppSupport"
+            );
+            self.update_diagnostics_config();
+        }
     }
 
     /// Incrementally refresh the metadata substrate for the config roots owning any
@@ -2030,5 +2036,46 @@ mod compatibility_mode_tests {
         state.vfs.write().set_file_contents(VfsPath::new(xml_path), Some(Arc::from(changed)));
         state.process_changes(false);
         assert_eq!(support(&state), (false, false));
+    }
+
+    /// An edit made during the initial load is picked up by the end-of-load bootstrap
+    /// for the diagnostics config as well as for the execution model.
+    #[test]
+    fn a_default_run_mode_edit_during_the_initial_load_reaches_both_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        let cf = root.join("src/cf");
+        std::fs::create_dir_all(&cf).unwrap();
+        let xml = |mode: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <DefaultRunMode>{mode}</DefaultRunMode>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        let xml_path = cf.join("Configuration.xml");
+        std::fs::write(&xml_path, xml("ManagedApplication")).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        let support = |state: &GlobalState| {
+            (
+                state.diagnostics_config.ordinary_app_support,
+                state.analysis_host.raw_database().env_options().ordinary_app_support,
+            )
+        };
+        assert_eq!(support(&state), (false, false));
+
+        let changed = xml("OrdinaryApplication");
+        std::fs::write(&xml_path, &changed).unwrap();
+        state.vfs.write().set_file_contents(VfsPath::new(xml_path), Some(Arc::from(changed)));
+        state.process_changes(true);
+        assert_eq!(support(&state), (false, false));
+
+        state.init_source_root();
+        state.bootstrap_metadata_substrate();
+        assert_eq!(support(&state), (true, true));
     }
 }

@@ -1,6 +1,7 @@
 use crate::metadata_object::PredefinedItem;
 
-/// The predefined items `xml` lists; `None` when it is not well-formed XML.
+/// `None` when the text is not well-formed XML, so a broken file is told apart from
+/// a readable one that lists no items.
 pub fn parse_predefined_xml(xml: &str) -> Option<Vec<PredefinedItem>> {
     let doc = match roxmltree::Document::parse(xml) {
         Ok(doc) => doc,
@@ -71,7 +72,7 @@ mod tests {
     </Item>
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml).expect("well-formed predefined XML");
+        let items = parse_predefined_xml(xml).unwrap();
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].name, "EmailПартнера");
@@ -116,7 +117,7 @@ mod tests {
     </Item>
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml).expect("well-formed predefined XML");
+        let items = parse_predefined_xml(xml).unwrap();
 
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].name, "РодительскийЭлемент");
@@ -138,7 +139,7 @@ mod tests {
                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml).expect("well-formed predefined XML");
+        let items = parse_predefined_xml(xml).unwrap();
         assert!(items.is_empty());
     }
 
@@ -164,7 +165,7 @@ mod tests {
     </Item>
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml).expect("well-formed predefined XML");
+        let items = parse_predefined_xml(xml).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "НормальныйЭлемент");
     }

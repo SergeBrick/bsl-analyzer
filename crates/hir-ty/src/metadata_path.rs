@@ -167,7 +167,7 @@ fn predefined_value_missing(
         | MdoType::ChartOfAccounts
         | MdoType::ChartOfCharacteristicTypes
         | MdoType::ChartOfCalculationTypes => {
-            if mdo.predefined_unreadable {
+            if mdo.predefined_unread {
                 return None;
             }
             mdo.find_predefined_item(value).is_some()

@@ -676,7 +676,7 @@ where
     if let Some(predefined_xml) = predefined_xml {
         match xml_parser::parse_predefined_xml(predefined_xml) {
             Some(items) => mdo.predefined_items = items,
-            None => mdo.predefined_unreadable = true,
+            None => mdo.predefined_unread = true,
         }
         tracing::debug!(
             name = %mdo.name,
@@ -2011,6 +2011,22 @@ mod tests {
             .find_metadata_object(MdoType::Catalog, "Справочник1")
             .expect("catalog from directory load");
         assert_eq!(&parsed, from_dir);
+    }
+
+    #[test]
+    fn unparsable_predefined_sidecar_marks_the_set_unread() {
+        let xml = include_str!("../fixtures/designer/Catalogs/Справочник1.xml");
+        let broken = parse_metadata_object_from_texts(MdoType::Catalog, xml, Some("<Predefined"))
+            .expect("catalog parsed from text");
+        assert!(broken.predefined_unread);
+
+        let empty = parse_metadata_object_from_texts(
+            MdoType::Catalog,
+            xml,
+            Some(r#"<PredefinedData xmlns="http://v8.1c.ru/8.3/xcf/predef"/>"#),
+        )
+        .expect("catalog parsed from text");
+        assert!(!empty.predefined_unread, "a readable empty set is a known set");
     }
 
     #[test]

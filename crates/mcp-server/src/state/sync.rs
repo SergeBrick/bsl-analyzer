@@ -2023,6 +2023,7 @@ mod tests {
     fn a_dormant_sink_waits_for_a_batch_newer_than_the_budget_it_spent() {
         use crate::change_hub::{test_support::eventually_within, WorkspaceChangeHub};
         use std::time::Duration;
+        const STATE_BOUND: Duration = Duration::from_secs(60);
 
         let dir = tempdir().unwrap();
         let workspace = dir.path().to_path_buf();
@@ -2072,11 +2073,30 @@ mod tests {
             );
         }
 
-        fs::write(workspace.join("Late.bsl"), "Процедура Поздняя() КонецПроцедуры\n").unwrap();
-        assert!(
-            rx.recv_timeout(crate::change_hub::test_support::STATE_CEILING).is_ok(),
-            "work delivered after the budget ran out must open the next one"
-        );
+        // The waiter reads the hub's generation only once it runs, so a single write may be
+        // taken by the hub before that read and never count as late. Writing again after every
+        // batch the hub takes, until the waiter answers, leaves the outcome to the order of
+        // events alone. The wait only ends on success, so a waiter that never answers fails
+        // the test at the hang guard instead of stalling the runner.
+        let give_up = std::time::Instant::now() + test_utils::wait::hang_guard(STATE_BOUND);
+        let mut seen = hub.generation();
+        let mut attempt = 0u32;
+        while rx.try_recv().is_err() {
+            let left = give_up.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "work delivered after the budget ran out must open the next one"
+            );
+            attempt += 1;
+            fs::write(
+                workspace.join("Late.bsl"),
+                format!("Процедура Поздняя{attempt}() КонецПроцедуры\n"),
+            )
+            .unwrap();
+            let next = hub.wait_for_change_or(seen, left, || false);
+            assert!(next > seen, "the hub took no batch for the late write");
+            seen = next;
+        }
         waiter.join().unwrap();
         hub.shutdown();
     }

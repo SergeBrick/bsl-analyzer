@@ -194,6 +194,10 @@ impl<'a> Parser<'a> {
 
     /// Drops the crossed `#Если` blocks still waiting for their closer, for
     /// the same reason as [`Self::forget_inline_inserts`].
+    ///
+    /// Called when a method ends as well: a block left open there would
+    /// otherwise take the `#КонецЕсли` after the method, which closes the
+    /// region around it.
     pub(crate) fn forget_crossed_preproc_ifs(&mut self) {
         self.crossed_preproc_ifs.clear();
     }

@@ -139,6 +139,7 @@ pub fn procedure_def_content(p: &mut Parser) {
     });
 
     statements::expect_stmt_list_terminator(p, T![KwEndProcedure], recovered);
+    p.forget_crossed_preproc_ifs();
 }
 
 pub fn function_def(p: &mut Parser) {
@@ -181,6 +182,7 @@ pub fn function_def_content(p: &mut Parser) {
     });
 
     statements::expect_stmt_list_terminator(p, T![KwEndFunction], recovered);
+    p.forget_crossed_preproc_ifs();
 }
 
 fn param_list(p: &mut Parser) {

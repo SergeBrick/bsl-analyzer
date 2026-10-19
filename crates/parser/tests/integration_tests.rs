@@ -687,6 +687,28 @@ fn test_preprocessor_if_crossing_an_else_if_keeps_enclosing_region() {
 }
 
 #[test]
+fn test_preprocessor_if_unclosed_in_method_keeps_enclosing_closer() {
+    // A block left open at the end of a method is an error, but the
+    // `#КонецЕсли` right after the method still closes the module-level region.
+    let bodies = [
+        "#Если Клиент Тогда\n    Х = 1;",
+        "Если Х Тогда\n#Если Клиент Тогда\nИначеЕсли Й Тогда\nКонецЕсли;",
+    ];
+    for (head, tail) in [("Процедура А()", "КонецПроцедуры"), ("Функция А()", "КонецФункции")]
+    {
+        for body in bodies {
+            let region = format!("#Если Сервер Тогда\n{head}\n{body}\n{tail}\n#КонецЕсли");
+            let input = format!("{region}\nПроцедура Б()\nКонецПроцедуры\n");
+            let root = parse(&input).syntax_node();
+            let regions: Vec<_> =
+                root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
+            assert_eq!(regions.len(), 1, "{input}: {regions:?}");
+            assert_eq!(regions[0].text().to_string(), region, "the region ends at its #КонецЕсли");
+        }
+    }
+}
+
+#[test]
 fn test_small_file_performance() {
     let input = r#"Функция Тест() Экспорт
     Результат = 10 + 20;

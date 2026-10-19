@@ -1522,6 +1522,10 @@ pub(super) fn apply_resident_changes(
                 resident.project.compatibility_mode(),
             );
             ide_host_core::apply_ordinary_forms_setting(&mut resident.db, Some(&resident.project));
+            // `<DefaultRunMode>` can decide the diagnostics' `ordinaryAppSupport`; the
+            // config is otherwise read once, at the build.
+            resident.config.ordinary_app_support =
+                ide_host_core::effective_ordinary_app_support(&resident.project);
             metadata_changed = true;
         }
         moved = true;
@@ -1926,6 +1930,43 @@ mod tests {
         );
         assert!(!rebuild, "an edit inside the configuration root is applied in place");
         assert_eq!(setting(&resident), Some(true));
+    }
+
+    /// The diagnostics `ordinaryAppSupport` derived from `<DefaultRunMode>` follows an
+    /// edit of `Configuration.xml` applied in place, as a fresh build would read it.
+    #[test]
+    fn the_resident_rederives_ordinary_app_support_on_a_configuration_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        sample_workspace(root);
+        let xml = |mode: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <DefaultRunMode>{mode}</DefaultRunMode>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        write(root, "Configuration.xml", &xml("ManagedApplication"));
+
+        let mut resident = DiagnosticsState::build_resident_for_test(root);
+        assert!(!resident.config().ordinary_app_support);
+
+        write(root, "Configuration.xml", &xml("OrdinaryApplication"));
+        let (rebuild, _) = apply_resident_changes(
+            &mut resident,
+            &[root.join("Configuration.xml")],
+            &[],
+            &[],
+            &[],
+            |_| None,
+            &HashMap::new(),
+        );
+        assert!(!rebuild, "an edit inside the configuration root is applied in place");
+        assert!(resident.config().ordinary_app_support);
+        assert!(
+            !resident.db.env_options().ordinary_app_support,
+            "the resident's execution model is not built from the project settings"
+        );
     }
 
     /// What a consumer of the resident sees for one path: the generation it is served at,

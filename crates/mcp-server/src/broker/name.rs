@@ -620,7 +620,7 @@ pub const TOPOLOGY_FP_ENV: &str = "BSL_MCP_TOPOLOGY_FP";
 /// without its userinfo, plus the query, which can select an API version or a deployment.
 /// The credential travels in `EMBEDDING_API_KEY` as a header, so the query is not where a
 /// key belongs.
-fn embedding_endpoint_identity(url: &str) -> String {
+pub fn embedding_endpoint_identity(url: &str) -> String {
     let redacted = bsl_platform::redact_url(url);
     let without_fragment = url.split('#').next().unwrap_or(url);
     match without_fragment.split_once('?') {

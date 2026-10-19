@@ -558,6 +558,8 @@ mod tests {
         // Settled, not merely ready: the publish pass checks ownership too, and one still
         // running when the lease file is taken below would pause admission on its own.
         crate::graph::test_support::wait_settled(&graph);
+        // Populate the idle pool before timing reads with lease I/O blocked.
+        drop(crate::graph::test_support::hold_every_handle(&graph));
         // Keep the heartbeat from observing the deliberately held OS lock as Unknown and
         // pausing the graph pool while the request-only checkout is being measured: every
         // ownership check queues on the lifecycle lock for the whole window instead.

@@ -64,7 +64,7 @@ impl SessionAnalysisHost {
     }
 
     pub fn prepare_view_for_open(&mut self) {
-        if !self.is_shared() {
+        if !self.is_shared() || self.view().is_some() {
             return;
         }
         let snapshot = WorkspaceSnapshot::capture(&RootDatabaseImpl::new(), 0);

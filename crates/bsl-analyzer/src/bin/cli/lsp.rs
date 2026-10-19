@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     path::{Path, PathBuf},
     time::Duration,
@@ -31,8 +31,13 @@ pub fn run_lsp_server(args: LspArgs) -> Result<(), Box<dyn Error + Send + Sync>>
         LspMode::Stdio => bsl_analyzer::main_loop(connection),
         LspMode::Auto => run_auto(connection),
     };
-    if result.is_ok() {
-        io_threads.join().ok();
+    match &result {
+        Ok(()) => {
+            io_threads.join().ok();
+        }
+        // Termination prints the error to stderr only; the log file is where an editor
+        // session's failure is looked for afterwards.
+        Err(error) => tracing::error!(error = format!("{error:#}"), "LSP session failed"),
     }
     result.map_err(Into::into)
 }
@@ -77,47 +82,153 @@ fn standalone_with_initial(connection: Connection, initial: Message) -> Result<(
 }
 
 struct BackendPipe {
-    write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    /// Drained by its own task, so the relay waits for room in it as one more event and
+    /// keeps draining the backend meanwhile: a relay that waited inside a write would stop
+    /// draining the backend's output, while the backend may wait for that output to drain
+    /// before it reads more input.
+    outgoing: Option<tokio::sync::mpsc::Sender<Message>>,
+    writer: Option<tokio::task::JoinHandle<Result<()>>>,
     messages: tokio::sync::mpsc::Receiver<Message>,
     controls: tokio::sync::mpsc::Receiver<LspControl>,
     reader: tokio::task::JoinHandle<Result<()>>,
     _send_control: tokio::sync::mpsc::Sender<LspControl>,
 }
 
-impl Drop for BackendPipe {
-    fn drop(&mut self) {
-        self.reader.abort();
+impl BackendPipe {
+    fn new(
+        io: tokio::io::DuplexStream,
+        controls: tokio::sync::mpsc::Receiver<LspControl>,
+        send_control: tokio::sync::mpsc::Sender<LspControl>,
+    ) -> Self {
+        let (read, mut write) = tokio::io::split(io);
+        let (outgoing, mut queued) = tokio::sync::mpsc::channel::<Message>(16);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = queued.recv().await {
+                shared::write_lsp_message(&mut write, &message).await?;
+            }
+            Ok(())
+        });
+        let (sender, messages) = tokio::sync::mpsc::channel(16);
+        let reader = tokio::spawn(async move {
+            let mut read = tokio::io::BufReader::new(read);
+            while let Some(message) = shared::read_lsp_message(&mut read).await? {
+                if sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        Self {
+            outgoing: Some(outgoing),
+            writer: Some(writer),
+            messages,
+            controls,
+            reader,
+            _send_control: send_control,
+        }
+    }
+
+    /// Waits for room for one message; `None` once the writer has ended.
+    fn room(&self) -> impl std::future::Future<Output = Option<OwnedPermit>> + use<> {
+        let outgoing = self.outgoing.clone();
+        async move {
+            match outgoing {
+                Some(outgoing) => outgoing.reserve_owned().await.ok(),
+                None => None,
+            }
+        }
+    }
+
+    /// Why the writer ended.
+    async fn write_failure(&mut self) -> anyhow::Error {
+        self.outgoing = None;
+        match self.writer.take() {
+            Some(writer) => match writer.await {
+                Ok(Err(error)) => error.context("LSP backend write failed"),
+                Ok(Ok(())) => anyhow::anyhow!("LSP backend stopped accepting messages"),
+                Err(error) => error.into(),
+            },
+            None => anyhow::anyhow!("LSP backend stopped accepting messages"),
+        }
+    }
+
+    /// Delivers what was already handed to the writer. The backend's output is drained
+    /// meanwhile, for the same reason the relay drains it while it waits for room.
+    async fn finish(&mut self) -> Result<()> {
+        self.outgoing = None;
+        let Some(mut writer) = self.writer.take() else { return Ok(()) };
+        let mut draining = true;
+        loop {
+            tokio::select! {
+                result = &mut writer => return result?.context("LSP backend write failed"),
+                message = self.messages.recv(), if draining => draining = message.is_some(),
+            }
+        }
+    }
+
+    /// Why the backend's output ended: its read error when there was one.
+    async fn disconnected(&mut self) -> anyhow::Error {
+        let error = "LSP backend disconnected; session cannot be replayed";
+        match (&mut self.reader).await {
+            Ok(Err(cause)) => cause.context(error),
+            _ => anyhow::anyhow!(error),
+        }
     }
 }
 
+impl Drop for BackendPipe {
+    fn drop(&mut self) {
+        self.reader.abort();
+        if let Some(writer) = &self.writer {
+            writer.abort();
+        }
+    }
+}
+
+type OwnedPermit = tokio::sync::mpsc::OwnedPermit<Message>;
+
 enum RelayEvent {
     Control(Option<LspControl>),
+    Writable(Option<OwnedPermit>),
     Backend(Option<Message>),
     Client(Option<Message>),
 }
 
+/// `room` is awaited only while a message waits for the backend, and the client is read only
+/// while none does: the client is held back by the backend's pace, the backend never by the
+/// client's.
 async fn next_relay_event(
     controls: &mut tokio::sync::mpsc::Receiver<LspControl>,
+    room: Option<impl std::future::Future<Output = Option<OwnedPermit>>>,
     backend: &mut tokio::sync::mpsc::Receiver<Message>,
     client: &mut tokio::sync::mpsc::Receiver<Message>,
     controls_open: bool,
     prefer_client: bool,
 ) -> RelayEvent {
+    let reads_client = room.is_none();
+    let room = async move {
+        match room {
+            Some(room) => room.await,
+            None => std::future::pending().await,
+        }
+    };
     // Retirement must precede EOF. Alternate ready data directions so either
     // continuous producer still allows progress on the other side.
     if prefer_client {
         tokio::select! {
             biased;
             event = controls.recv(), if controls_open => RelayEvent::Control(event),
-            event = client.recv() => RelayEvent::Client(event),
+            permit = room => RelayEvent::Writable(permit),
+            event = client.recv(), if reads_client => RelayEvent::Client(event),
             event = backend.recv() => RelayEvent::Backend(event),
         }
     } else {
         tokio::select! {
             biased;
             event = controls.recv(), if controls_open => RelayEvent::Control(event),
+            permit = room => RelayEvent::Writable(permit),
             event = backend.recv() => RelayEvent::Backend(event),
-            event = client.recv() => RelayEvent::Client(event),
+            event = client.recv(), if reads_client => RelayEvent::Client(event),
         }
     }
 }
@@ -148,18 +259,7 @@ async fn connect_backend(root: &Path, context: &LspContext) -> Result<BackendPip
         channel.send_control(LspControl::ResumeLsp(bytes)).await?;
     }
     let (io, controls, send_control) = channel.into_parts();
-    let (read, write) = tokio::io::split(io);
-    let (sender, messages) = tokio::sync::mpsc::channel(16);
-    let reader = tokio::spawn(async move {
-        let mut read = tokio::io::BufReader::new(read);
-        while let Some(message) = shared::read_lsp_message(&mut read).await? {
-            if sender.send(message).await.is_err() {
-                break;
-            }
-        }
-        Ok(())
-    });
-    Ok(BackendPipe { write, messages, controls, reader, _send_control: send_control })
+    Ok(BackendPipe::new(io, controls, send_control))
 }
 
 async fn relay_lsp(
@@ -176,7 +276,7 @@ async fn relay_lsp(
     if let Message::Request(request) = &initial {
         pending.insert(request.id.clone(), request.method.clone());
     }
-    shared::write_lsp_message(&mut backend.write, &initial).await?;
+    let mut outbox = VecDeque::from([initial]);
     let (sender, mut incoming) = tokio::sync::mpsc::channel(16);
     let receiver = connection.receiver;
     tokio::task::spawn_blocking(move || {
@@ -199,117 +299,188 @@ async fn relay_lsp(
     let mut shutdown_requested = false;
     let mut controls_open = true;
     let mut prefer_client = false;
-    let result = async { loop {
-        match next_relay_event(&mut backend.controls, &mut backend.messages, &mut incoming, controls_open, prefer_client).await {
-            RelayEvent::Control(control) => match control {
-                Some(LspControl::ScopeRetired { .. }) => {
-                    cancel_pending(&connection.sender, &mut pending);
-                    if !initialized || shutdown_requested { break Err(anyhow::anyhow!("workspace retired during initialization or shutdown")); }
-                    if awaiting_rebind_ready { break Err(anyhow::anyhow!("workspace retired again before the rebound session became ready")); }
-                    // Only a replayed document can confirm the rebound session: with none
-                    // open there is nothing to confirm, and nothing a later rebind could lose.
-                    awaiting_rebind_ready = !documents.is_empty();
-                    pending_rebind_refresh.clear();
-                    for id in pending_server.drain() {
-                        connection.sender.send(Message::Notification(lsp_server::Notification::new(
-                            "$/cancelRequest".into(), serde_json::json!({"id": id}),
-                        )))?;
+    let result = async {
+        loop {
+            let room = (!outbox.is_empty()).then(|| backend.room());
+            match next_relay_event(
+                &mut backend.controls,
+                room,
+                &mut backend.messages,
+                &mut incoming,
+                controls_open,
+                prefer_client,
+            )
+            .await
+            {
+                RelayEvent::Control(control) => match control {
+                    Some(LspControl::ScopeRetired { .. }) => {
+                        cancel_pending(&connection.sender, &mut pending);
+                        if !initialized || shutdown_requested {
+                            break Err(anyhow::anyhow!(
+                                "workspace retired during initialization or shutdown"
+                            ));
+                        }
+                        if awaiting_rebind_ready {
+                            break Err(anyhow::anyhow!(
+                                "workspace retired again before the rebound session became ready"
+                            ));
+                        }
+                        // Only a replayed document can confirm the rebound session: with none
+                        // open there is nothing to confirm, and nothing a later rebind could lose.
+                        awaiting_rebind_ready = !documents.is_empty();
+                        pending_rebind_refresh.clear();
+                        for id in pending_server.drain() {
+                            connection.sender.send(Message::Notification(
+                                lsp_server::Notification::new(
+                                    "$/cancelRequest".into(),
+                                    serde_json::json!({"id": id}),
+                                ),
+                            ))?;
+                        }
+                        for (_, token) in active_progress.drain() {
+                            connection.sender.send(Message::Notification(
+                                lsp_server::Notification::new(
+                                    "$/progress".into(),
+                                    serde_json::json!({"token": token, "value": {"kind": "end"}}),
+                                ),
+                            ))?;
+                        }
+                        progress_generation = progress_generation.saturating_add(1);
+                        let context = LspContext {
+                            initialize_params: Some(initialize_params.clone()),
+                            announced_capabilities: announced_capabilities.clone(),
+                            next_server_request_id,
+                            progress_generation,
+                        };
+                        backend = match connect_backend(&root, &context).await {
+                            Ok(backend) => backend,
+                            Err(error) => break Err(error.context("LSP workspace rebind failed")),
+                        };
+                        controls_open = true;
+                        // What waited for the retired backend is covered by the replay below and
+                        // by the cancellation of its pending requests above.
+                        outbox.clear();
+                        for uri in documents.uris() {
+                            let params = lsp_types::DidOpenTextDocumentParams {
+                                text_document: lsp_types::TextDocumentItem {
+                                    uri: uri.clone(),
+                                    language_id: "bsl".into(),
+                                    version: documents.get_version(&uri).unwrap_or_default(),
+                                    text: documents.get(&uri).unwrap_or_default(),
+                                },
+                            };
+                            outbox.push_back(Message::Notification(lsp_server::Notification::new(
+                                "textDocument/didOpen".into(),
+                                params,
+                            )));
+                        }
                     }
-                    for (_, token) in active_progress.drain() {
-                        connection.sender.send(Message::Notification(lsp_server::Notification::new(
-                            "$/progress".into(), serde_json::json!({"token": token, "value": {"kind": "end"}}),
-                        )))?;
+                    Some(LspControl::ResumeLsp(_)) => {
+                        break Err(anyhow::anyhow!("unexpected daemon resume control"))
                     }
-                    progress_generation = progress_generation.saturating_add(1);
-                    let context = LspContext { initialize_params: Some(initialize_params.clone()), announced_capabilities: announced_capabilities.clone(), next_server_request_id, progress_generation };
-                    backend = match connect_backend(&root, &context).await {
-                        Ok(backend) => backend,
-                        Err(error) => break Err(error.context("LSP workspace rebind failed")),
-                    };
-                    controls_open = true;
-                    for uri in documents.uris() {
-                        let params = lsp_types::DidOpenTextDocumentParams { text_document: lsp_types::TextDocumentItem {
-                            uri: uri.clone(), language_id: "bsl".into(),
-                            version: documents.get_version(&uri).unwrap_or_default(),
-                            text: documents.get(&uri).unwrap_or_default(),
-                        }};
-                        shared::write_lsp_message(&mut backend.write, &Message::Notification(lsp_server::Notification::new("textDocument/didOpen".into(), params))).await?;
+                    None => controls_open = false,
+                },
+                RelayEvent::Writable(Some(permit)) => {
+                    if let Some(message) = outbox.pop_front() {
+                        permit.send(message);
                     }
                 }
-                Some(LspControl::ResumeLsp(_)) => break Err(anyhow::anyhow!("unexpected daemon resume control")),
-                None => controls_open = false,
-            },
-            RelayEvent::Backend(message) => {
-                prefer_client = true;
-                match message {
-                Some(message) => {
-                    if awaiting_rebind_ready && confirms_rebind_publication(&message, &documents) {
-                        awaiting_rebind_ready = false;
-                    }
-                    match &message {
-                        Message::Response(response) => {
-                            let Some(method) = pending.remove(&response.id) else { continue };
-                            if method == "initialize" {
-                                initialized = response.error.is_none();
-                                announced_capabilities = response.result.as_ref().map(|result| result["capabilities"].clone());
-                            }
-                        },
-                        Message::Request(request) => {
-                            pending_server.insert(request.id.clone());
+                RelayEvent::Writable(None) => break Err(backend.write_failure().await),
+                RelayEvent::Backend(message) => {
+                    prefer_client = true;
+                    match message {
+                        Some(message) => {
                             if awaiting_rebind_ready
-                                && is_supported_rebind_refresh(
-                                    &request.method,
-                                    rebind_refresh_capabilities,
-                                )
+                                && confirms_rebind_publication(&message, &documents)
                             {
-                                pending_rebind_refresh.insert(request.id.clone());
-                            }
-                            if let Some(id) = serde_json::to_value(&request.id)?.as_i64() {
-                                next_server_request_id = next_server_request_id.max(i32::try_from(id)?.checked_add(1).context("server request id overflow")?);
-                            }
-                        },
-                        Message::Notification(notification) => {
-                            if notification.method == "$/progress" {
-                                let token = notification.params["token"].clone();
-                                let key = serde_json::to_string(&token)?;
-                                match notification.params["value"]["kind"].as_str() {
-                                    Some("begin") => { active_progress.insert(key, token); },
-                                    Some("end") => { active_progress.remove(&key); },
-                                    _ => {},
-                                }
-                            }
-                        },
-                    }
-                    connection.sender.send(message)?;
-                }
-                None if shutdown_requested => break Ok(()),
-                None => break Err(anyhow::anyhow!("LSP backend disconnected; session cannot be replayed")),
-                }
-            },
-            RelayEvent::Client(message) => {
-                prefer_client = false;
-                match message {
-                Some(message) => {
-                    match &message {
-                        Message::Request(request) => {
-                            shutdown_requested |= request.method == "shutdown";
-                            pending.insert(request.id.clone(), request.method.clone());
-                        },
-                        Message::Notification(notification) => mirror_document(&mut documents, notification, encoding),
-                        Message::Response(response) => {
-                            if !pending_server.remove(&response.id) { continue; }
-                            if rebind_refresh_completed(response, &mut pending_rebind_refresh) {
                                 awaiting_rebind_ready = false;
                             }
-                        },
+                            match &message {
+                                Message::Response(response) => {
+                                    let Some(method) = pending.remove(&response.id) else {
+                                        continue;
+                                    };
+                                    if method == "initialize" {
+                                        initialized = response.error.is_none();
+                                        announced_capabilities = response
+                                            .result
+                                            .as_ref()
+                                            .map(|result| result["capabilities"].clone());
+                                    }
+                                }
+                                Message::Request(request) => {
+                                    pending_server.insert(request.id.clone());
+                                    if awaiting_rebind_ready
+                                        && is_supported_rebind_refresh(
+                                            &request.method,
+                                            rebind_refresh_capabilities,
+                                        )
+                                    {
+                                        pending_rebind_refresh.insert(request.id.clone());
+                                    }
+                                    if let Some(id) = serde_json::to_value(&request.id)?.as_i64() {
+                                        next_server_request_id = next_server_request_id.max(
+                                            i32::try_from(id)?
+                                                .checked_add(1)
+                                                .context("server request id overflow")?,
+                                        );
+                                    }
+                                }
+                                Message::Notification(notification) => {
+                                    if notification.method == "$/progress" {
+                                        let token = notification.params["token"].clone();
+                                        let key = serde_json::to_string(&token)?;
+                                        match notification.params["value"]["kind"].as_str() {
+                                            Some("begin") => {
+                                                active_progress.insert(key, token);
+                                            }
+                                            Some("end") => {
+                                                active_progress.remove(&key);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            connection.sender.send(message)?;
+                        }
+                        None if shutdown_requested => break Ok(()),
+                        None => break Err(backend.disconnected().await),
                     }
-                    shared::write_lsp_message(&mut backend.write, &message).await?;
                 }
-                None => break Ok(()),
+                RelayEvent::Client(message) => {
+                    prefer_client = false;
+                    match message {
+                        Some(message) => {
+                            match &message {
+                                Message::Request(request) => {
+                                    shutdown_requested |= request.method == "shutdown";
+                                    pending.insert(request.id.clone(), request.method.clone());
+                                }
+                                Message::Notification(notification) => {
+                                    mirror_document(&mut documents, notification, encoding)
+                                }
+                                Message::Response(response) => {
+                                    if !pending_server.remove(&response.id) {
+                                        continue;
+                                    }
+                                    if rebind_refresh_completed(
+                                        response,
+                                        &mut pending_rebind_refresh,
+                                    ) {
+                                        awaiting_rebind_ready = false;
+                                    }
+                                }
+                            }
+                            outbox.push_back(message);
+                        }
+                        None => break backend.finish().await,
+                    }
                 }
-            },
+            }
         }
-    }}.await;
+    }
+    .await;
     cancel_pending(&connection.sender, &mut pending);
     result
 }
@@ -441,7 +612,112 @@ fn mirror_document(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    /// A relay that stalls leaves these waits with nothing else to end them.
+    const GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
+
+    async fn guarded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(GUARD, future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never completed"))
+    }
+
+    fn relay_over(
+        io: tokio::io::DuplexStream,
+    ) -> (Connection, tokio::task::JoinHandle<Result<()>>) {
+        let (server, client) = Connection::memory();
+        let (send_control, controls) = tokio::sync::mpsc::channel(1);
+        let initialize = Message::Request(lsp_server::Request::new(
+            RequestId::from(1),
+            "initialize".into(),
+            serde_json::json!({"capabilities": {}}),
+        ));
+        let relay = tokio::spawn(relay_lsp(
+            server,
+            BackendPipe::new(io, controls, send_control),
+            PathBuf::new(),
+            initialize,
+            serde_json::json!({"capabilities": {}}),
+            lsp_types::InitializeParams::default(),
+        ));
+        (client, relay)
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_the_backend_while_a_write_to_it_is_blocked() {
+        let (relay_io, backend_io) = tokio::io::duplex(4096);
+        let (backend_read, mut backend_write) = tokio::io::split(backend_io);
+        let mut backend_read = tokio::io::BufReader::new(backend_read);
+        let (client, relay) = relay_over(relay_io);
+        let initialize =
+            guarded("the initialize request", shared::read_lsp_message(&mut backend_read))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(initialize, Message::Request(request) if request.method == "initialize"));
+
+        client
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                RequestId::from(2),
+                "test/large".into(),
+                "я".repeat(64 * 1024),
+            )))
+            .unwrap();
+        // The backend stops reading once the large request has started to arrive, so the
+        // rest of it cannot be written while the backend has output of its own to deliver.
+        let mut first = [0u8; 1];
+        guarded("the large request", backend_read.read_exact(&mut first)).await.unwrap();
+        guarded(
+            "the backend's notification",
+            shared::write_lsp_message(
+                &mut backend_write,
+                &Message::Notification(lsp_server::Notification::new(
+                    "test/progress".into(),
+                    serde_json::Value::Null,
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let (client, forwarded) = tokio::task::spawn_blocking(move || {
+            let forwarded = client
+                .receiver
+                .recv_timeout(GUARD)
+                .expect("the backend's notification is forwarded");
+            (client, forwarded)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(forwarded, Message::Notification(notification) if notification.method == "test/progress")
+        );
+        relay.abort();
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_backend_framing_error_is_the_reported_cause() {
+        let (relay_io, backend_io) = tokio::io::duplex(4096);
+        let (backend_read, mut backend_write) = tokio::io::split(backend_io);
+        let mut backend_read = tokio::io::BufReader::new(backend_read);
+        let (client, relay) = relay_over(relay_io);
+        guarded("the initialize request", shared::read_lsp_message(&mut backend_read))
+            .await
+            .unwrap()
+            .unwrap();
+
+        backend_write.write_all(b"Content-Length: 50\r\n\r\n{}").await.unwrap();
+        backend_write.shutdown().await.unwrap();
+
+        let error = guarded("the relay", relay).await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("truncated LSP body"), "{error:#}");
+        drop(client);
+    }
 
     #[tokio::test]
     async fn relay_services_both_ready_data_producers_and_prioritizes_retirement() {
@@ -457,12 +733,13 @@ mod tests {
         backend_tx.send(message()).await.unwrap();
         client_tx.send(message()).await.unwrap();
         assert!(matches!(
-            next_relay_event(&mut controls, &mut backend, &mut client, true, false).await,
+            next_relay_event(&mut controls, no_room(), &mut backend, &mut client, true, false)
+                .await,
             RelayEvent::Backend(Some(_))
         ));
         backend_tx.send(message()).await.unwrap();
         assert!(matches!(
-            next_relay_event(&mut controls, &mut backend, &mut client, true, true).await,
+            next_relay_event(&mut controls, no_room(), &mut backend, &mut client, true, true).await,
             RelayEvent::Client(Some(_))
         ));
         client_tx.send(message()).await.unwrap();
@@ -471,13 +748,32 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            next_relay_event(&mut controls, &mut backend, &mut client, true, true).await,
+            next_relay_event(&mut controls, no_room(), &mut backend, &mut client, true, true).await,
             RelayEvent::Control(Some(LspControl::ScopeRetired { .. }))
         ));
         assert!(matches!(
-            next_relay_event(&mut controls, &mut backend, &mut client, false, false).await,
+            next_relay_event(&mut controls, no_room(), &mut backend, &mut client, false, false)
+                .await,
             RelayEvent::Backend(Some(_))
         ));
+
+        // While a message waits for room toward the backend, the client is not read even
+        // when it has the turn; the backend still is.
+        backend_tx.send(message()).await.unwrap();
+        let waiting = Some(std::future::pending::<Option<OwnedPermit>>());
+        assert!(matches!(
+            next_relay_event(&mut controls, waiting, &mut backend, &mut client, false, true).await,
+            RelayEvent::Backend(Some(_))
+        ));
+        assert!(matches!(
+            next_relay_event(&mut controls, no_room(), &mut backend, &mut client, false, true)
+                .await,
+            RelayEvent::Client(Some(_))
+        ));
+    }
+
+    fn no_room() -> Option<std::future::Pending<Option<OwnedPermit>>> {
+        None
     }
 
     #[test]

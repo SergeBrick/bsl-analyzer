@@ -7060,8 +7060,22 @@ mod tests {
         let seeded = state.analysis_host.view().expect("open editor view").generation();
         std::fs::write(&closed, "Процедура Стало() Экспорт КонецПроцедуры\n")
             .expect("rewrite the closed source");
-        let mcp_server::WorkspaceRead::Ready(published) = owner.refresh_saved_path(&closed) else {
-            panic!("the owner publishes the closed file's new text");
+        // The owner's watcher can publish the same write first: the refresh then reports
+        // that the owner changed under it, and the next one finds the new text published.
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::hang_guard(std::time::Duration::from_secs(20));
+        let published = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the owner never published the closed file's new text"
+            );
+            match owner.refresh_saved_path(&closed) {
+                mcp_server::WorkspaceRead::Ready(published) => break published,
+                mcp_server::WorkspaceRead::Busy => std::thread::yield_now(),
+                mcp_server::WorkspaceRead::Failed(reason)
+                    if reason == "saved_path_owner_changed" => {}
+                _ => panic!("the owner publishes the closed file's new text"),
+            }
         };
         assert!(published.generation > seeded, "the owner is ahead of the view");
 

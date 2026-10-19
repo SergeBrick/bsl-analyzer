@@ -211,7 +211,11 @@ fn lsp_serves_the_configured_corpus_until_restart() {
     let dir = project(&external("a.json"));
     let file = dir.path().join("Module.bsl");
 
-    let mut lsp = Lsp::start(dir.path());
+    // The help snapshot belongs to the serving process. A shared backend keys on the help
+    // source, so the source change below retires it and the session rebinds to one that
+    // already loaded the new corpus, at whatever moment the retirement lands: the
+    // until-restart contract is the stdio server's own.
+    let mut lsp = Lsp::start_stdio(dir.path());
     lsp.open(&file, MODULE);
     let first = hover_add(&mut lsp, &file, 100);
     assert!(
@@ -244,7 +248,7 @@ fn lsp_serves_the_configured_corpus_until_restart() {
     assert!(still.contains("Corpus A text."), "the running server keeps its snapshot: {still}");
     drop(lsp);
 
-    let mut restarted = Lsp::start(dir.path());
+    let mut restarted = Lsp::start_stdio(dir.path());
     restarted.open(&file, MODULE);
     let after = hover_add(&mut restarted, &file, 2000);
     assert!(after.contains("Corpus B text."), "a restart picks up the new source: {after}");

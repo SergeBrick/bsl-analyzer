@@ -66,10 +66,7 @@ impl LoweringContext<'_> {
             .map(|n| self.lower_expr(&n))
             .unwrap_or_else(|| ExprHir::Missing { range: node.text_range() });
 
-        let negated = node
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .any(|token| token.kind() == syntax::SyntaxKind::KW_NOT);
+        let negated = has_direct_token(node, syntax::SyntaxKind::KW_NOT);
 
         self.record_keyword_by_text(
             node,
@@ -79,12 +76,7 @@ impl LoweringContext<'_> {
         );
 
         if negated {
-            self.record_keyword_by_text(
-                node,
-                "NOT",
-                "НЕ",
-                crate::source_map::TokenCategory::Operator,
-            );
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
 
         self.record_keyword_by_text(
@@ -111,19 +103,10 @@ impl LoweringContext<'_> {
             .map(|n| self.lower_expr(&n))
             .unwrap_or_else(|| ExprHir::Missing { range: node.text_range() });
 
-        let negated = node.descendants_with_tokens().any(|el| {
-            el.as_token().map(|t| t.kind() == syntax::SyntaxKind::KW_NOT).unwrap_or(false)
-        });
+        let negated = has_direct_token(node, syntax::SyntaxKind::KW_NOT);
 
         if negated {
-            for element in node.descendants_with_tokens() {
-                if let Some(token) = element.as_token() {
-                    if token.kind() == syntax::SyntaxKind::KW_NOT {
-                        self.record_token(token, crate::source_map::TokenCategory::Operator);
-                        break;
-                    }
-                }
-            }
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
 
         for element in node.descendants_with_tokens() {
@@ -190,6 +173,11 @@ impl LoweringContext<'_> {
             .map(|n| self.lower_expr(&n))
             .unwrap_or_else(|| ExprHir::Missing { range: node.text_range() });
 
+        let negated = has_direct_token(node, syntax::SyntaxKind::KW_NOT);
+        if negated {
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
+        }
+
         for element in node.descendants_with_tokens() {
             if let Some(token) = element.as_token() {
                 if token.kind() == syntax::SyntaxKind::KW_IN {
@@ -228,7 +216,7 @@ impl LoweringContext<'_> {
             let subquery_hir = self.lower_in_subquery(&root_node);
             return ExprHir::In {
                 expr: Box::new(expr),
-                negated: false,
+                negated,
                 values: InValues::Subquery(Box::new(subquery_hir)),
                 ty: SdblType::Boolean,
                 range: node.text_range(),
@@ -236,12 +224,22 @@ impl LoweringContext<'_> {
         }
 
         let root_expr = self.lower_expr(&root_node);
-        ExprHir::BinaryOp {
+        let membership = ExprHir::BinaryOp {
             lhs: Box::new(expr),
             op: crate::hir::BinaryOp::Eq,
             rhs: Box::new(root_expr),
             ty: SdblType::Boolean,
             range: node.text_range(),
+        };
+        if negated {
+            ExprHir::UnaryOp {
+                op: crate::hir::UnaryOp::Not,
+                expr: Box::new(membership),
+                ty: SdblType::Boolean,
+                range: node.text_range(),
+            }
+        } else {
+            membership
         }
     }
 
@@ -252,20 +250,13 @@ impl LoweringContext<'_> {
             .map(|n| self.lower_expr(&n))
             .unwrap_or_else(|| ExprHir::Missing { range: node.text_range() });
 
-        let negated = node.descendants_with_tokens().any(|el| {
-            el.as_token().map(|t| t.kind() == syntax::SyntaxKind::KW_NOT).unwrap_or(false)
-        });
+        let negated = has_direct_token(node, syntax::SyntaxKind::KW_NOT);
 
         if negated {
-            for element in node.descendants_with_tokens() {
-                if let Some(token) = element.as_token() {
-                    if token.kind() == syntax::SyntaxKind::KW_NOT {
-                        self.record_token(token, crate::source_map::TokenCategory::Operator);
-                        break;
-                    }
-                }
-            }
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
+
+        self.record_direct_token(node, syntax::SyntaxKind::KW_AND);
 
         self.record_keyword_by_text(
             node,
@@ -302,19 +293,10 @@ impl LoweringContext<'_> {
             .map(|n| self.lower_expr(n))
             .unwrap_or_else(|| ExprHir::Missing { range: node.text_range() });
 
-        let negated = node.descendants_with_tokens().any(|el| {
-            el.as_token().map(|t| t.kind() == syntax::SyntaxKind::KW_NOT).unwrap_or(false)
-        });
+        let negated = has_direct_token(node, syntax::SyntaxKind::KW_NOT);
 
         if negated {
-            for element in node.descendants_with_tokens() {
-                if let Some(token) = element.as_token() {
-                    if token.kind() == syntax::SyntaxKind::KW_NOT {
-                        self.record_token(token, crate::source_map::TokenCategory::Operator);
-                        break;
-                    }
-                }
-            }
+            self.record_direct_token(node, syntax::SyntaxKind::KW_NOT);
         }
 
         self.record_keyword_by_text(
@@ -401,4 +383,22 @@ impl LoweringContext<'_> {
             range: node.text_range(),
         }
     }
+
+    fn record_direct_token(&mut self, node: &syntax::SyntaxNode, kind: syntax::SyntaxKind) {
+        if let Some(token) = node
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .find(|token| token.kind() == kind)
+        {
+            self.record_token(&token, crate::source_map::TokenCategory::Operator);
+        }
+    }
+}
+
+/// A predicate owns only the tokens directly under its node; a `НЕ` deeper down belongs
+/// to a nested predicate or subquery.
+fn has_direct_token(node: &syntax::SyntaxNode, kind: syntax::SyntaxKind) -> bool {
+    node.children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .any(|token| token.kind() == kind)
 }

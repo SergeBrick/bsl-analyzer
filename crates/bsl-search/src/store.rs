@@ -8781,7 +8781,10 @@ mod tests {
                 tracing_subscriber::registry().with(Capture(records.clone()).with_filter(level)),
                 f,
             );
-            Arc::try_unwrap(records).unwrap().into_inner().unwrap()
+            // tracing-core briefly upgrades every registered dispatcher while another test thread
+            // registers a callsite, so the subscriber may still be shared here; take the records.
+            let taken = std::mem::take(&mut *records.lock().unwrap());
+            taken
         }
 
         fn mixed(store: &mut Store, root: &str, path: &str) -> i64 {

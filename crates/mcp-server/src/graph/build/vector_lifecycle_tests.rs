@@ -2059,7 +2059,10 @@ fn capture(f: impl FnOnce()) -> Vec<Value> {
     }
     let records = Arc::new(Mutex::new(Vec::new()));
     test_utils::with_subscriber(tracing_subscriber::registry().with(Capture(records.clone())), f);
-    Arc::try_unwrap(records).unwrap().into_inner().unwrap()
+    // tracing-core briefly upgrades every registered dispatcher while another test thread
+    // registers a callsite, so the subscriber may still be shared here; take the records.
+    let taken = std::mem::take(&mut *records.lock().unwrap());
+    taken
 }
 
 #[test]

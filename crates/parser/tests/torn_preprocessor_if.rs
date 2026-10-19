@@ -218,3 +218,16 @@ fn a_group_whose_brackets_pair_inside_each_branch_stays_a_container() {
     assert!(parts(&root).is_empty());
     assert!(root.descendants().any(|node| node.kind() == SyntaxKind::PRE_IF_DIR));
 }
+
+#[test]
+fn a_torn_group_inside_an_unclosed_block_keeps_its_own_directives() {
+    let source = "Процедура А()\nЕсли Х Тогда\n#Если Клиент Тогда\nИначеЕсли Й Тогда\n#Если Сервер Тогда\nЕсли Ф Тогда\n#Иначе\nФ = 2;\n#КонецЕсли\nКонецЕсли;\nКонецЕсли;\nКонецПроцедуры\n";
+    let root = parser::parse(source).syntax_node();
+    assert_eq!(root.text().to_string(), source);
+    let offset = source.find("Ф = 2").unwrap().try_into().unwrap();
+    let token = root.token_at_offset(offset).right_biased().unwrap();
+    assert!(
+        token.parent_ancestors().any(|node| node.kind() == SyntaxKind::PRE_TORN_IF_PART),
+        "the removed branch of the torn group must not parse as live code"
+    );
+}

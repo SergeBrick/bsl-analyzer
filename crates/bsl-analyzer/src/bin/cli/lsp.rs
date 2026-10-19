@@ -616,6 +616,15 @@ mod tests {
 
     use super::*;
 
+    /// A relay that stalls leaves these waits with nothing else to end them.
+    const GUARD: Duration = test_utils::wait::hang_guard(Duration::from_secs(30));
+
+    async fn guarded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(GUARD, future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never completed"))
+    }
+
     fn relay_over(
         io: tokio::io::DuplexStream,
     ) -> (Connection, tokio::task::JoinHandle<Result<()>>) {
@@ -643,7 +652,11 @@ mod tests {
         let (backend_read, mut backend_write) = tokio::io::split(backend_io);
         let mut backend_read = tokio::io::BufReader::new(backend_read);
         let (client, relay) = relay_over(relay_io);
-        let initialize = shared::read_lsp_message(&mut backend_read).await.unwrap().unwrap();
+        let initialize =
+            guarded("the initialize request", shared::read_lsp_message(&mut backend_read))
+                .await
+                .unwrap()
+                .unwrap();
         assert!(matches!(initialize, Message::Request(request) if request.method == "initialize"));
 
         client
@@ -657,19 +670,25 @@ mod tests {
         // The backend stops reading once the large request has started to arrive, so the
         // rest of it cannot be written while the backend has output of its own to deliver.
         let mut first = [0u8; 1];
-        backend_read.read_exact(&mut first).await.unwrap();
-        shared::write_lsp_message(
-            &mut backend_write,
-            &Message::Notification(lsp_server::Notification::new(
-                "test/progress".into(),
-                serde_json::Value::Null,
-            )),
+        guarded("the large request", backend_read.read_exact(&mut first)).await.unwrap();
+        guarded(
+            "the backend's notification",
+            shared::write_lsp_message(
+                &mut backend_write,
+                &Message::Notification(lsp_server::Notification::new(
+                    "test/progress".into(),
+                    serde_json::Value::Null,
+                )),
+            ),
         )
         .await
         .unwrap();
 
         let (client, forwarded) = tokio::task::spawn_blocking(move || {
-            let forwarded = client.receiver.recv().unwrap();
+            let forwarded = client
+                .receiver
+                .recv_timeout(GUARD)
+                .expect("the backend's notification is forwarded");
             (client, forwarded)
         })
         .await
@@ -687,12 +706,15 @@ mod tests {
         let (backend_read, mut backend_write) = tokio::io::split(backend_io);
         let mut backend_read = tokio::io::BufReader::new(backend_read);
         let (client, relay) = relay_over(relay_io);
-        shared::read_lsp_message(&mut backend_read).await.unwrap().unwrap();
+        guarded("the initialize request", shared::read_lsp_message(&mut backend_read))
+            .await
+            .unwrap()
+            .unwrap();
 
         backend_write.write_all(b"Content-Length: 50\r\n\r\n{}").await.unwrap();
         backend_write.shutdown().await.unwrap();
 
-        let error = relay.await.unwrap().unwrap_err();
+        let error = guarded("the relay", relay).await.unwrap().unwrap_err();
         assert!(format!("{error:#}").contains("truncated LSP body"), "{error:#}");
         drop(client);
     }

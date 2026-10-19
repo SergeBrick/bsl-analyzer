@@ -7020,7 +7020,13 @@ mod tests {
             .expect("rewrite the closed source");
         // The owner's watcher can publish the same write first: the refresh then reports
         // that the owner changed under it, and the next one finds the new text published.
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::hang_guard(std::time::Duration::from_secs(20));
         let published = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the owner never published the closed file's new text"
+            );
             match owner.refresh_saved_path(&closed) {
                 mcp_server::WorkspaceRead::Ready(published) => break published,
                 mcp_server::WorkspaceRead::Busy => std::thread::yield_now(),

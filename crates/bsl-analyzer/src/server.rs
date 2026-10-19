@@ -780,11 +780,7 @@ fn handle_idle_tick(state: &mut GlobalState) {
         return;
     };
 
-    let db = state.analysis_host.raw_database_mut();
-    match kind {
-        IdleTrimKind::Shallow => db.enforce_lru(),
-        IdleTrimKind::Deep => ide::sweep_lru_deep(db),
-    }
+    state.analysis_host.enforce_lru(kind == IdleTrimKind::Deep);
     syntax::clear_shared_node_cache();
 
     if kind == IdleTrimKind::Deep {

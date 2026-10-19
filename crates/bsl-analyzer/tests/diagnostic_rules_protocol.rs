@@ -36,11 +36,24 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
     );
 
     let log_file = dir.path().join("lsp.log");
-    let mut lsp = Lsp::start_with_capabilities_and_log(
+    // In-process: under auto mode the project may load in a shared backend whose log is
+    // not this file, depending on whether the backend answers in time.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+    command.args(["lsp", "--mode", "stdio"]).env("BSL_LOG_FILE", &log_file).env("BSL_LOG", "warn");
+    let mut lsp = Lsp::start_command(
+        command,
         dir.path(),
         json!({"general":{"positionEncodings":["utf-16"]}}),
-        Some(&log_file),
+        common::SILENCE,
     );
+    // A config change that lands while the workspace is still loading is folded into
+    // the load instead of reloading the project, so it logs no new warning; the reload
+    // under test needs the load finished first.
+    lsp.wait_for(|message| {
+        message["method"] == "$/progress"
+            && message["params"]["token"].as_str().is_some_and(|token| token.ends_with("/Loading"))
+            && message["params"]["value"]["kind"] == "end"
+    });
     let file = dir.path().join("src/Module.bsl");
     lsp.open(&file, &source);
     let uri = lsp_types::Url::from_file_path(&file).unwrap();

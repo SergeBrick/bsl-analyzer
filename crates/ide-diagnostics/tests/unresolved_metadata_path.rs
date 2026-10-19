@@ -602,3 +602,31 @@ fn predefined_items_that_cannot_be_read_are_not_judged() {
         Vec::<String>::new()
     );
 }
+
+#[test]
+fn predefined_items_whose_file_is_not_text_are_not_judged() {
+    let source = r#"
+Процедура Тест() Экспорт
+    З = ПредопределенноеЗначение("Справочник.Товары.Основной");
+КонецПроцедуры
+"#;
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let cf = dir.path().join("cf");
+    write_configuration(&cf);
+    // «Основной» in windows-1251: not UTF-8, so the file cannot be read as text.
+    std::fs::write(
+        cf.join("Catalogs/Товары/Ext/Predefined.xml"),
+        b"<Name>\xce\xf1\xed\xee\xe2\xed\xee\xe9</Name>",
+    )
+    .expect("write predefined items");
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf)],
+            None,
+            "cf/CommonModules/Тест/Ext/Module.bsl",
+            source,
+        ),
+        Vec::<String>::new()
+    );
+}

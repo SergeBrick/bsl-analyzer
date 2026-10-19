@@ -307,6 +307,7 @@ impl GlobalState {
         let mut call_hierarchy_structural_file_ids = Vec::new();
         let mut call_hierarchy_structural_change = false;
         let mut changed_metadata_paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut configuration_xml_changed = false;
         // Substrate-listed module bodies (common modules and HTTP/Web/Integration
         // services) that were added or removed (not merely edited): their per-MDO
         // listing `module_file` entry must be rebuilt.
@@ -450,17 +451,34 @@ impl GlobalState {
                     tracing::info!(path = %path.display(), "bumping config revision after XML change");
                     db.bump_config_for_path(path);
                 }
-                // The compatibility mode and the ordinary-form setting are read from
-                // the main configuration's `Configuration.xml`, not derived from the
-                // metadata revision.
-                if changed_metadata_paths.iter().any(|path| {
+                // The compatibility mode, the ordinary-form setting and the default
+                // run mode are read from the main configuration's `Configuration.xml`,
+                // not derived from the metadata revision.
+                configuration_xml_changed = changed_metadata_paths.iter().any(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
                         .and_then(bsl_conventions::conventional_of)
                         == Some(bsl_conventions::ConventionalName::ConfigurationXml)
-                }) {
+                });
+                if configuration_xml_changed {
                     self.apply_configuration_xml_settings();
                 }
+            }
+        }
+        // A `<DefaultRunMode>` edit can change the derived `ordinaryAppSupport` of the
+        // diagnostics too; rebuild their config only when it did.
+        if configuration_xml_changed {
+            let derived = self
+                .project
+                .as_ref()
+                .and_then(project_model::Project::ordinary_app_support)
+                .is_some_and(|(value, _)| value);
+            if derived != self.diagnostics_config.ordinary_app_support {
+                tracing::info!(
+                    ordinary_app_support = derived,
+                    "Configuration.xml changed the derived ordinaryAppSupport"
+                );
+                self.update_diagnostics_config();
             }
         }
 
@@ -1975,5 +1993,42 @@ mod compatibility_mode_tests {
         state.init_source_root();
         state.bootstrap_metadata_substrate();
         assert_eq!(settings(&state), (Some("Version8_3_17".to_owned()), Some(true)));
+    }
+
+    /// `<DefaultRunMode>` decides `ordinaryAppSupport` when the project leaves it out;
+    /// an edit flips both the diagnostics config and the execution model.
+    #[test]
+    fn a_configuration_xml_edit_rederives_ordinary_app_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        let cf = root.join("src/cf");
+        std::fs::create_dir_all(&cf).unwrap();
+        let xml = |mode: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <DefaultRunMode>{mode}</DefaultRunMode>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        let xml_path = cf.join("Configuration.xml");
+        std::fs::write(&xml_path, xml("OrdinaryApplication")).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        let support = |state: &GlobalState| {
+            (
+                state.diagnostics_config.ordinary_app_support,
+                state.analysis_host.raw_database().env_options().ordinary_app_support,
+            )
+        };
+        assert_eq!(support(&state), (true, true));
+
+        let changed = xml("ManagedApplication");
+        std::fs::write(&xml_path, &changed).unwrap();
+        state.vfs.write().set_file_contents(VfsPath::new(xml_path), Some(Arc::from(changed)));
+        state.process_changes(false);
+        assert_eq!(support(&state), (false, false));
     }
 }

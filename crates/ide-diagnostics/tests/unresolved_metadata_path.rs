@@ -651,7 +651,9 @@ fn a_readable_empty_predefined_items_file_is_judged() {
             "cf/CommonModules/Тест/Ext/Module.bsl",
             source,
         ),
-        vec!["Предопределенное значение \"Основной\" не найдено у \"Справочник.Товары\"".to_string()]
+        vec![
+            "Предопределенное значение \"Основной\" не найдено у \"Справочник.Товары\"".to_string()
+        ]
     );
 }
 

@@ -709,6 +709,23 @@ fn test_preprocessor_if_unclosed_in_method_keeps_enclosing_closer() {
 }
 
 #[test]
+fn test_preprocessor_if_crossed_survives_a_method_nested_in_it() {
+    // A method inside another's body is an error of its own, but it must not
+    // take the crossed block of the statement around it: that block's
+    // `#Иначе` and `#КонецЕсли` still follow.
+    for (head, tail) in [("Процедура Б()", "КонецПроцедуры"), ("Функция Б()", "КонецФункции")]
+    {
+        let input = format!(
+            "Процедура А()\nЕсли Х Тогда\n#Если Клиент Тогда\nИначеЕсли Й Тогда\n\
+             #Если Сервер Тогда\n{head}\n{tail}\n#КонецЕсли\n#Иначе\nКонецЕсли;\n\
+             #КонецЕсли\nКонецПроцедуры"
+        );
+        let errors = parse(&input).errors().to_vec();
+        assert_eq!(errors.len(), 1, "only the closer the crossed block ended without: {errors:?}");
+    }
+}
+
+#[test]
 fn test_small_file_performance() {
     let input = r#"Функция Тест() Экспорт
     Результат = 10 + 20;

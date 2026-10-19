@@ -629,6 +629,33 @@ fn a_catalog_without_predefined_items_file_is_not_judged() {
 }
 
 #[test]
+fn a_readable_empty_predefined_items_file_is_judged() {
+    let source = r#"
+Процедура Тест() Экспорт
+    З = ПредопределенноеЗначение("Справочник.Товары.Основной");
+КонецПроцедуры
+"#;
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let cf = dir.path().join("cf");
+    write_configuration(&cf);
+    write(
+        &cf,
+        "Catalogs/Товары/Ext/Predefined.xml",
+        r#"<PredefinedData xmlns="http://v8.1c.ru/8.3/xcf/predef"/>"#,
+    );
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf)],
+            None,
+            "cf/CommonModules/Тест/Ext/Module.bsl",
+            source,
+        ),
+        vec!["Предопределенное значение \"Основной\" не найдено у \"Справочник.Товары\"".to_string()]
+    );
+}
+
+#[test]
 fn predefined_items_whose_file_is_not_text_are_not_judged() {
     let source = r#"
 Процедура Тест() Экспорт

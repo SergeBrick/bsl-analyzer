@@ -675,7 +675,10 @@ where
 
     if let Some(predefined_xml) = predefined_xml {
         match xml_parser::parse_predefined_xml(predefined_xml) {
-            Some(items) => mdo.predefined_items = items,
+            Some(items) => {
+                mdo.predefined_items = items;
+                mdo.predefined_read = true;
+            }
             None => mdo.predefined_unread = true,
         }
         tracing::debug!(
@@ -2027,6 +2030,11 @@ mod tests {
         )
         .expect("catalog parsed from text");
         assert!(!empty.predefined_unread, "a readable empty set is a known set");
+        assert!(empty.predefined_read);
+
+        let absent = parse_metadata_object_from_texts(MdoType::Catalog, xml, None)
+            .expect("catalog parsed from text");
+        assert!(!absent.predefined_read, "without the file the set is not known");
     }
 
     #[test]

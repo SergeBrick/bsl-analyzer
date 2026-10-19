@@ -137,7 +137,8 @@ pub(crate) fn manager_members_closed(
 /// An object whose predefined items were not read (no `Ext/Predefined.xml`, or one
 /// that failed to parse, in the base or in any extension layer) leaves the set
 /// unknown, as does an object adopted by an extension whose base is not visible:
-/// the base may hold the missing item.
+/// the base may hold the missing item. A file that is read and lists nothing is a
+/// known empty set.
 pub(crate) fn closed_member_owner(
     resolver: &dyn ObjectResolver,
     kind: MdoType,
@@ -148,7 +149,9 @@ pub(crate) fn closed_member_owner(
     let closed = mdo.object_belonging() != bsl_metadata::ObjectBelonging::Adopted
         && match kind {
             MdoType::Enum => true,
-            _ => !mdo.predefined_unread && !mdo.predefined_items.is_empty(),
+            _ => {
+                !mdo.predefined_unread && (mdo.predefined_read || !mdo.predefined_items.is_empty())
+            }
         };
     closed.then_some(mdo)
 }
@@ -480,6 +483,45 @@ mod tests {
         assert!(!closed(&db, &configs, MdoType::Catalog, "Хранилища"));
         assert!(!closed(&db, &configs, MdoType::Document, "ПКО"));
         assert!(!closed(&db, &configs, MdoType::Catalog, "НетТакого"));
+    }
+
+    #[test]
+    fn a_read_empty_predefined_set_is_closed() {
+        let mut config = Configuration::new("Test");
+        let mut empty = catalog("Хранилища", vec![]);
+        empty.predefined_read = true;
+        config.add_metadata_object(empty);
+        let configs = wrap(config);
+        let db = InMemoryDb::new();
+
+        assert!(closed(&db, &configs, MdoType::Catalog, "Хранилища"));
+    }
+
+    #[test]
+    fn extension_items_over_a_read_empty_base_close_the_set() {
+        use bsl_metadata::ObjectBelonging;
+
+        let base_uuid = uuid::Uuid::new_v4();
+        let mut main = Configuration::new("Main");
+        let mut base = catalog("Валюты", vec![]);
+        base.predefined_read = true;
+        base.set_uuid(base_uuid);
+        main.add_metadata_object(base);
+
+        let mut ext = Configuration::new("Ext");
+        let mut adopted = catalog("Валюты", vec!["Евро"]);
+        adopted.predefined_read = true;
+        adopted.set_object_belonging(ObjectBelonging::Adopted);
+        adopted.set_extends_uuid(base_uuid);
+        ext.add_metadata_object(adopted);
+
+        let configs = vec![
+            VisibleConfig { name: None, configuration: Arc::new(main) },
+            VisibleConfig { name: Some("Ext".into()), configuration: Arc::new(ext) },
+        ];
+        let db = InMemoryDb::new();
+
+        assert!(closed(&db, &configs, MdoType::Catalog, "Валюты"));
     }
 
     #[test]

@@ -1699,6 +1699,7 @@ fn test_join_paren_field_resolution() {
         enum_values: vec![],
         predefined_items: vec![],
         predefined_unread: false,
+        predefined_read: false,
         check_unique: false,
         code_series: bsl_metadata::CodeSeries::default(),
         constant_type: None,

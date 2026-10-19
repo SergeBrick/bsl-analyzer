@@ -581,9 +581,11 @@ impl Lsp {
 
 impl Drop for Lsp {
     fn drop(&mut self) {
-        if let Err(error) = self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
-            eprintln!("{error}");
+        match self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
+            Ok(_) => self.join_stderr_reader(),
+            // A child that outlived its cleanup still holds its stderr open, so the reader
+            // would never reach EOF: leave it detached and report instead of hanging.
+            Err(error) => eprintln!("{error}"),
         }
-        self.join_stderr_reader();
     }
 }

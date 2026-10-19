@@ -329,25 +329,39 @@ pub fn check_token(token: &SyntaxToken, acc: &mut Vec<Diagnostic<LocalRange>>, c
 
     let config = Config::from_context(ctx);
     let dictionaries = get_dictionaries();
-    let parent = token.parent();
-    let literal = parent
-        .as_ref()
+    let literal = token
+        .parent()
         .and_then(|parent| parent.ancestors().find(|node| node.kind() == SyntaxKind::LITERAL));
-    // A positional annotation value is a bare STRING token without a LITERAL wrapper.
-    let (text, start) = match literal {
-        Some(literal) => {
-            if literal.first_token().map(|first| first.text_range()) != Some(token.text_range()) {
-                return;
-            }
-            (literal.text().to_string(), literal.text_range().start())
-        }
-        None if parent.is_some_and(|parent| parent.kind() == SyntaxKind::ANNOTATION_PARAM) => {
-            (token.text().to_owned(), token.text_range().start())
-        }
-        None => return,
+    // A positional annotation value, or a string the parser recovered into an
+    // error node, is a bare token without a LITERAL wrapper.
+    let Some(literal) = literal else {
+        check_text(token.text(), token.text_range().start(), acc, ctx, &config, &dictionaries);
+        return;
     };
+    if literal.first_token().map(|first| first.text_range()) != Some(token.text_range()) {
+        return;
+    }
 
-    check_text(&text, start, acc, ctx, &config, &dictionaries);
+    // Comments and directives between the parts of a literal are trivia, not string text.
+    let parts: Vec<_> = literal
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|part| {
+            matches!(
+                part.kind(),
+                SyntaxKind::STRING
+                    | SyntaxKind::STRING_START
+                    | SyntaxKind::STRING_PART
+                    | SyntaxKind::STRING_TAIL
+            )
+        })
+        .collect();
+    if is_format_string(&parts.iter().map(SyntaxToken::text).collect::<String>()) {
+        return;
+    }
+    for part in &parts {
+        check_text(part.text(), part.text_range().start(), acc, ctx, &config, &dictionaries);
+    }
 }
 
 fn find_first_ident_token(node: &SyntaxNode) -> Option<SyntaxToken> {
@@ -611,6 +625,35 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert_eq!(source_slice(code, &diagnostics[0]), "гатово");
+    }
+
+    #[test]
+    fn strings_left_in_error_nodes_are_checked() {
+        let annotation = "&Перед(\"zqx\" \"гатово\")\nПроцедура Тест()\nКонецПроцедуры";
+        let diagnostics = raw_typo_diagnostics(annotation, config_with_typo_enabled());
+        let slices: Vec<_> = diagnostics.iter().map(|d| source_slice(annotation, d)).collect();
+        assert_eq!(slices, ["zqx", "гатово"]);
+
+        let params = "Процедура Тест(Х \"гатово\")\nКонецПроцедуры";
+        let diagnostics = raw_typo_diagnostics(params, config_with_typo_enabled());
+        let slices: Vec<_> = diagnostics.iter().map(|d| source_slice(params, d)).collect();
+        assert_eq!(slices, ["гатово"]);
+    }
+
+    #[test]
+    fn comments_inside_a_literal_are_not_string_text() {
+        for code in [
+            "Процедура Тест()\n\tА = \"Цикл\"\n\t// гатово\n\t\"Сумма\";\nКонецПроцедуры",
+            "Процедура Тест()\n\tА = \"Цикл\n\t// гатово\n\t|Сумма\";\nКонецПроцедуры",
+        ] {
+            let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+            assert!(diagnostics.is_empty(), "{code}: {diagnostics:#?}");
+        }
+
+        let code = "Процедура Тест()\n\tА = \"Цикл\n\t// коментарий\n\t|гатово\";\nКонецПроцедуры";
+        let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+        let slices: Vec<_> = diagnostics.iter().map(|d| source_slice(code, d)).collect();
+        assert_eq!(slices, ["гатово"]);
     }
 
     #[test]

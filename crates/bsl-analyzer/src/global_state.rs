@@ -1243,10 +1243,10 @@ mod vfs_race_tests {
             .unwrap();
 
         state.set_workspace_root(project.clone()).expect("valid test workspace");
-        // With `..` folded: the spelling an editor's didSave reports for the parent.
-        let parent = shared.join("base.toml");
+        let parent = project_model::config_extends_spelling(&shared.join("base.toml"));
         assert_eq!(state.config_extends_paths, std::slice::from_ref(&parent));
-        assert!(state.is_config_extends_path(&parent));
+        // `..` folded: the spelling an editor's didSave reports for the parent.
+        assert!(state.is_config_extends_path(&shared.join("base.toml")));
         assert!(!state.is_config_extends_path(&project.join("bsl-analyzer.toml")));
     }
 

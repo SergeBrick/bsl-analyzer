@@ -733,9 +733,13 @@ impl GlobalState {
     }
 
     /// Whether `path` is a parent config the workspace config inherits through
-    /// `extends`.
+    /// `extends`, under any spelling of its directory.
     pub(crate) fn is_config_extends_path(&self, path: &Path) -> bool {
-        self.config_extends_paths.iter().any(|parent| parent == path)
+        if self.config_extends_paths.is_empty() {
+            return false;
+        }
+        let spelled = project_model::config_extends_spelling(path);
+        self.config_extends_paths.iter().any(|parent| parent == path || *parent == spelled)
     }
 
     pub fn reload_project_config(&mut self) -> bool {

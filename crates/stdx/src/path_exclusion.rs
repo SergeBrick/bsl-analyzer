@@ -548,7 +548,7 @@ pub fn resolve(path: &Path) -> std::io::Result<PathBuf> {
 ///
 /// The appended part is normalised lexically, `..` included: nothing in it exists, so
 /// nothing in it can be a symlink that `..` would have to step back out of.
-fn resolve_as_far_as_it_goes(path: &Path) -> Option<PathBuf> {
+pub fn resolve_as_far_as_it_goes(path: &Path) -> Option<PathBuf> {
     let mut missing = Vec::new();
     let mut existing = path;
     loop {

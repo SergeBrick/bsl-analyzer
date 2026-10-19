@@ -2725,8 +2725,8 @@ fn resolve_extends(
 }
 
 /// `extends = target` written in `file`: an absolute path as is, a relative one
-/// against the directory of `file` (as spelled, not through a symlink). `..` is
-/// folded, so the path compares equal to the one an editor or watcher reports.
+/// against the directory of `file` (as spelled, not through a symlink), in the
+/// spelling of [`config_extends_spelling`].
 fn extends_target(file: &Path, target: &str) -> PathBuf {
     let target = Path::new(target);
     let joined = if target.is_absolute() {
@@ -2734,7 +2734,19 @@ fn extends_target(file: &Path, target: &str) -> PathBuf {
     } else {
         file.parent().unwrap_or(Path::new("")).join(target)
     };
-    stdx::path_exclusion::normalize_lexically(&std::path::absolute(&joined).unwrap_or(joined))
+    config_extends_spelling(&std::path::absolute(&joined).unwrap_or(joined))
+}
+
+/// The spelling a parent config is read, watched and matched under: its directory
+/// resolved the way the file system walks it (links and `..`), so an editor's path for
+/// the same file compares equal, and its file name as written, so a parent that is
+/// itself a link keeps resolving its own `extends` from where it sits.
+pub fn config_extends_spelling(path: &Path) -> PathBuf {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    stdx::path_exclusion::resolve_as_far_as_it_goes(dir)
+        .map_or_else(|| path.to_path_buf(), |dir| dir.join(name))
 }
 
 /// What makes two spellings of a config file the same file for cycle detection.
@@ -4610,7 +4622,11 @@ mod tests {
         assert_eq!(rules["dataflowMaxIterations"], 500, "a sibling table key survives");
         assert_eq!(config.target_platform_version.as_deref(), Some("8.3.27"));
         assert_eq!(config.source_exclude, ["c"], "an array is replaced, not appended");
-        assert_eq!(config.extends_chain(), [base], "`..` is folded");
+        assert_eq!(
+            config.extends_chain(),
+            [super::config_extends_spelling(&base)],
+            "`..` is folded"
+        );
         assert_eq!(config.config_file_path(), Some(child.as_path()));
     }
 
@@ -4648,6 +4664,27 @@ mod tests {
             Some(project_abs.join("baseline.json")),
             "a config-relative path resolves against the child, not the parent"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extends_climbs_out_of_a_symlinked_project_directory_like_the_kernel() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(real.join("proj")).unwrap();
+        fs::create_dir_all(real.join("shared")).unwrap();
+        fs::write(real.join("shared/base.toml"), "[diagnostics.parameters]\nLineLength = false\n")
+            .unwrap();
+        fs::write(real.join("proj/bsl-analyzer.toml"), "extends = \"../shared/base.toml\"\n")
+            .unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(real.join("proj"), &link).unwrap();
+
+        let config = ProjectConfig::load_from_file(&link.join("bsl-analyzer.toml")).unwrap();
+        assert_eq!(config.diagnostics.rules_json()["parameters"]["LineLength"], false);
+        let parent = real.canonicalize().unwrap().join("shared/base.toml");
+        assert_eq!(config.extends_chain(), std::slice::from_ref(&parent));
+        assert_eq!(super::workspace_config_extends_paths(&link), [parent]);
     }
 
     #[test]
@@ -4706,7 +4743,7 @@ mod tests {
         assert!(error.message.contains("missing.toml"), "{error}");
         assert_eq!(
             super::workspace_config_extends_paths(dir.path()),
-            [std::path::absolute(dir.path().join("missing.toml")).unwrap()],
+            [super::config_extends_spelling(&dir.path().join("missing.toml"))],
             "a missing parent is still watched"
         );
 

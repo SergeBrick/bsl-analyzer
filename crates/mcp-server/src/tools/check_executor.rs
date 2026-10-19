@@ -621,6 +621,18 @@ async fn stop_child(
     }
 }
 
+/// `wait` fails with ECHILD once something else has collected the child: there is nothing left
+/// to reap, so retrying would hold the connection permit forever.
+#[cfg(unix)]
+fn child_is_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ECHILD)
+}
+
+#[cfg(not(unix))]
+fn child_is_gone(_error: &std::io::Error) -> bool {
+    false
+}
+
 fn reap_in_background(mut child: Child, control: ProcessControl, permit: OwnedSemaphorePermit) {
     tokio::spawn(async move {
         let _permit = permit;
@@ -628,6 +640,7 @@ fn reap_in_background(mut child: Child, control: ProcessControl, permit: OwnedSe
         loop {
             match child.wait().await {
                 Ok(_) => break,
+                Err(error) if child_is_gone(&error) => break,
                 Err(error) => {
                     tracing::warn!(kind = %error.kind(), "check_executor background reap wait failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -819,6 +832,12 @@ pub(crate) fn has_module_syntax(code: &str) -> bool {
 mod tests {
     use super::*;
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+    #[test]
+    fn reaper_stops_when_the_child_was_collected_elsewhere() {
+        assert!(child_is_gone(&std::io::Error::from_raw_os_error(libc::ECHILD)));
+        assert!(!child_is_gone(&std::io::Error::from_raw_os_error(libc::EINTR)));
+    }
 
     #[test]
     fn ast_preflight_ignores_words_inside_strings_and_comments() {

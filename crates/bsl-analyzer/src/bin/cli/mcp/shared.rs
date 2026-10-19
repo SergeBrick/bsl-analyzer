@@ -276,9 +276,10 @@ impl ExecutorSlots {
         connection: &str,
         executor: super::CheckExecutorConfig,
     ) -> Result<mcp_server::CheckExecutorProfile> {
-        // Keyed by the whole executor config: a session that brings different limits for the
-        // same connection name gets its own semaphore instead of resizing a running one.
-        let key = format!("{connection}\0{}", serde_json::to_string(&executor)?);
+        // The permit count is fixed when a semaphore is created, so a session that asks for a
+        // different `max_concurrent` gets its own semaphore instead of resizing a running one.
+        // Every other limit varies per session without splitting the connection's admission.
+        let key = format!("{connection}\0{}", executor.max_concurrent);
         let mut profile = executor.into_profile()?;
         let mut slots = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         profile.semaphore = slots.entry(key).or_insert(profile.semaphore).clone();
@@ -789,6 +790,25 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.semaphore, &other_connection.semaphore));
         let _held = first.semaphore.clone().try_acquire_owned().unwrap();
         assert_eq!(second.semaphore.available_permits(), 0, "the limit holds across sessions");
+    }
+
+    #[test]
+    fn executor_semaphore_ignores_limits_other_than_max_concurrent() {
+        let executor = |max_concurrent: usize,
+                        timeout_ms: u64|
+         -> super::super::CheckExecutorConfig {
+            serde_json::from_str(&format!(
+                r#"{{"program":"/x","max_concurrent":{max_concurrent},"timeout_ms":{timeout_ms},"handles_snippet":true}}"#
+            ))
+            .unwrap()
+        };
+        let slots = ExecutorSlots::default();
+        let first = slots.profile("exec", executor(1, 120_000)).unwrap();
+        let slower = slots.profile("exec", executor(1, 600_000)).unwrap();
+        let wider = slots.profile("exec", executor(2, 120_000)).unwrap();
+
+        assert!(Arc::ptr_eq(&first.semaphore, &slower.semaphore));
+        assert!(!Arc::ptr_eq(&first.semaphore, &wider.semaphore));
     }
 
     #[test]

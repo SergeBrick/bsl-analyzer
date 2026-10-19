@@ -112,7 +112,13 @@ fn validate_parameters(
         Some(name) => {
             let selected =
                 state.onec_connection(Some(name)).map_err(|e| McpError::invalid_params(e, None))?;
-            Ok(selected.http_client().map(|_| name.to_string()))
+            if selected.http_client().is_none() {
+                return Err(McpError::invalid_params(
+                    format!("1C connection '{name}' has no HTTP backend for the platform check"),
+                    None,
+                ));
+            }
+            Ok(Some(name.to_string()))
         }
         None => Ok(state
             .onec_connection(None)
@@ -641,6 +647,21 @@ mod tests {
 
     fn extract_text(result: &CallToolResult) -> &str {
         result.content[0].as_text().expect("expected text content").text.as_str()
+    }
+
+    #[test]
+    fn an_explicitly_named_connection_without_http_is_refused_not_degraded() {
+        let mut state = test_shared_state();
+        state.add_onec_connection(
+            "exec".to_owned(),
+            crate::state::OnecConnection::with_optional_http(None, false, None),
+        );
+
+        let named = validate_parameters(&state, "ВЫБРАТЬ 1", None, Some("exec"));
+        assert!(named.is_err(), "a named connection that cannot run the platform check is refused");
+
+        let unnamed = validate_parameters(&state, "ВЫБРАТЬ 1", None, None);
+        assert_eq!(unnamed.unwrap(), None, "an unnamed request just has no platform block");
     }
 
     #[test]

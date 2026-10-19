@@ -33,8 +33,10 @@ English spellings (`Type("CatalogRef.Товары")`, `PredefinedValue("Enum.Ц�
 
 - the argument is not a string literal: a variable, a concatenation
   (`"Справочник." + Name`);
-- the module sees no configuration (an external data processor or report, a module
-  outside a configuration);
+- the module belongs neither to the main configuration nor to its extension: an
+  external data processor or report, a file outside the configuration roots, a project
+  without the main configuration (extensions only, external objects only, or a
+  directory of sources without `Configuration.xml`);
 - the path does not lead into the configuration: `ВнешняяОбработка.`, `ВнешнийОтчет.`;
 - a kind the analyzer's configuration model does not hold: `ОбщаяФорма.`,
   `ЖурналДокументов.`, `ОпределяемыйТип.` and the like;

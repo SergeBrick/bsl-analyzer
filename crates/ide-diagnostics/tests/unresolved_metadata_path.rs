@@ -419,3 +419,127 @@ fn a_module_without_a_visible_configuration_is_silent() {
             .collect();
     assert_eq!(reported, Vec::<String>::new());
 }
+
+/// The rule's messages for `source` written at `module` (relative to `dir`), with the
+/// workspace registering `roots`; the root at `external`, if any, is an external data
+/// processor export.
+fn reported_in_workspace(
+    dir: &Path,
+    roots: Vec<(Option<String>, std::path::PathBuf)>,
+    external: Option<usize>,
+    module: &str,
+    source: &str,
+) -> Vec<String> {
+    let path = dir.join(module);
+    write(dir, module, source);
+
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(0);
+    let mut files = FileSet::default();
+    files.insert(file_id, VfsPath::new(path.to_string_lossy().into_owned()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(file_id, source);
+    let mut snapshot = ide_db::metadata::WorkspaceConfigsSnapshot::from_paths(roots);
+    if let Some(external) = external {
+        snapshot.kinds[external] =
+            ide_db::metadata::RootKind::External(bsl_metadata::ExternalObjectKind::DataProcessor);
+    }
+    db.set_workspace_configs_snapshot(snapshot);
+    ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+        .into_iter()
+        .filter(|diag| diag.code.as_str() == CODE)
+        .map(|diag| diag.message)
+        .collect()
+}
+
+const MISSING_CATALOG: &str = r#"
+Процедура Тест() Экспорт
+    Т = Тип("СправочникСсылка.Нет");
+КонецПроцедуры
+"#;
+
+#[test]
+fn a_module_of_an_extension_is_judged_against_the_main_configuration() {
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let (cf, cfe) = (dir.path().join("cf"), dir.path().join("cfe"));
+    write_configuration(&cf);
+    write_extension(&cfe);
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf), (Some("Расширение".to_string()), cfe)],
+            None,
+            "cfe/CommonModules/Тест/Ext/Module.bsl",
+            MISSING_CATALOG,
+        ),
+        vec!["Объект метаданных \"Справочник.Нет\" не найден в конфигурации"]
+    );
+}
+
+#[test]
+fn a_module_outside_the_configuration_roots_is_silent() {
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let cf = dir.path().join("cf");
+    write_configuration(&cf);
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf)],
+            None,
+            "scratch/Module.bsl",
+            MISSING_CATALOG,
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn an_external_data_processor_is_silent() {
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let (cf, epf) = (dir.path().join("cf"), dir.path().join("epf"));
+    write_configuration(&cf);
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, cf), (Some("Внешняя".to_string()), epf)],
+            Some(1),
+            "epf/Внешняя/Ext/ObjectModule.bsl",
+            MISSING_CATALOG,
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_workspace_of_extensions_only_is_silent() {
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let cfe = dir.path().join("cfe");
+    write_extension(&cfe);
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(Some("Расширение".to_string()), cfe)],
+            None,
+            "cfe/CommonModules/Тест/Ext/Module.bsl",
+            MISSING_CATALOG,
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_directory_of_sources_without_a_configuration_is_silent() {
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let src = dir.path().join("src");
+    assert_eq!(
+        reported_in_workspace(
+            dir.path(),
+            vec![(None, src)],
+            None,
+            "src/Module.bsl",
+            MISSING_CATALOG
+        ),
+        Vec::<String>::new()
+    );
+}

@@ -4315,10 +4315,11 @@ impl<'db> InferenceContext<'db> {
     }
 
     /// A literal metadata path given to the platform function `name`
-    /// ([`crate::metadata_path`]). Judged only where the configuration is visible and
-    /// the call really reaches the platform function: an external processor or a
-    /// loose module names objects of a configuration it cannot see, and a method of
-    /// the module or a global export of the same name takes the call over.
+    /// ([`crate::metadata_path`]). Judged only in a module of the main configuration or
+    /// of its extension, and only where the call really reaches the platform function:
+    /// an external processor, a loose module or a project without the main
+    /// configuration names objects of a configuration the analyzer cannot read, and a
+    /// method of the module or a global export of the same name takes the call over.
     fn check_metadata_path_argument(
         &mut self,
         function: crate::metadata_path::MetadataPathFunction,
@@ -4345,6 +4346,10 @@ impl<'db> InferenceContext<'db> {
         else {
             return;
         };
+        // Asked of a miss only: the answer looks for `Configuration.xml` on disk.
+        if !self.db.file_in_main_configuration(self.context_file_id) {
+            return;
+        }
         // The module sees the base configuration and its own extension only, while at run
         // time every extension of the infobase is applied: an object or a value another
         // extension of the workspace adds is there when the call runs.

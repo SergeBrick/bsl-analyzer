@@ -3429,6 +3429,26 @@ impl hir::ConfigsDatabase for RootDatabaseImpl {
         }
     }
 
+    fn file_in_main_configuration(&self, file_id: FileId) -> bool {
+        let snapshot = RootDatabaseImpl::workspace_configs_snapshot(self);
+        let Some(main) =
+            snapshot.paths.iter().find_map(|(label, path)| label.is_none().then_some(path))
+        else {
+            return false;
+        };
+        // A project that is only a directory of sources registers that directory as
+        // an anonymous main root; it describes no configuration.
+        let described = bsl_conventions::find_child_ci(
+            main,
+            bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
+        )
+        .is_some_and(|path| path.is_file());
+        described
+            && RootDatabaseImpl::config_root_rank_and_label(self, file_id)
+                .and_then(|(rank, _)| snapshot.topological_order.get(rank).copied())
+                .is_some_and(|idx| !snapshot.is_external(idx))
+    }
+
     fn recorders_for_register(
         &self,
         file_id: FileId,

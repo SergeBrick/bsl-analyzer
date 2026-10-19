@@ -1494,6 +1494,12 @@ impl DiagnosticsState {
         Self::build_resident_with_catalog(root, excluded, WorkspaceCatalog::new())
     }
 
+    /// Build synchronously for tests of the resident, independent of the loader lifecycle.
+    #[cfg(test)]
+    pub(super) fn build_resident_for_test(root: &Path) -> DiagnosticsResident {
+        Self::build_resident(root, &[]).unwrap().resident
+    }
+
     fn build_resident_with_catalog(
         root: &Path,
         excluded: &[PathBuf],

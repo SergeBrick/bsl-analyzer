@@ -48,7 +48,10 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         rules::expected(&source, false, true)
     );
 
-    let log_file = dir.path().join("lsp-{pid}.log");
+    // Outside the project root: the server watches that root recursively, so a log
+    // inside it makes every log line a file change that reloads the project and logs again.
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_file = log_dir.path().join("lsp-{pid}.log");
     let mut lsp = Lsp::start_with_capabilities_and_log(
         dir.path(),
         json!({"general":{"positionEncodings":["utf-16"]}}),
@@ -84,16 +87,16 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         pull(&mut lsp, Instant::now() + Duration::from_secs(60)),
         rules::expected(&source, true, true)
     );
-    let before = rules::warning_count(&session_log(dir.path()));
+    let before = rules::warning_count(&session_log(log_dir.path()));
     assert!(before > 0);
-    assert!(!session_log(dir.path()).contains(RELOAD_WARNING));
+    assert!(!session_log(log_dir.path()).contains(RELOAD_WARNING));
     for _ in 0..PULLS_PER_LOAD_BOUND {
         assert_eq!(
             pull(&mut lsp, Instant::now() + Duration::from_secs(60)),
             rules::expected(&source, true, true)
         );
     }
-    let grown = rules::warning_count(&session_log(dir.path())) - before;
+    let grown = rules::warning_count(&session_log(log_dir.path())) - before;
     assert!(grown < PULLS_PER_LOAD_BOUND, "pulls reloaded the startup config: {grown} loads");
 
     let next = dir.path().join("bsl-analyzer.toml.next");
@@ -102,15 +105,23 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
     let config_uri = lsp_types::Url::from_file_path(dir.path().join("bsl-analyzer.toml")).unwrap();
     lsp.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":config_uri,"type":2}]}}));
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if pull(&mut lsp, deadline) == rules::expected(&source, true, false) {
-            break;
+    // The reloaded diagnostics and the reload's load-time warning are published
+    // independently, so wait for both instead of assuming an order.
+    let log = loop {
+        let diagnostics_reloaded =
+            pull(&mut lsp, deadline) == rules::expected(&source, true, false);
+        let log = session_log(log_dir.path());
+        let warned = log.contains(RELOAD_WARNING);
+        if diagnostics_reloaded && warned {
+            break log;
         }
-        assert!(Instant::now() < deadline, "changed Typo config never reached diagnostics");
+        assert!(
+            Instant::now() < deadline,
+            "changed Typo config never reached diagnostics and the log \
+             (diagnostics: {diagnostics_reloaded}, load-time warning: {warned})"
+        );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let log = session_log(dir.path());
-    assert!(log.contains(RELOAD_WARNING), "the reloaded config logged no load-time warning");
+    };
     assert!(!log.contains(rules::PRIVATE_VALUE));
     let before = log.matches(RELOAD_WARNING).count();
     for _ in 0..PULLS_PER_LOAD_BOUND {
@@ -119,7 +130,7 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
             rules::expected(&source, true, false)
         );
     }
-    let grown = session_log(dir.path()).matches(RELOAD_WARNING).count() - before;
+    let grown = session_log(log_dir.path()).matches(RELOAD_WARNING).count() - before;
     assert!(grown < PULLS_PER_LOAD_BOUND, "pulls reloaded the changed config: {grown} loads");
     assert!(lsp.shutdown(1000).success());
     lsp.assert_protocol_clean();

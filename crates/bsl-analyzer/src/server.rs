@@ -1217,6 +1217,10 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             if changed {
                 state.shared_view_seeded = true;
             }
+            // A new owner generation is a disk change, possibly a checkout that moved the
+            // git state the vendor-diff scope was computed against.
+            state.request_scope_rebuild();
+            state.maybe_spawn_scope_build();
             let first_ready_generation = refresh_shared_readiness(state);
             if changed && state.vfs_done {
                 crate::handlers::notification::refresh_after_shared_catch_up(state);
@@ -7069,6 +7073,93 @@ mod tests {
                 },
             )
             .expect("close the open document");
+        });
+    }
+
+    /// The vendor-diff scope is computed against the working tree, so every disk change a
+    /// shared session learns of must queue a rebuild, as the standalone save and external
+    /// change paths do. The input is a shared session whose first scope build has already
+    /// been applied, so only the event under test can queue the next one.
+    fn assert_shared_disk_change_rebuilds_scope(
+        apply: impl FnOnce(&mut GlobalState, &std::path::Path),
+    ) {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(
+            root.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\n\n[analysis]\ndiff_base = \"HEAD\"\n",
+        )
+        .expect("write project config");
+        let module = root.path().join("Module.bsl");
+        std::fs::write(&module, "Процедура Было() КонецПроцедуры\n").expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        assert!(state.analysis_scope.is_loading(), "a configured diff base builds the scope");
+        while state.analysis_scope.is_loading() {
+            let task = state
+                .task_pool
+                .receiver
+                .recv_timeout(test_utils::wait::ceiling(std::time::Duration::from_secs(20)))
+                .expect("the first scope build finishes");
+            if matches!(task, crate::global_state::Task::AnalysisScopeReady { .. }) {
+                handle_task(&mut state, task).unwrap();
+            }
+        }
+        assert!(!state.scope_build_queued, "no rebuild is pending before the disk change");
+
+        std::fs::write(&module, "Процедура Стало() КонецПроцедуры\n").expect("rewrite source");
+        apply(&mut state, &module);
+
+        assert!(
+            state.scope_build_queued || state.analysis_scope.is_loading(),
+            "the disk change rebuilds the vendor-diff scope"
+        );
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    #[test]
+    fn a_shared_save_rebuilds_the_vendor_diff_scope() {
+        assert_shared_disk_change_rebuilds_scope(|state, path| {
+            crate::handlers::handle_did_save(
+                state,
+                lsp_types::DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: lsp_types::Url::from_file_path(path).unwrap(),
+                    },
+                    text: None,
+                },
+            )
+            .expect("save the document");
+        });
+    }
+
+    #[test]
+    fn a_shared_workspace_change_rebuilds_the_vendor_diff_scope() {
+        assert_shared_disk_change_rebuilds_scope(|state, path| {
+            let owner = state.analysis_host.owner().cloned().expect("shared session owner");
+            owner.notify_changed_path(path);
+            handle_task(state, crate::global_state::Task::SharedWorkspaceChanged { generation: 0 })
+                .unwrap();
         });
     }
 }

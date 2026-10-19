@@ -702,7 +702,11 @@ pub fn handle_did_save(state: &mut GlobalState, params: DidSaveTextDocumentParam
             state.mark_shared_view_changed();
             refresh_after_shared_catch_up(state);
         }
-        state.scope_dirty_docs.remove(&uri);
+        if state.scope_dirty_docs.remove(&uri) && state.diagnostics_config().scope.is_some() {
+            schedule_diagnostics(state, &uri);
+        }
+        state.request_scope_rebuild();
+        state.maybe_spawn_scope_build();
         return Ok(());
     }
 

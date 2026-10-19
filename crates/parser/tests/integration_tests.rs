@@ -693,9 +693,11 @@ fn test_preprocessor_if_crossing_an_else_if_keeps_enclosing_region() {
 }
 
 #[test]
-fn test_preprocessor_if_unclosed_in_method_keeps_enclosing_closer() {
-    // A block left open at the end of a method is an error, but the
-    // `#КонецЕсли` right after the method still closes the module-level region.
+fn test_preprocessor_if_unclosed_in_method_leaves_the_outer_region_unclosed() {
+    // The preprocessor pairs directives by text: the only `#КонецЕсли` here
+    // belongs to the nearest `#Если`, the one inside the method, so the region
+    // around the method is the block left without a closer, and it runs to the
+    // end of the module.
     let bodies = [
         "#Если Клиент Тогда\n    Х = 1;",
         "Если Х Тогда\n#Если Клиент Тогда\nИначеЕсли Й Тогда\nКонецЕсли;",
@@ -705,11 +707,21 @@ fn test_preprocessor_if_unclosed_in_method_keeps_enclosing_closer() {
         for body in bodies {
             let region = format!("#Если Сервер Тогда\n{head}\n{body}\n{tail}\n#КонецЕсли");
             let input = format!("{region}\nПроцедура Б()\nКонецПроцедуры\n");
-            let root = parse(&input).syntax_node();
+            let parse = parse(&input);
+            let root = parse.syntax_node();
             let regions: Vec<_> =
                 root.children().filter(|n| n.kind() == SyntaxKind::PRE_IF_DIR).collect();
             assert_eq!(regions.len(), 1, "{input}: {regions:?}");
-            assert_eq!(regions[0].text().to_string(), region, "the region ends at its #КонецЕсли");
+            assert_eq!(
+                regions[0].text().to_string(),
+                input.trim_end(),
+                "the region runs to the module end"
+            );
+            let errors = parse.errors();
+            assert_eq!(errors.len(), 1, "{input}: only the missing closer: {errors:?}");
+            let range = errors[0].range();
+            assert_eq!(range.start(), range.end(), "{input}: at the end");
+            assert_eq!(usize::from(range.end()), input.len(), "{input}: at the end");
         }
     }
 }

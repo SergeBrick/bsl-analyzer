@@ -217,10 +217,15 @@ const CLIENT_FILTER_MAX: usize = 128;
 /// `pfghjc`, which starts after a space. The original text stays first, so the
 /// client's highlight and score of a correct-layout match are unaffected, and the
 /// appended words score below a match at position 0.
+///
+/// The item matched only through one of the transposed words, so when the
+/// client's window is too short for all of them the original text's tail gives
+/// way rather than a transposed word.
 pub(super) fn layout_filter_text(label: &str, filter_text: Option<&str>) -> String {
-    let mut out = filter_text.unwrap_or(label).to_string();
+    let original = filter_text.unwrap_or(label);
     let words =
         label.split_whitespace().chain(filter_text.into_iter().flat_map(str::split_whitespace));
+    let mut appended = String::new();
     let mut seen: Vec<String> = Vec::new();
     for word in words {
         let Some(transposed) = transpose_layout(&word.fold_lower()) else {
@@ -229,15 +234,35 @@ pub(super) fn layout_filter_text(label: &str, filter_text: Option<&str>) -> Stri
         if seen.contains(&transposed) {
             continue;
         }
-        let len = out.encode_utf16().count() + 1 + transposed.encode_utf16().count();
+        let len = appended.encode_utf16().count() + 1 + transposed.encode_utf16().count();
         if len > CLIENT_FILTER_MAX {
             continue;
         }
-        out.push(' ');
-        out.push_str(&transposed);
+        appended.push(' ');
+        appended.push_str(&transposed);
         seen.push(transposed);
     }
-    out
+    if appended.is_empty() {
+        return original.to_string();
+    }
+    let room = CLIENT_FILTER_MAX - appended.encode_utf16().count();
+    let kept = utf16_prefix(original, room).trim_end();
+    if kept.is_empty() {
+        return appended.trim_start().to_string();
+    }
+    format!("{kept}{appended}")
+}
+
+/// Longest prefix of `s` that fits in `max` UTF-16 units, cut on a char boundary.
+fn utf16_prefix(s: &str, max: usize) -> &str {
+    let mut units = 0;
+    for (i, c) in s.char_indices() {
+        units += c.len_utf16();
+        if units > max {
+            return &s[..i];
+        }
+    }
+    s
 }
 
 /// Score a completion candidate by its label and any bilingual aliases carried in
@@ -408,16 +433,42 @@ mod tests {
 
     #[test]
     fn layout_filter_text_stays_within_client_limit() {
-        // 41 + 1 + 41 chars: the transposed label still fits, the alias no longer.
+        // 41 + 1 + 41 chars of original and 1 + 41 + 1 + 41 of transposed words:
+        // both transposed words fit, the original keeps its first 44 units.
         let long = "ОченьДлинноеИмяПеременнойКотороеНеВлезает";
         let alias = "VeryLongVariableNameThatDoesNotFitAnyMore";
         let original = format!("{long} {alias}");
         let text = layout_filter_text(long, Some(&original));
-        assert!(text.encode_utf16().count() <= CLIENT_FILTER_MAX, "{text}");
-        assert_eq!(text, format!("{original} {}", transpose_layout(&long.fold_lower()).unwrap()));
-        // Already past the limit: nothing to add that the client would see.
+        assert_eq!(text.encode_utf16().count(), CLIENT_FILTER_MAX, "{text}");
+        let transposed_long = transpose_layout(&long.fold_lower()).unwrap();
+        let transposed_alias = transpose_layout(&alias.fold_lower()).unwrap();
+        assert_eq!(text, format!("{long} Ve {transposed_long} {transposed_alias}"));
+        // A transposed word longer than the client's window: nothing it would see.
         let huge = long.repeat(4);
         assert_eq!(layout_filter_text(&huge, None), huge);
+    }
+
+    #[test]
+    fn layout_filter_text_cuts_original_to_keep_transposed_words_visible() {
+        // The original text alone leaves no room for a transposed word; the item
+        // matched only through one of them, so the original's tail gives way.
+        let text = layout_filter_text("Запрос", Some(&format!("Запрос {}", "Z".repeat(118))));
+        assert!(text.encode_utf16().count() <= CLIENT_FILTER_MAX, "{text}");
+        assert!(text.split_whitespace().any(|w| w == "pfghjc"), "{text}");
+
+        // A hit through the alias needs the alias's transposed word as much as a
+        // hit through the label needs the label's.
+        let label = "ОстаткиТоваровНаСкладахОрганизацийПоПартиям";
+        let alias = "StockBalancesInCompanyWarehousesByBatchesXYZ";
+        let original = format!("{label} {alias}");
+        let text = layout_filter_text(label, Some(&original));
+        assert!(text.encode_utf16().count() <= CLIENT_FILTER_MAX, "{text}");
+        let words: Vec<&str> = text.split_whitespace().collect();
+        for word in [label, alias] {
+            let transposed = transpose_layout(&word.fold_lower()).unwrap();
+            assert!(words.contains(&transposed.as_str()), "{transposed} missing: {text}");
+        }
+        assert!(text.starts_with("ОстаткиТоваров"), "the original text stays first: {text}");
     }
 
     #[test]

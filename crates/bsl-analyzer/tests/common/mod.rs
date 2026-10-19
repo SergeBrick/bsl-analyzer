@@ -20,6 +20,8 @@ pub const BROKEN: &str = "Процедура Тест(\n";
 /// `timing_contract`. An ordinary run does not judge a slow server by the clock — a server
 /// descheduled on a loaded machine is as quiet and as idle as a lost one — so there the window
 /// is the hang guard, far past any healthy answer (see [`test_utils::wait::hang_guard`]).
+/// How much of an LSP child's stderr [`Lsp::stderr_text`] keeps: the most recent bytes.
+pub const STDERR_TAIL: usize = 64 * 1024;
 pub const SILENCE: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 /// Total bound for one wait, even while unrelated messages keep arriving: ten minutes in
@@ -184,8 +186,8 @@ impl Lsp {
                 }
                 let mut output = stderr_capture.lock().unwrap();
                 output.extend_from_slice(&buffer[..read]);
-                if output.len() > 64 * 1024 {
-                    let excess = output.len() - 64 * 1024;
+                if output.len() > STDERR_TAIL {
+                    let excess = output.len() - STDERR_TAIL;
                     output.drain(..excess);
                 }
             }
@@ -273,6 +275,8 @@ impl Lsp {
         self.stdin.flush().unwrap();
     }
 
+    /// The child's stderr so far, or only its last [`STDERR_TAIL`] bytes once it has written
+    /// more.
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr_output.lock().unwrap()).into_owned()
     }

@@ -741,6 +741,11 @@ fn refresh_diagnostics_baseline(state: &mut GlobalState) {
 fn answer_from_the_reloaded_baseline(state: &mut GlobalState) {
     state.reset_workspace_batch();
     state.analysis_host.request_cancellation();
+    // Without an editor view, shared requests run on the owner's store, which the
+    // cancellation above cannot reach; a new request generation retries their answers.
+    if state.analysis_host.is_shared() {
+        state.shared_request_generation = state.shared_request_generation.wrapping_add(1);
+    }
     let uris = state.opened_document_uris();
     invalidate_diagnostics(state, &uris);
     for uri in uris {
@@ -780,11 +785,7 @@ fn handle_idle_tick(state: &mut GlobalState) {
         return;
     };
 
-    let db = state.analysis_host.raw_database_mut();
-    match kind {
-        IdleTrimKind::Shallow => db.enforce_lru(),
-        IdleTrimKind::Deep => ide::sweep_lru_deep(db),
-    }
+    state.analysis_host.enforce_lru(kind == IdleTrimKind::Deep);
     syntax::clear_shared_node_cache();
 
     if kind == IdleTrimKind::Deep {
@@ -1779,8 +1780,7 @@ pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<(
             continue;
         }
         if !origin_matches {
-            let current_revision =
-                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            let current_revision = state.analysis_host.request_revision();
             let refusal = RetryRefusal::InvalidOrigin;
             tracing::info!(
                 request_id = ?key.id,
@@ -7161,5 +7161,141 @@ mod tests {
             handle_task(state, crate::global_state::Task::SharedWorkspaceChanged { generation: 0 })
                 .unwrap();
         });
+    }
+
+    /// Two spellings of one file — through a symlinked directory — share one canonical
+    /// file in a shared session. Closing one must leave the file open for the other and
+    /// analysed from that other buffer, not from disk.
+    #[cfg(unix)]
+    #[test]
+    fn closing_one_spelling_of_a_shared_file_keeps_it_open_for_the_other() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src\"\n")
+            .expect("write project config");
+        let source = root.path().join("src");
+        std::fs::create_dir(&source).expect("create source root");
+        let module = source.join("Module.bsl");
+        std::fs::write(&module, "Процедура Диск() КонецПроцедуры\n").expect("write source");
+        std::os::unix::fs::symlink(&source, root.path().join("alias"))
+            .expect("link the source directory");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        state.vfs_done = true;
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        let buffer = "Процедура Буфер() КонецПроцедуры\n";
+        let open = |state: &mut GlobalState, path: &std::path::Path| {
+            let uri = lsp_types::Url::from_file_path(path).unwrap();
+            crate::handlers::notification::handle_did_open(
+                state,
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "bsl".to_owned(),
+                        version: 1,
+                        text: buffer.to_owned(),
+                    },
+                },
+            )
+            .expect("open the document");
+            uri
+        };
+        let real = open(&mut state, &module);
+        let alias = open(&mut state, &root.path().join("alias/Module.bsl"));
+        let file_id = crate::lsp::file_id(&state, &real).expect("resolve the real spelling");
+        assert_eq!(
+            crate::lsp::file_id(&state, &alias).ok(),
+            Some(file_id),
+            "both spellings resolve to one shared file"
+        );
+
+        crate::handlers::notification::handle_did_close(
+            &mut state,
+            lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: alias },
+            },
+        )
+        .expect("close the alias spelling");
+
+        assert!(state.open_files.contains(&file_id), "the real spelling keeps the file open");
+        let analysis = state.analysis_host.view().expect("open editor view").analysis();
+        assert_eq!(&*analysis.file_text(file_id), buffer, "the file is analysed from the buffer");
+        drop(analysis);
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    /// A shared session without an editor view answers from its owner's analysis. While the
+    /// owner has none published, a request must be declined as not ready, not answered from
+    /// the empty fallback store as if the workspace were empty. The input is a session that
+    /// already counts as loaded, so only the owner's state can decline it.
+    #[test]
+    fn a_shared_request_without_owner_analysis_is_declined() {
+        let backend = mcp_server::SharedState::shared();
+        let owner = backend.workspace_handle();
+        assert!(!matches!(owner.request_analysis(), mcp_server::WorkspaceRead::Ready(_)));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner);
+        state.vfs_done = true;
+
+        handle_request(
+            &mut state,
+            Request::new(
+                1.into(),
+                lsp_types::request::WorkspaceSymbolRequest::METHOD.to_string(),
+                serde_json::json!({ "query": "" }),
+            ),
+        )
+        .unwrap();
+        let response = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|message| match message {
+                Message::Response(response) if response.id == 1.into() => Some(response),
+                _ => None,
+            })
+            .expect("the request is declined at dispatch, not handed to the pool");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "the request is declined, not answered from an empty store: {:?}",
+            response.result
+        );
+    }
+
+    /// A reloaded diagnostics baseline answers everything again. A shared request without an
+    /// editor view runs on the owner's store, out of reach of the session's cancellation, so
+    /// the reload must leave its stamp stale for the finished answer to be retried. The input
+    /// is a view-less shared session, where the cancellation reaches only the fallback store.
+    #[test]
+    fn a_reloaded_baseline_retries_view_less_shared_requests() {
+        let backend = mcp_server::SharedState::shared();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, backend.workspace_handle());
+        assert!(state.analysis_host.view().is_none());
+        let stamped = state.shared_request_generation;
+
+        answer_from_the_reloaded_baseline(&mut state);
+
+        assert_ne!(
+            state.shared_request_generation, stamped,
+            "a request stamped before the reload is retried when it finishes"
+        );
     }
 }

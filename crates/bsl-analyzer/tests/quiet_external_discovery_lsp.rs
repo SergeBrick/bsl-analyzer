@@ -14,8 +14,11 @@ fn initial_lsp_load_reports_invalid_discovery_once_across_internal_requests() {
     std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src\"\n").unwrap();
 
     // The stdio server loads the project in this process, so its discovery warning reaches
-    // this stderr; a shared backend would log it to its own journal instead.
-    let mut lsp = Lsp::start_stdio(root.path());
+    // this stderr; a shared backend would log it to its own journal instead. The log level
+    // and destination are pinned so the caller's environment cannot divert or filter it.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
+    command.args(["lsp", "--mode", "stdio"]).env_remove("BSL_LOG_FILE").env("BSL_LOG", "warn");
+    let mut lsp = Lsp::start_command(command, root.path(), json!({}), common::SILENCE);
     lsp.open(&module, text);
     let uri = lsp_types::Url::from_file_path(&module).unwrap();
     for id in 2..5 {
@@ -33,9 +36,14 @@ fn initial_lsp_load_reports_invalid_discovery_once_across_internal_requests() {
     let status = lsp.shutdown(5);
     assert!(status.success(), "LSP subprocess exited with {status}");
 
-    // shutdown joins the stderr reader after the child closes its pipe, so this count covers
-    // the complete process lifetime and cannot miss a delayed internal warning.
+    // shutdown joins the stderr reader after the child closes its pipe, and the output stays
+    // under the capture's tail bound, so this count covers the complete process lifetime and
+    // cannot miss a delayed internal warning.
     let stderr = lsp.stderr_text();
+    assert!(
+        stderr.len() < common::STDERR_TAIL,
+        "stderr reached the capture bound, so its head may be lost:\n{stderr}"
+    );
     assert_eq!(
         stderr.matches("auto-discovered external directories were skipped").count(),
         1,

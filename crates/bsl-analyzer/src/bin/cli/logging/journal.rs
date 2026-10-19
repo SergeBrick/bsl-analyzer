@@ -720,7 +720,8 @@ mod tests {
             drop(JournalGuard(shared));
             guard_done.send(()).unwrap();
         });
-        let result = guard_observed.recv_timeout(DRAIN + Duration::from_secs(1));
+        let result =
+            guard_observed.recv_timeout(test_utils::wait::ceiling(DRAIN + Duration::from_secs(1)));
         drop(lock);
         assert!(result.is_ok(), "shutdown must finish while the disk lock remains held");
         guard.join().unwrap();
@@ -838,7 +839,12 @@ mod tests {
                 finished.send(result).unwrap();
             });
             // Watchdog only: a blocking send cannot finish while the full receiver stays undrained.
-            assert_eq!(completion.recv_timeout(Duration::from_secs(10)).unwrap(), control);
+            assert_eq!(
+                completion
+                    .recv_timeout(test_utils::wait::ceiling(Duration::from_secs(10)))
+                    .unwrap(),
+                control
+            );
             worker.join().unwrap();
             assert!(shared.dropped.load(Ordering::Relaxed) > 0);
             if let Some(receiver) = receiver {
@@ -902,7 +908,7 @@ mod tests {
             );
             done_tx.send(()).unwrap();
         });
-        let drained = appended_rx.recv_timeout(Duration::from_secs(30));
+        let drained = appended_rx.recv_timeout(test_utils::wait::ceiling(Duration::from_secs(30)));
         drop(JournalGuard(shared));
         handle.join().unwrap();
         drained.expect("the worker should append the overflow gap and every queued record");

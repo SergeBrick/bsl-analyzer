@@ -330,7 +330,7 @@ fn predicate_operators_are_owned_by_their_source_nodes() {
     let package = lower(&nested);
     assert!(matches!(
         package.queries()[0].hir.where_clause,
-        Some(ExprHir::In { negated: true, .. })
+        Some(ExprHir::In { negated: false, .. })
     ));
     assert_eq!(
         package
@@ -342,6 +342,76 @@ fn predicate_operators_are_owned_by_their_source_nodes() {
         1,
         "nested NOT belongs only to the inner predicate"
     );
+}
+
+#[test]
+fn predicate_negation_is_read_from_the_predicate_itself() {
+    let prefix = "ВЫБРАТЬ Т.Код ИЗ Т КАК Т ГДЕ ";
+    let nested = "(ВЫБРАТЬ В.Код ИЗ Справочник.В КАК В ГДЕ НЕ В.Флаг)";
+    let negated_of = |expression: String| match lower(&format!("{prefix}{expression}")).queries()[0]
+        .hir
+        .where_clause
+        .clone()
+    {
+        Some(ExprHir::In { negated, .. })
+        | Some(ExprHir::Between { negated, .. })
+        | Some(ExprHir::Like { negated, .. }) => negated,
+        other => panic!("unexpected predicate {other:?} for {expression:?}"),
+    };
+    assert!(!negated_of(format!("Т.Код В {nested}")));
+    assert!(negated_of(format!("Т.Код НЕ В {nested}")));
+    assert!(!negated_of(format!("Т.Код МЕЖДУ 1 И {nested}")));
+    assert!(negated_of(format!("Т.Код НЕ МЕЖДУ 1 И {nested}")));
+    assert!(!negated_of(format!("Т.Код ПОДОБНО {nested}")));
+    assert!(negated_of(format!("Т.Код НЕ ПОДОБНО {nested}")));
+}
+
+#[test]
+fn negated_hierarchy_predicate_keeps_its_negation() {
+    let prefix = "ВЫБРАТЬ Т.Код ИЗ Т КАК Т ГДЕ ";
+    let list = |expression: &str| {
+        lower(&format!("{prefix}{expression}")).queries()[0].hir.where_clause.clone()
+    };
+    assert!(matches!(list("Т.Код В ИЕРАРХИИ (&Корень)"), Some(ExprHir::BinaryOp { .. })));
+    assert!(matches!(
+        list("Т.Код НЕ В ИЕРАРХИИ (&Корень)"),
+        Some(ExprHir::UnaryOp { op, expr, .. })
+            if format!("{op:?}") == "Not" && matches!(*expr, ExprHir::BinaryOp { .. })
+    ));
+    let subquery = "(ВЫБРАТЬ К.Ссылка ИЗ Справочник.Товары КАК К)";
+    assert!(matches!(
+        list(&format!("Т.Код В ИЕРАРХИИ {subquery}")),
+        Some(ExprHir::In { negated: false, .. })
+    ));
+    assert!(matches!(
+        list(&format!("Т.Код НЕ В ИЕРАРХИИ {subquery}")),
+        Some(ExprHir::In { negated: true, .. })
+    ));
+}
+
+#[test]
+fn operators_inside_every_argument_and_in_list_value_are_recorded() {
+    for input in [
+        "ВЫБРАТЬ Т.Код ИЗ Т КАК Т ГДЕ ЕСТЬNULL(ВЫБОР КОГДА Т.Вид = 2 ТОГДА 3 ИНАЧЕ 0 КОНЕЦ, 0) = 3",
+        "ВЫБРАТЬ Т.Код ИЗ Т КАК Т ГДЕ Т.Код В (1, ВЫБОР КОГДА Т.Вид = 2 ТОГДА 3 КОНЕЦ) И Т.Код = 3",
+    ] {
+        let package = lower(input);
+        let mut actual: Vec<_> = package
+            .source_map
+            .tokens_by_category(TokenCategory::Operator)
+            .iter()
+            .filter(|token| token.text == "=")
+            .map(|token| token.range)
+            .collect();
+        actual.sort_by_key(|range| range.start());
+        let expected: Vec<_> = input
+            .match_indices('=')
+            .map(|(start, _)| {
+                text_size::TextRange::new((start as u32).into(), ((start + 1) as u32).into())
+            })
+            .collect();
+        assert_eq!(actual, expected, "{input}");
+    }
 }
 
 #[test]

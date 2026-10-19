@@ -189,6 +189,19 @@ fn string_literal_candidates() {
     assert_eq!(&escaped[start..end], "\"Текст с \"\"кавычками\"\"\"");
 }
 
+#[test]
+fn unterminated_literal_is_still_a_candidate() {
+    for query in ["ВЫБРАТЬ \"Первая строка\nвторая", "ВЫБРАТЬ \"Одна строка"]
+    {
+        let package = lower_sdbl_to_hir(&parser::parse_sdbl(query), None);
+        let candidates = package
+            .all_diagnostics()
+            .filter(|d| matches!(d, SdblDiagnostic::MultilineString { .. }))
+            .count();
+        assert_eq!(candidates, 1, "{query:?}");
+    }
+}
+
 // v8std #437 §2, §2б: a result column needs an explicit name given with КАК.
 #[test]
 fn field_alias_requirements() {

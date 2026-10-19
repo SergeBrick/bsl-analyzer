@@ -236,11 +236,11 @@ impl LoweringContext<'_> {
 
         // Keep every non-empty multi-string as a candidate; the IDE layer checks the full
         // query text to decide whether the literal actually continues onto another line.
-        let fragments = node
+        let has_content = node
             .children_with_tokens()
-            .filter(|element| element.kind() == syntax::SyntaxKind::STRING)
-            .count();
-        if fragments > 2 {
+            .filter_map(|element| element.into_token())
+            .any(|token| token.kind() == syntax::SyntaxKind::STRING && token.text() != "\"");
+        if has_content {
             self.diagnostics.push(SdblDiagnostic::MultilineString { range: node.text_range() });
         }
 

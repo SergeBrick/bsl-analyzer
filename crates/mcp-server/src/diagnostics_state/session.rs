@@ -834,10 +834,14 @@ mod tests {
     /// A state whose throttle cache reads as walked JUST NOW, so every force meets the
     /// storm guard's decline. No resident behind it: these gates count reads and forces,
     /// and building a database would only add time to a wait they measure.
+    ///
+    /// Stamped ahead of the clock: its age reads as zero at every consultation, however
+    /// long the stand takes to reach the guard. A stamp of `now` decays while a loaded
+    /// machine runs the setup, and the guard then arms the force these gates need declined.
     fn a_state_the_storm_guard_is_protecting(root: &std::path::Path) -> DiagnosticsState {
         let state = DiagnosticsState::for_workspace(root.to_path_buf());
         *lock_recover(&state.scan) = Some(crate::diagnostics_state::drift::ScanCache {
-            at: Instant::now(),
+            at: Instant::now() + Duration::from_secs(3600),
             stats: Vec::new(),
             config_fp: 0,
             baseline_epoch: 0,

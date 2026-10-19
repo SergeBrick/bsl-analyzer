@@ -1521,6 +1521,7 @@ pub(super) fn apply_resident_changes(
                 &mut resident.db,
                 resident.project.compatibility_mode(),
             );
+            ide_host_core::apply_ordinary_forms_setting(&mut resident.db, Some(&resident.project));
             metadata_changed = true;
         }
         moved = true;
@@ -1888,6 +1889,43 @@ mod tests {
         assert!(!rebuild, "a readable add needs no rebuild");
         assert!(applied, "the add reached the file set, or the control proves nothing");
         assert!(after > before, "an applied add is published: generation {before} -> {after}");
+    }
+
+    /// `UseOrdinaryFormInManagedApplication` decides where ordinary forms are judged in
+    /// the resident as in the CLI and the LSP: read at the build, reread on an edit of
+    /// `Configuration.xml`.
+    #[test]
+    fn the_resident_follows_the_ordinary_form_setting_of_the_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        sample_workspace(root);
+        let xml = |value: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <UseOrdinaryFormInManagedApplication>{value}</UseOrdinaryFormInManagedApplication>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        write(root, "Configuration.xml", &xml("false"));
+        let setting = |resident: &DiagnosticsResident| {
+            resident.db.env_options().ordinary_forms_in_managed_app
+        };
+
+        let mut resident = DiagnosticsState::build_resident_for_test(root);
+        assert_eq!(setting(&resident), Some(false));
+
+        write(root, "Configuration.xml", &xml("true"));
+        let (rebuild, _) = apply_resident_changes(
+            &mut resident,
+            &[root.join("Configuration.xml")],
+            &[],
+            &[],
+            &[],
+            |_| None,
+            &HashMap::new(),
+        );
+        assert!(!rebuild, "an edit inside the configuration root is applied in place");
+        assert_eq!(setting(&resident), Some(true));
     }
 
     /// What a consumer of the resident sees for one path: the generation it is served at,

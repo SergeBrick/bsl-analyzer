@@ -8,9 +8,8 @@ impl GlobalState {
     pub fn update_features_config(&mut self) {
         let config =
             self.project.as_ref().map(|project| project.config.clone()).unwrap_or_default();
-        let db = self.analysis_host.raw_database_mut();
-        apply_project_config_to_db(db, &config);
-        apply_compatibility_mode_to_db(db, self.project.as_ref());
+        apply_project_config_to_db(self.analysis_host.raw_database_mut(), &config);
+        self.apply_configuration_xml_settings();
         if let Some(project) = self.project.as_ref() {
             if let Some(warning) =
                 platform_help::source_change_warning(Some(&project.config), &project.root)
@@ -19,6 +18,15 @@ impl GlobalState {
                 self.show_warning_message(warning);
             }
         }
+    }
+
+    /// Reads the settings the main configuration's `Configuration.xml` states into the
+    /// database: the compatibility mode and whether ordinary forms run in the managed
+    /// thick client.
+    pub(crate) fn apply_configuration_xml_settings(&mut self) {
+        let db = self.analysis_host.raw_database_mut();
+        apply_compatibility_mode_to_db(db, self.project.as_ref());
+        ide_host_core::apply_ordinary_forms_setting(db, self.project.as_ref());
     }
 }
 

@@ -23,6 +23,23 @@ pub use workspace::{
 use ide::{Analysis, RootDatabaseImpl};
 use salsa::Database as _;
 
+/// `UseOrdinaryFormInManagedApplication` of the main configuration of `project` into
+/// the environment options: whether ordinary forms run in the managed thick client.
+/// Applied after the options are built from the settings, and again when
+/// `Configuration.xml` changes.
+pub fn apply_ordinary_forms_setting(
+    db: &mut RootDatabaseImpl,
+    project: Option<&project_model::Project>,
+) {
+    let value = project.and_then(|project| project.ordinary_forms_in_managed_app());
+    let mut options = db.env_options();
+    if options.ordinary_forms_in_managed_app != value {
+        tracing::info!(ordinary_forms_in_managed_app = ?value, "updated ordinary-form environments");
+        options.ordinary_forms_in_managed_app = value;
+        db.set_env_options(options);
+    }
+}
+
 /// Owns the resident Salsa database and produces cheap [`Analysis`] snapshots over
 /// cloned handles (the clone shares the Salsa storage / LRU cache).
 #[derive(Default)]

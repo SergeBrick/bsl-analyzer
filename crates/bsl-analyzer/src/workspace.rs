@@ -450,18 +450,16 @@ impl GlobalState {
                     tracing::info!(path = %path.display(), "bumping config revision after XML change");
                     db.bump_config_for_path(path);
                 }
-                // The compatibility mode is read from the main configuration's
-                // `Configuration.xml`, not derived from the metadata revision.
+                // The compatibility mode and the ordinary-form setting are read from
+                // the main configuration's `Configuration.xml`, not derived from the
+                // metadata revision.
                 if changed_metadata_paths.iter().any(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
                         .and_then(bsl_conventions::conventional_of)
                         == Some(bsl_conventions::ConventionalName::ConfigurationXml)
                 }) {
-                    crate::features_state::apply_compatibility_mode_to_db(
-                        db,
-                        self.project.as_ref(),
-                    );
+                    self.apply_configuration_xml_settings();
                 }
             }
         }
@@ -1074,6 +1072,9 @@ impl GlobalState {
     pub fn bootstrap_metadata_substrate(&mut self) {
         let vfs = LspVfs(&self.vfs);
         self.analysis_host.bootstrap_metadata_substrate(&vfs);
+        // A `Configuration.xml` edit made during the initial load arrives in a batch
+        // that skips the reread; the complete workspace is read here.
+        self.apply_configuration_xml_settings();
     }
 
     /// Incrementally refresh the metadata substrate for the config roots owning any
@@ -1898,5 +1899,81 @@ mod compatibility_mode_tests {
             state.analysis_host.raw_database().compatibility_mode().as_deref(),
             Some("Version8_3_17")
         );
+    }
+
+    /// `UseOrdinaryFormInManagedApplication` lives there too and is reread the same way.
+    #[test]
+    fn a_configuration_xml_edit_rereads_the_ordinary_form_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        let cf = root.join("src/cf");
+        std::fs::create_dir_all(&cf).unwrap();
+        let xml = |value: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <UseOrdinaryFormInManagedApplication>{value}</UseOrdinaryFormInManagedApplication>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        let xml_path = cf.join("Configuration.xml");
+        std::fs::write(&xml_path, xml("false")).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        let setting = |state: &GlobalState| {
+            state.analysis_host.raw_database().env_options().ordinary_forms_in_managed_app
+        };
+        assert_eq!(setting(&state), Some(false));
+
+        let changed = xml("true");
+        std::fs::write(&xml_path, &changed).unwrap();
+        state.vfs.write().set_file_contents(VfsPath::new(xml_path), Some(Arc::from(changed)));
+        state.process_changes(false);
+        assert_eq!(setting(&state), Some(true));
+    }
+
+    /// An edit made while the workspace still loads lands in a batch that skips the
+    /// reread; the end-of-load metadata bootstrap reads the file the load ended with.
+    #[test]
+    fn a_configuration_xml_edit_during_the_initial_load_is_read_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        let cf = root.join("src/cf");
+        std::fs::create_dir_all(&cf).unwrap();
+        let xml = |mode: &str, ordinary: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <CompatibilityMode>{mode}</CompatibilityMode>\
+                 <UseOrdinaryFormInManagedApplication>{ordinary}</UseOrdinaryFormInManagedApplication>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        let xml_path = cf.join("Configuration.xml");
+        std::fs::write(&xml_path, xml("Version8_2_13", "false")).unwrap();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root.to_path_buf()).unwrap();
+        let settings = |state: &GlobalState| {
+            let db = state.analysis_host.raw_database();
+            (
+                db.compatibility_mode().as_deref().map(str::to_owned),
+                db.env_options().ordinary_forms_in_managed_app,
+            )
+        };
+        assert_eq!(settings(&state), (Some("Version8_2_13".to_owned()), Some(false)));
+
+        let changed = xml("Version8_3_17", "true");
+        std::fs::write(&xml_path, &changed).unwrap();
+        state.vfs.write().set_file_contents(VfsPath::new(xml_path), Some(Arc::from(changed)));
+        state.process_changes(true);
+        assert_eq!(settings(&state), (Some("Version8_2_13".to_owned()), Some(false)));
+
+        state.init_source_root();
+        state.bootstrap_metadata_substrate();
+        assert_eq!(settings(&state), (Some("Version8_3_17".to_owned()), Some(true)));
     }
 }

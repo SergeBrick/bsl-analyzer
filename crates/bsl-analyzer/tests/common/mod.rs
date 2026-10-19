@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 
 pub const BROKEN: &str = "Процедура Тест(\n";
 
+/// How much of an LSP child's stderr [`Lsp::stderr_text`] keeps: the most recent bytes.
+pub const STDERR_TAIL: usize = 64 * 1024;
+
 /// Silence a server at rest is allowed before a wait is judged lost: a minute under
 /// `timing_contract`. An ordinary run does not judge a slow server by the clock — a server
 /// descheduled on a loaded machine is as quiet and as idle as a lost one — so there the window
@@ -116,6 +119,7 @@ pub struct Lsp {
     pub messages: Receiver<Value>,
     pub initialize_response: Value,
     stderr_output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     /// Server notifications sent during initialize are valid LSP traffic too; keep
     /// them for the test that owns the channel instead of eating them while waiting
     /// for the initialize response.
@@ -174,7 +178,7 @@ impl Lsp {
         let stderr = child.stderr.take().unwrap();
         let stderr_output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let stderr_capture = std::sync::Arc::clone(&stderr_output);
-        std::thread::spawn(move || {
+        let stderr_reader = std::thread::spawn(move || {
             let mut reader = stderr;
             let mut buffer = [0; 2048];
             while let Ok(read) = reader.read(&mut buffer) {
@@ -183,8 +187,8 @@ impl Lsp {
                 }
                 let mut output = stderr_capture.lock().unwrap();
                 output.extend_from_slice(&buffer[..read]);
-                if output.len() > 64 * 1024 {
-                    let excess = output.len() - 64 * 1024;
+                if output.len() > STDERR_TAIL {
+                    let excess = output.len() - STDERR_TAIL;
                     output.drain(..excess);
                 }
             }
@@ -224,6 +228,7 @@ impl Lsp {
             messages,
             initialize_response: Value::Null,
             stderr_output,
+            stderr_reader: Some(stderr_reader),
             pending: Default::default(),
             recent: Default::default(),
         };
@@ -271,8 +276,16 @@ impl Lsp {
         self.stdin.flush().unwrap();
     }
 
+    /// The child's stderr so far, or only its last [`STDERR_TAIL`] bytes once it has written
+    /// more.
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr_output.lock().unwrap()).into_owned()
+    }
+
+    fn join_stderr_reader(&mut self) {
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("LSP stderr reader thread");
+        }
     }
 
     /// Fails a wait for `phase` that `waited` without seeing what it waited for, with what the
@@ -546,7 +559,7 @@ impl Lsp {
         let response = self.request(id, "shutdown", Value::Null);
         assert!(response["error"].is_null(), "shutdown request failed: {response}");
         self.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-        match self.wait_for_exit_within(PROCESS_SHUTDOWN_TIMEOUT, "shutdown/exit") {
+        let status = match self.wait_for_exit_within(PROCESS_SHUTDOWN_TIMEOUT, "shutdown/exit") {
             Ok(Some(status)) => status,
             Ok(None) => {
                 let pid = self.child.id();
@@ -560,7 +573,9 @@ impl Lsp {
                 let cleanup = self.stop_child("shutdown error cleanup", PROCESS_CLEANUP_TIMEOUT);
                 panic!("{error}; forced cleanup: {cleanup:?}");
             }
-        }
+        };
+        self.join_stderr_reader();
+        status
     }
 }
 
@@ -569,5 +584,6 @@ impl Drop for Lsp {
         if let Err(error) = self.stop_child("Drop", PROCESS_CLEANUP_TIMEOUT) {
             eprintln!("{error}");
         }
+        self.join_stderr_reader();
     }
 }

@@ -741,6 +741,11 @@ fn refresh_diagnostics_baseline(state: &mut GlobalState) {
 fn answer_from_the_reloaded_baseline(state: &mut GlobalState) {
     state.reset_workspace_batch();
     state.analysis_host.request_cancellation();
+    // Without an editor view, shared requests run on the owner's store, which the
+    // cancellation above cannot reach; a new request generation retries their answers.
+    if state.analysis_host.is_shared() {
+        state.shared_request_generation = state.shared_request_generation.wrapping_add(1);
+    }
     let uris = state.opened_document_uris();
     invalidate_diagnostics(state, &uris);
     for uri in uris {
@@ -780,11 +785,7 @@ fn handle_idle_tick(state: &mut GlobalState) {
         return;
     };
 
-    let db = state.analysis_host.raw_database_mut();
-    match kind {
-        IdleTrimKind::Shallow => db.enforce_lru(),
-        IdleTrimKind::Deep => ide::sweep_lru_deep(db),
-    }
+    state.analysis_host.enforce_lru(kind == IdleTrimKind::Deep);
     syntax::clear_shared_node_cache();
 
     if kind == IdleTrimKind::Deep {
@@ -1217,6 +1218,10 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
             if changed {
                 state.shared_view_seeded = true;
             }
+            // A new owner generation is a disk change, possibly a checkout that moved the
+            // git state the vendor-diff scope was computed against.
+            state.request_scope_rebuild();
+            state.maybe_spawn_scope_build();
             let first_ready_generation = refresh_shared_readiness(state);
             if changed && state.vfs_done {
                 crate::handlers::notification::refresh_after_shared_catch_up(state);
@@ -1709,12 +1714,20 @@ fn queue_latency_retry(
 }
 
 fn finish_latency_request(state: &mut GlobalState, key: &RequestAttemptKey, response: Response) {
+    if close_latency_lifecycle(state, key) {
+        state.respond(response);
+    }
+}
+
+/// Retire the lifecycle of `key`'s attempt, or report that the attempt is no longer the
+/// current one and its terminal response is stale.
+fn close_latency_lifecycle(state: &mut GlobalState, key: &RequestAttemptKey) -> bool {
     let current = state.request_lifecycles.get(&key.id).is_some_and(|lifecycle| {
         lifecycle.generation == key.generation && lifecycle.attempt == key.attempt
     });
     if !current {
         tracing::debug!(request_id = ?key.id, generation = key.generation, attempt = key.attempt, "discarding stale terminal response");
-        return;
+        return false;
     }
 
     state
@@ -1739,7 +1752,7 @@ fn finish_latency_request(state: &mut GlobalState, key: &RequestAttemptKey, resp
         attempt = key.attempt,
         "finalized LSP request"
     );
-    state.respond(response);
+    true
 }
 
 pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<()> {
@@ -1775,8 +1788,7 @@ pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<(
             continue;
         }
         if !origin_matches {
-            let current_revision =
-                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            let current_revision = state.analysis_host.request_revision();
             let refusal = RetryRefusal::InvalidOrigin;
             tracing::info!(
                 request_id = ?key.id,
@@ -1819,8 +1831,10 @@ pub(crate) fn admit_pending_latency_retries(state: &mut GlobalState) -> Result<(
                     "content modified".to_string(),
                 ),
             );
-        } else {
-            state.retry_dispatch = None;
+        } else if state.retry_dispatch.take().is_some() {
+            // The dispatcher answered without admitting the attempt (declined while loading
+            // or busy), so only its lifecycle is left to close.
+            close_latency_lifecycle(state, &key);
         }
     }
     Ok(())
@@ -4987,6 +5001,34 @@ mod tests {
         state.request_lifecycles.remove(&unopened_id);
     }
 
+    /// A queued retry the dispatcher declines before admitting it — here because the
+    /// workspace is loading again — is answered by the decline, and its lifecycle must close
+    /// with it: a lifecycle left behind counts against the shared admission bound forever.
+    #[test]
+    fn a_retry_declined_before_admission_closes_its_lifecycle() {
+        let (_root, mut state, client_receiver, _task_receiver, retry, _active_token) =
+            g1_session_boundary_state(lsp_server::RequestId::from(7420));
+        while client_receiver.try_recv().is_ok() {}
+        state.vfs_done = false;
+
+        admit_pending_latency_retries(&mut state).unwrap();
+
+        let response = std::iter::from_fn(|| client_receiver.try_recv().ok())
+            .find_map(|message| match message {
+                Message::Response(response) if response.id == retry.id => Some(response),
+                _ => None,
+            })
+            .expect("the declined retry is answered");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32)
+        );
+        assert!(
+            !state.request_lifecycles.contains_key(&retry.id),
+            "the declined retry closes its lifecycle"
+        );
+    }
+
     #[test]
     fn g1_shutdown_branch_does_not_admit_valid_queued_retry_and_cleans_session() {
         g1_with_tracing(|| {
@@ -7070,5 +7112,278 @@ mod tests {
             )
             .expect("close the open document");
         });
+    }
+
+    /// The vendor-diff scope is computed against the working tree, so every disk change a
+    /// shared session learns of must queue a rebuild, as the standalone save and external
+    /// change paths do. The input is a shared session whose first scope build has already
+    /// been applied, so only the event under test can queue the next one.
+    fn assert_shared_disk_change_rebuilds_scope(
+        apply: impl FnOnce(&mut GlobalState, &std::path::Path),
+    ) {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(
+            root.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\n\n[analysis]\ndiff_base = \"HEAD\"\n",
+        )
+        .expect("write project config");
+        let module = root.path().join("Module.bsl");
+        std::fs::write(&module, "Процедура Было() КонецПроцедуры\n").expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        assert!(state.analysis_scope.is_loading(), "a configured diff base builds the scope");
+        while state.analysis_scope.is_loading() {
+            let task = state
+                .task_pool
+                .receiver
+                .recv_timeout(test_utils::wait::ceiling(std::time::Duration::from_secs(20)))
+                .expect("the first scope build finishes");
+            if matches!(task, crate::global_state::Task::AnalysisScopeReady { .. }) {
+                handle_task(&mut state, task).unwrap();
+            }
+        }
+        assert!(!state.scope_build_queued, "no rebuild is pending before the disk change");
+
+        std::fs::write(&module, "Процедура Стало() КонецПроцедуры\n").expect("rewrite source");
+        apply(&mut state, &module);
+
+        assert!(
+            state.scope_build_queued || state.analysis_scope.is_loading(),
+            "the disk change rebuilds the vendor-diff scope"
+        );
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    #[test]
+    fn a_shared_save_rebuilds_the_vendor_diff_scope() {
+        assert_shared_disk_change_rebuilds_scope(|state, path| {
+            crate::handlers::handle_did_save(
+                state,
+                lsp_types::DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: lsp_types::Url::from_file_path(path).unwrap(),
+                    },
+                    text: None,
+                },
+            )
+            .expect("save the document");
+        });
+    }
+
+    #[test]
+    fn a_shared_workspace_change_rebuilds_the_vendor_diff_scope() {
+        assert_shared_disk_change_rebuilds_scope(|state, path| {
+            let owner = state.analysis_host.owner().cloned().expect("shared session owner");
+            owner.notify_changed_path(path);
+            handle_task(state, crate::global_state::Task::SharedWorkspaceChanged { generation: 0 })
+                .unwrap();
+        });
+    }
+
+    /// Spellings of one file through symlinked directories share one canonical file in a
+    /// shared session. Closing one must leave the file open for the others and analysed from
+    /// one of their buffers, not from disk — the same one on every run, which the input
+    /// tells apart by giving each of the two remaining spellings a different buffer.
+    #[cfg(unix)]
+    #[test]
+    fn closing_one_spelling_of_a_shared_file_keeps_it_open_for_the_other() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src\"\n")
+            .expect("write project config");
+        let source = root.path().join("src");
+        std::fs::create_dir(&source).expect("create source root");
+        let module = source.join("Module.bsl");
+        std::fs::write(&module, "Процедура Диск() КонецПроцедуры\n").expect("write source");
+        for alias in ["alias", "zalias"] {
+            std::os::unix::fs::symlink(&source, root.path().join(alias))
+                .expect("link the source directory");
+        }
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        state.vfs_done = true;
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
+            let uri = lsp_types::Url::from_file_path(path).unwrap();
+            crate::handlers::notification::handle_did_open(
+                state,
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "bsl".to_owned(),
+                        version: 1,
+                        text: text.to_owned(),
+                    },
+                },
+            )
+            .expect("open the document");
+            uri
+        };
+        let real = open(&mut state, &module, "Процедура Исходник() КонецПроцедуры\n");
+        let alias_buffer = "Процедура Псевдоним() КонецПроцедуры\n";
+        let alias = open(&mut state, &root.path().join("alias/Module.bsl"), alias_buffer);
+        let closed = open(
+            &mut state,
+            &root.path().join("zalias/Module.bsl"),
+            "Процедура Последний() КонецПроцедуры\n",
+        );
+        let file_id = crate::lsp::file_id(&state, &real).expect("resolve the real spelling");
+        for spelling in [&alias, &closed] {
+            assert_eq!(
+                crate::lsp::file_id(&state, spelling).ok(),
+                Some(file_id),
+                "every spelling resolves to one shared file"
+            );
+        }
+
+        crate::handlers::notification::handle_did_close(
+            &mut state,
+            lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: closed },
+            },
+        )
+        .expect("close one spelling");
+
+        assert!(state.open_files.contains(&file_id), "the other spellings keep the file open");
+        let analysis = state.analysis_host.view().expect("open editor view").analysis();
+        assert_eq!(
+            &*analysis.file_text(file_id),
+            alias_buffer,
+            "the file is analysed from the remaining buffer with the least URI"
+        );
+        drop(analysis);
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    /// A shared session without an editor view answers from its owner's analysis. While the
+    /// owner has none published, a request must be declined as not ready, not answered from
+    /// the empty fallback store as if the workspace were empty. The input is a session that
+    /// already counts as loaded, so only the owner's state can decline it.
+    #[test]
+    fn a_shared_request_without_owner_analysis_is_declined() {
+        let backend = mcp_server::SharedState::shared();
+        let owner = backend.workspace_handle();
+        assert!(!matches!(owner.request_analysis(), mcp_server::WorkspaceRead::Ready(_)));
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner);
+        state.vfs_done = true;
+
+        handle_request(
+            &mut state,
+            Request::new(
+                1.into(),
+                lsp_types::request::WorkspaceSymbolRequest::METHOD.to_string(),
+                serde_json::json!({ "query": "" }),
+            ),
+        )
+        .unwrap();
+        let response = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|message| match message {
+                Message::Response(response) if response.id == 1.into() => Some(response),
+                _ => None,
+            })
+            .expect("the request is declined at dispatch, not handed to the pool");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "the request is declined, not answered from an empty store: {:?}",
+            response.result
+        );
+    }
+
+    /// A syntax request is answered inline while loading from the store holding its file.
+    /// A shared session without an editor view has no such store — its fallback is empty —
+    /// so the request is declined as not ready instead of failing on a missing file.
+    #[test]
+    fn a_view_less_shared_syntax_request_is_declined_while_not_ready() {
+        let backend = mcp_server::SharedState::shared();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, backend.workspace_handle());
+        state.vfs_done = true;
+        let root = tempfile::tempdir().expect("create workspace");
+        let uri = lsp_types::Url::from_file_path(root.path().join("Module.bsl")).unwrap();
+
+        handle_request(
+            &mut state,
+            Request::new(
+                1.into(),
+                lsp_types::request::DocumentSymbolRequest::METHOD.to_string(),
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            ),
+        )
+        .unwrap();
+
+        let response = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|message| match message {
+                Message::Response(response) if response.id == 1.into() => Some(response),
+                _ => None,
+            })
+            .expect("the request is answered at dispatch");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(lsp_server::ErrorCode::ContentModified as i32),
+            "declined as not ready: {:?}",
+            response.error
+        );
+    }
+
+    /// A reloaded diagnostics baseline answers everything again. A shared request without an
+    /// editor view runs on the owner's store, out of reach of the session's cancellation, so
+    /// the reload must leave its stamp stale for the finished answer to be retried. The input
+    /// is a view-less shared session, where the cancellation reaches only the fallback store.
+    #[test]
+    fn a_reloaded_baseline_retries_view_less_shared_requests() {
+        let backend = mcp_server::SharedState::shared();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, backend.workspace_handle());
+        assert!(state.analysis_host.view().is_none());
+        let stamped = state.shared_request_generation;
+
+        answer_from_the_reloaded_baseline(&mut state);
+
+        assert_ne!(
+            state.shared_request_generation, stamped,
+            "a request stamped before the reload is retried when it finishes"
+        );
     }
 }

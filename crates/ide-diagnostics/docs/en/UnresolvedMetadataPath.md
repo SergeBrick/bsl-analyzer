@@ -43,6 +43,8 @@ English spellings (`Type("CatalogRef.Товары")`, `PredefinedValue("Enum.Ц�
   checked;
 - a module method or a global common module export of the same name takes the call
   over;
+- the object or the value is added by another extension of the workspace: the module
+  does not see it, but every extension of the infobase is applied when the call runs;
 - the call sits in an `#If` branch no environment of the method compiles, or in a
   common module with no environments set.
 

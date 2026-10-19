@@ -179,6 +179,11 @@ fn reported(source: &str) -> Vec<String> {
 /// [`reported`], with an extension that adds the catalog `Услуги` registered beside
 /// the configuration.
 fn reported_in(source: &str, with_extension: bool) -> Vec<String> {
+    findings_in(source, with_extension).into_iter().map(|(message, _)| message).collect()
+}
+
+/// The messages of the rule with the source text each one points at.
+fn findings_in(source: &str, with_extension: bool) -> Vec<(String, String)> {
     let dir = tempfile::tempdir().expect("create fixture directory");
     let root = dir.path().join("cf");
     let root = root.as_path();
@@ -203,7 +208,7 @@ fn reported_in(source: &str, with_extension: bool) -> Vec<String> {
     ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
         .into_iter()
         .filter(|diag| diag.code.as_str() == CODE)
-        .map(|diag| diag.message)
+        .map(|diag| (diag.message, source[diag.range].to_string()))
         .collect()
 }
 
@@ -335,4 +340,82 @@ fn an_object_another_extension_adds_is_silent() {
         Vec::<String>::new(),
         "the extension is applied when the call runs"
     );
+}
+
+#[test]
+fn modal_and_get_form_paths_are_judged_too() {
+    let source = r#"
+Процедура Тест() Экспорт
+    ОткрытьФормуМодально("Справочник.Услуги.ФормаВыбора");
+    Ф = GetForm("Catalog.Услуги.ItemForm");
+    OpenFormModal("Catalog.Товары.ChoiceForm");
+КонецПроцедуры
+"#;
+    assert_eq!(
+        reported(source),
+        vec![
+            "Объект метаданных \"Справочник.Услуги\" не найден в конфигурации",
+            "Объект метаданных \"Справочник.Услуги\" не найден в конфигурации",
+        ]
+    );
+}
+
+#[test]
+fn the_finding_points_at_the_string_literal() {
+    let source = r#"
+Процедура Тест() Экспорт
+    Если ТипЗнч(Неопределено) = Тип("СправочникСсылка.Услуги") Тогда
+        ОткрытьФорму("Справочник.Товары.ФормаСписка", , , ПредопределенноеЗначение("Перечисление.Цвета.Зеленый"));
+    КонецЕсли;
+КонецПроцедуры
+"#;
+    let ranges: Vec<String> =
+        findings_in(source, false).into_iter().map(|(_, text)| text).collect();
+    assert_eq!(ranges, vec!["\"СправочникСсылка.Услуги\"", "\"Перечисление.Цвета.Зеленый\""]);
+}
+
+#[test]
+fn unknown_prefixes_and_shapes_are_silent() {
+    let source = r#"
+Процедура Тест() Экспорт
+    Т1 = Тип("ОпределяемыйТип.Услуги");
+    Т2 = Тип("КонстантаМенеджерЗначения.Услуги");
+    Т3 = Тип("СправочникСсылка");
+    Т4 = Тип("СправочникСсылка.Услуги.Лишний");
+    Т5 = Тип("СправочникСсылка.Не Имя");
+    З1 = ПредопределенноеЗначение("НеВид.Услуги.Основной");
+    ОткрытьФорму("ЖурналДокументов.Услуги.ФормаСписка");
+    ОткрытьФорму("ФормаСписка");
+КонецПроцедуры
+"#;
+    assert_eq!(reported(source), Vec::<String>::new());
+}
+
+#[test]
+fn a_module_without_a_visible_configuration_is_silent() {
+    let source = r#"
+Процедура Тест() Экспорт
+    Т = Тип("СправочникСсылка.Услуги");
+    З = ПредопределенноеЗначение("Перечисление.Цвета.Зеленый");
+    ОткрытьФорму("Справочник.Услуги.ФормаСписка");
+КонецПроцедуры
+"#;
+    let dir = tempfile::tempdir().expect("create fixture directory");
+    let path = dir.path().join("Module.bsl");
+    std::fs::write(&path, source).expect("write module");
+
+    let mut db = RootDatabaseImpl::new();
+    let file_id = FileId(0);
+    let mut files = FileSet::default();
+    files.insert(file_id, VfsPath::new(path.to_string_lossy().into_owned()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+    db.set_file_source_root(file_id, SourceRootId(0));
+    db.set_file_text(file_id, source);
+    let reported: Vec<String> =
+        ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+            .into_iter()
+            .filter(|diag| diag.code.as_str() == CODE)
+            .map(|diag| diag.message)
+            .collect();
+    assert_eq!(reported, Vec::<String>::new());
 }

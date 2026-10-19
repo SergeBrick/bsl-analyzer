@@ -562,3 +562,20 @@ fn nothing_is_judged_while_the_workspace_is_loading() {
         "while loading, the configuration reads as empty"
     );
 }
+
+#[test]
+fn a_report_spelled_with_yo_is_judged_like_one_spelled_with_ye() {
+    let source = r#"
+Процедура Тест() Экспорт
+    ОткрытьФорму("Отчёт.Продажи.Форма");
+    ОткрытьФорму("Отчет.Продажи.Форма");
+КонецПроцедуры
+"#;
+    assert_eq!(
+        reported(source),
+        vec![
+            "Объект метаданных \"Отчет.Продажи\" не найден в конфигурации",
+            "Объект метаданных \"Отчет.Продажи\" не найден в конфигурации",
+        ]
+    );
+}

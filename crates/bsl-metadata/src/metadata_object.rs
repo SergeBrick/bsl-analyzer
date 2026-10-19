@@ -97,7 +97,7 @@ impl FromStr for MdoType {
             "внешнийотчет" | "внешнийотчёт" | "externalreport" => {
                 Ok(Self::ExternalReport)
             }
-            "отчет" | "report" => Ok(Self::Report),
+            "отчет" | "отчёт" | "report" => Ok(Self::Report),
             "общиймодуль" | "commonmodule" => Ok(Self::CommonModule),
             "подписканасобытие" | "eventsubscription" => {
                 Ok(Self::EventSubscription)

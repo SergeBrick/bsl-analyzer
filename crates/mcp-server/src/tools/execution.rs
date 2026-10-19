@@ -57,7 +57,10 @@ pub async fn check_syntax(
             }
         }
         if crate::tools::check_executor::has_module_syntax(code) {
-            return Ok(crate::tools::check_executor::context_required(&selected_name));
+            return Ok(crate::tools::check_executor::context_required(
+                &selected_name,
+                selected.check_executor().is_some(),
+            ));
         }
     }
     if input_kind == check_contract::InputKind::Module {
@@ -257,7 +260,13 @@ mod tests {
         let response: check_contract::CheckResponse =
             serde_json::from_value(preflight.structured_content.unwrap()).unwrap();
         assert_eq!(response.status, check_contract::Status::ContextRequired);
-        assert_eq!(response.failure.unwrap().code, "context_required");
+        let failure = response.failure.unwrap();
+        assert_eq!(failure.code, "context_required");
+        assert!(
+            !failure.message.contains("retry with input_kind=module"),
+            "a connection without an executor cannot take the module retry: {}",
+            failure.message
+        );
 
         for (code, kind) in [
             ("x = 1;", check_contract::InputKind::Snippet),

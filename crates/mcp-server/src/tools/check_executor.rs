@@ -755,13 +755,14 @@ pub(crate) fn unsupported(connection: &str) -> CallToolResult {
     caller_failure(&request, "unsupported", "No backend is configured for this check route.")
 }
 
-pub(crate) fn context_required(connection: &str) -> CallToolResult {
+pub(crate) fn context_required(connection: &str, has_executor: bool) -> CallToolResult {
     let request = empty_request(connection);
-    caller_failure(
-        &request,
-        "context_required",
-        "This source contains module declarations or directives; retry with input_kind=module and module context.",
-    )
+    let message = if has_executor {
+        "This source contains module declarations or directives; retry with input_kind=module and module context."
+    } else {
+        "This source contains module declarations or directives; module checks need a check_executor configured for this connection."
+    };
+    caller_failure(&request, "context_required", message)
 }
 
 fn empty_request(connection: &str) -> CheckRequest {

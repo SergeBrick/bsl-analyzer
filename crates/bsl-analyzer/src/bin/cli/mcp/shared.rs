@@ -265,6 +265,27 @@ fn stamp_file_metadata(hasher: &mut blake3::Hasher, path: &Path) {
     }
 }
 
+/// Worker admission semaphores shared by every session of one daemon, so that
+/// `max_concurrent` bounds a connection rather than each session attached to it.
+#[derive(Default)]
+struct ExecutorSlots(std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Semaphore>>>);
+
+impl ExecutorSlots {
+    fn profile(
+        &self,
+        connection: &str,
+        executor: super::CheckExecutorConfig,
+    ) -> Result<mcp_server::CheckExecutorProfile> {
+        // Keyed by the whole executor config: a session that brings different limits for the
+        // same connection name gets its own semaphore instead of resizing a running one.
+        let key = format!("{connection}\0{}", serde_json::to_string(&executor)?);
+        let mut profile = executor.into_profile()?;
+        let mut slots = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        profile.semaphore = slots.entry(key).or_insert(profile.semaphore).clone();
+        Ok(profile)
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct NativeContext {
     pub url: Option<String>,
@@ -331,7 +352,7 @@ impl NativeContext {
         Ok(())
     }
 
-    fn install(&self, config: &mut mcp_server::SessionConfig) -> Result<()> {
+    fn install(&self, config: &mut mcp_server::SessionConfig, slots: &ExecutorSlots) -> Result<()> {
         if let Some(url) = &self.url {
             config.set_onec_client(onec_client::Client::new(url, &self.user, &self.password));
         }
@@ -340,9 +361,11 @@ impl NativeContext {
                 .url
                 .as_ref()
                 .map(|url| onec_client::Client::new(url, &native.user, &native.password));
-            // shortcut: the worker concurrency limit is built per session, not per daemon;
-            // share one semaphore across sessions if the limit must hold daemon-wide.
-            let executor = native.check_executor.clone().map(|c| c.into_profile()).transpose()?;
+            let executor = native
+                .check_executor
+                .clone()
+                .map(|executor| slots.profile(name, executor))
+                .transpose()?;
             config.add_onec_connection(
                 name.clone(),
                 mcp_server::OnecConnection::with_optional_http(
@@ -396,6 +419,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
         None
     };
     let epoch = mcp_server::broker::process_epoch();
+    let executor_slots = Arc::new(ExecutorSlots::default());
     let owner: Arc<tokio::sync::OnceCell<mcp_server::McpServer>> =
         Arc::new(tokio::sync::OnceCell::new());
     let markers_enabled = std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some();
@@ -413,6 +437,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
         let cache = cache.clone();
         let expected = expected.clone();
         let preset = preset.clone();
+        let executor_slots = executor_slots.clone();
         let retiring = retiring.clone();
         let epoch = epoch;
         if markers_enabled {
@@ -506,7 +531,7 @@ pub(super) async fn run_daemon(inputs: ServerInputs) -> Result<()> {
                         &context.native
                     };
                     let mut settings = mcp_server::SessionConfig::default();
-                    native.install(&mut settings)?;
+                    native.install(&mut settings, &executor_slots)?;
                     for tool in context.enable_tools {
                         settings.enable_tool(tool);
                     }
@@ -732,7 +757,7 @@ mod tests {
         let bytes = serde_json::to_vec(&McpContext { native, ..McpContext::default() }).unwrap();
         let context: McpContext = serde_json::from_slice(&bytes).unwrap();
         let mut settings = mcp_server::SessionConfig::default();
-        context.native.install(&mut settings).unwrap();
+        context.native.install(&mut settings, &ExecutorSlots::default()).unwrap();
 
         let named = &context.native.named["exec"];
         assert!(named.url.is_none(), "executor-only connection keeps no HTTP URL");
@@ -741,6 +766,29 @@ mod tests {
         assert_eq!(profile.program, std::path::PathBuf::from("/test/executor"));
         assert_eq!(profile.args, ["--a", "b c"].map(std::ffi::OsString::from));
         assert!(profile.handles_snippet);
+    }
+
+    #[test]
+    fn executor_semaphore_is_shared_by_sessions_of_one_connection() {
+        let config = || -> super::super::OnecConnectionsFile {
+            serde_json::from_str(
+                r#"{"connections":{"exec":{"check_executor":{"program":"/x","max_concurrent":1,"handles_snippet":true}}}}"#,
+            )
+            .unwrap()
+        };
+        let mut native = NativeContext::default();
+        native.add_named(config()).unwrap();
+        let slots = ExecutorSlots::default();
+        let executor = || native.named["exec"].check_executor.clone().unwrap();
+
+        let first = slots.profile("exec", executor()).unwrap();
+        let second = slots.profile("exec", executor()).unwrap();
+        let other_connection = slots.profile("other", executor()).unwrap();
+
+        assert!(Arc::ptr_eq(&first.semaphore, &second.semaphore));
+        assert!(!Arc::ptr_eq(&first.semaphore, &other_connection.semaphore));
+        let _held = first.semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(second.semaphore.available_permits(), 0, "the limit holds across sessions");
     }
 
     #[test]

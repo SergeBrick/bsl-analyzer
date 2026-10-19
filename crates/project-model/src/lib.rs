@@ -2725,7 +2725,8 @@ fn resolve_extends(
 }
 
 /// `extends = target` written in `file`: an absolute path as is, a relative one
-/// against the directory of `file` (as spelled, not through a symlink).
+/// against the directory of `file` (as spelled, not through a symlink). `..` is
+/// folded, so the path compares equal to the one an editor or watcher reports.
 fn extends_target(file: &Path, target: &str) -> PathBuf {
     let target = Path::new(target);
     let joined = if target.is_absolute() {
@@ -2733,7 +2734,7 @@ fn extends_target(file: &Path, target: &str) -> PathBuf {
     } else {
         file.parent().unwrap_or(Path::new("")).join(target)
     };
-    std::path::absolute(&joined).unwrap_or(joined)
+    stdx::path_exclusion::normalize_lexically(&std::path::absolute(&joined).unwrap_or(joined))
 }
 
 /// What makes two spellings of a config file the same file for cycle detection.
@@ -2775,10 +2776,14 @@ pub fn workspace_config_extends_paths(root: &Path) -> Vec<PathBuf> {
             .ok()
             .and_then(|content| toml::from_str::<toml::Table>(&content).ok())
             .and_then(|table| table.get(EXTENDS_KEY).and_then(|v| v.as_str()).map(str::to_owned))
+            .filter(|target| !target.trim().is_empty())
         else {
             return paths;
         };
         let parent = extends_target(&current, &target);
+        if parent.is_dir() {
+            return paths;
+        }
         let identity = config_file_identity(&parent);
         if visited.contains(&identity) {
             return paths;
@@ -4605,9 +4610,7 @@ mod tests {
         assert_eq!(rules["dataflowMaxIterations"], 500, "a sibling table key survives");
         assert_eq!(config.target_platform_version.as_deref(), Some("8.3.27"));
         assert_eq!(config.source_exclude, ["c"], "an array is replaced, not appended");
-        // Spelled as `extends` spells it: `absolute` folds `..` on Windows only.
-        let expected = std::path::absolute(project.join("../shared/base.toml")).unwrap();
-        assert_eq!(config.extends_chain(), [expected]);
+        assert_eq!(config.extends_chain(), [base], "`..` is folded");
         assert_eq!(config.config_file_path(), Some(child.as_path()));
     }
 
@@ -4721,6 +4724,13 @@ mod tests {
 
         fs::write(&child, "extends = 5\n").unwrap();
         assert!(ProjectConfig::load_from_file(&child).is_err());
+
+        // Not a file to watch: the workspace directory itself.
+        for target in ["", ".", "  "] {
+            fs::write(&child, format!("extends = \"{target}\"\n")).unwrap();
+            assert!(ProjectConfig::load_from_file(&child).is_err(), "{target:?}");
+            assert_eq!(super::workspace_config_extends_paths(dir.path()), [] as [PathBuf; 0]);
+        }
     }
 
     #[test]

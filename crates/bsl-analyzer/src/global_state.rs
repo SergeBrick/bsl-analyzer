@@ -1243,11 +1243,36 @@ mod vfs_race_tests {
             .unwrap();
 
         state.set_workspace_root(project.clone()).expect("valid test workspace");
-        // Spelled as `extends` spells it: `absolute` folds `..` on Windows only.
-        let parent = std::path::absolute(project.join("../shared/base.toml")).unwrap();
+        // With `..` folded: the spelling an editor's didSave reports for the parent.
+        let parent = shared.join("base.toml");
         assert_eq!(state.config_extends_paths, std::slice::from_ref(&parent));
         assert!(state.is_config_extends_path(&parent));
         assert!(!state.is_config_extends_path(&project.join("bsl-analyzer.toml")));
+    }
+
+    /// A live reload that fails on a parent the edit just named keeps the last valid
+    /// project, yet watches that parent: creating it is what brings the project back.
+    #[test]
+    fn a_parent_named_by_a_failed_reload_is_watched() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        state.init_empty_source_root();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shared = tmp.path().join("shared");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(shared.join("base.toml"), "[diagnostics]\n").unwrap();
+        let config = project.join("bsl-analyzer.toml");
+        std::fs::write(&config, "extends = \"../shared/base.toml\"\n").unwrap();
+        state.set_workspace_root(project.clone()).expect("valid test workspace");
+
+        std::fs::write(&config, "extends = \"../shared/team.toml\"\n").unwrap();
+        assert!(!state.reload_project_config(), "the named parent does not exist yet");
+        assert!(state.project.is_some(), "the last valid project is still served");
+        assert!(state.is_config_extends_path(&shared.join("team.toml")));
+        assert!(!state.is_config_extends_path(&shared.join("base.toml")));
     }
 
     #[test]

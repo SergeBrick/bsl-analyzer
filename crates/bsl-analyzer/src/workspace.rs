@@ -130,6 +130,14 @@ impl GlobalState {
                 if self.project.is_none() {
                     self.project_rejected = true;
                 }
+                // The edit that broke a live reload may name a parent that is missing
+                // or broken: watch it, so that its repair brings the project back.
+                if self.workspace_root.as_deref() == Some(root.as_path())
+                    && project_model::workspace_config_extends_paths(&root)
+                        != self.config_extends_paths
+                {
+                    self.configure_loader();
+                }
                 return Err(e);
             }
         };
@@ -204,14 +212,14 @@ impl GlobalState {
         // A config file inside an excluded directory is not watched either — with
         // `exclude = ["."]` that is the project's own config. It is still reloaded on a
         // delivered didSave, which does not go through the loader.
-        // Parents named by `extends` may live anywhere, typically outside the
-        // workspace; they are watched by exact path, the exclusions do not apply.
+        // Parents named by `extends` are watched by exact path, typically outside the
+        // workspace; one inside an excluded directory is skipped like the config itself.
         self.config_extends_paths = project_model::workspace_config_extends_paths(root);
         let mut config_files: Vec<_> = project_model::PROJECT_INPUT_FILE_NAMES
             .iter()
             .map(|name| root.join(name))
-            .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
             .chain(self.config_extends_paths.iter().cloned())
+            .filter(|path| !self.source_exclusions.is_excluded_resolved(path))
             .map(paths::AbsPathBuf::assert_utf8)
             .collect();
         config_files.sort();

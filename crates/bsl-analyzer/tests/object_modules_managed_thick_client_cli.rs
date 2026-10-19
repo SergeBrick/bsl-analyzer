@@ -176,3 +176,25 @@ fn object_module_of_an_ordinary_configuration_is_not_judged_in_the_managed_thick
     let found = module_accessibility(dir.path());
     assert!(found.is_empty(), "{found:?}");
 }
+
+/// The ordinary thick client, when it is checked, compiles the object module as well,
+/// so an own `&НаСервере` method is missing there just as a common module the client
+/// does not see.
+#[test]
+fn object_module_of_an_ordinary_configuration_is_judged_in_a_checked_ordinary_thick_client() {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), "OrdinaryApplication");
+    write(
+        &dir.path().join("bsl-analyzer.toml"),
+        "[source]\nroot = \"src/cf\"\n\
+         [features]\nchecked_environments = [\"ТолстыйКлиентОбычноеПриложение\"]\n",
+    );
+    let found = module_accessibility(dir.path());
+    assert!(
+        found.contains(&(
+            4,
+            "Метод 'Серверная' недоступен [Толстый клиент (обычное приложение)]".into()
+        )),
+        "{found:?}"
+    );
+}

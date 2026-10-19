@@ -329,18 +329,25 @@ pub fn check_token(token: &SyntaxToken, acc: &mut Vec<Diagnostic<LocalRange>>, c
 
     let config = Config::from_context(ctx);
     let dictionaries = get_dictionaries();
-    let Some(literal) = token
-        .parent()
-        .and_then(|parent| parent.ancestors().find(|node| node.kind() == SyntaxKind::LITERAL))
-    else {
-        return;
+    let parent = token.parent();
+    let literal = parent
+        .as_ref()
+        .and_then(|parent| parent.ancestors().find(|node| node.kind() == SyntaxKind::LITERAL));
+    // A positional annotation value is a bare STRING token without a LITERAL wrapper.
+    let (text, start) = match literal {
+        Some(literal) => {
+            if literal.first_token().map(|first| first.text_range()) != Some(token.text_range()) {
+                return;
+            }
+            (literal.text().to_string(), literal.text_range().start())
+        }
+        None if parent.is_some_and(|parent| parent.kind() == SyntaxKind::ANNOTATION_PARAM) => {
+            (token.text().to_owned(), token.text_range().start())
+        }
+        None => return,
     };
-    if literal.first_token().map(|first| first.text_range()) != Some(token.text_range()) {
-        return;
-    }
 
-    let text = literal.text().to_string();
-    check_text(&text, literal.text_range().start(), acc, ctx, &config, &dictionaries);
+    check_text(&text, start, acc, ctx, &config, &dictionaries);
 }
 
 fn find_first_ident_token(node: &SyntaxNode) -> Option<SyntaxToken> {
@@ -595,6 +602,15 @@ mod tests {
             Возможная опечатка в "Цеены"
             Возможная опечатка в "гатово""#]],
         );
+    }
+
+    #[test]
+    fn positional_annotation_string_is_checked_once() {
+        let code = "&Перед(\"гатово\")\nПроцедура Тест()\nКонецПроцедуры";
+        let diagnostics = raw_typo_diagnostics(code, config_with_typo_enabled());
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(source_slice(code, &diagnostics[0]), "гатово");
     }
 
     #[test]

@@ -194,3 +194,27 @@ fn a_broken_construct_still_reports_its_error() {
         assert_eq!(parsed.syntax_node().text().to_string(), source);
     }
 }
+
+#[test]
+fn a_group_that_leaves_a_bracket_open_is_read_as_one_variant() {
+    for body in [
+        "\t#Если Сервер Тогда\n\tРезультат = Новый Структура(\n\t#Иначе\n\tРезультат = Новый Структура(\n\t#КонецЕсли\n\t\t\"Ключ\", 1);",
+        "\t#Если Сервер Тогда\n\tРезультат = К[\n\t#Иначе\n\tРезультат = М[\n\t#КонецЕсли\n\t\t0];",
+    ] {
+        let source = in_function(body);
+        let root = assert_clean(&source);
+        assert_methods(&root, &["Первая", "Вторая"]);
+        assert!(!parts(&root).is_empty(), "a torn group must be read as one variant:\n{source}");
+        assert!(root.descendants().all(|node| node.kind() != SyntaxKind::PRE_IF_DIR));
+    }
+}
+
+#[test]
+fn a_group_whose_brackets_pair_inside_each_branch_stays_a_container() {
+    let source = in_function(
+        "\t#Если Сервер Тогда\n\tРезультат = Новый Структура(\n\t\t\"Ключ\", 1);\n\t#Иначе\n\tРезультат = Новый Структура(\n\t\t\"Другой\", 2);\n\t#КонецЕсли",
+    );
+    let root = assert_clean(&source);
+    assert!(parts(&root).is_empty());
+    assert!(root.descendants().any(|node| node.kind() == SyntaxKind::PRE_IF_DIR));
+}

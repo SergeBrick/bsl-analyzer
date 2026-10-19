@@ -219,6 +219,9 @@ enum Block {
 /// A nested group counts as the parser will read it: a balanced one as
 /// nothing, since each of its branches is whole; a torn one as its branch.
 ///
+/// A bracket left open or closed without its pair tears an expression, as a
+/// block word does a statement.
+///
 /// An annotation counts as opening the declaration it belongs to: a range
 /// that ends between the two gives one declaration a header per branch.
 fn walk(
@@ -230,6 +233,7 @@ fn walk(
 ) -> bool {
     let mut whole = true;
     let mut annotated = false;
+    let mut brackets: i32 = 0;
     let mut at = range.0;
     while at < range.1 {
         let Some(k) = kind(at) else { break };
@@ -243,6 +247,14 @@ fn walk(
                 at = group.close + 1;
                 continue;
             }
+        }
+        match k {
+            T![LParen] | T![LBracket] => brackets += 1,
+            T![RParen] | T![RBracket] => {
+                brackets -= 1;
+                whole &= brackets >= 0;
+            }
+            _ => {}
         }
         if k == T![PreDelete] {
             while at < range.1 && kind(at) != Some(T![PreEndDelete]) {
@@ -309,5 +321,5 @@ fn walk(
         }
         at += 1;
     }
-    whole && !annotated
+    whole && !annotated && brackets == 0
 }

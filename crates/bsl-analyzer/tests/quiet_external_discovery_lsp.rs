@@ -13,7 +13,9 @@ fn initial_lsp_load_reports_invalid_discovery_once_across_internal_requests() {
     std::fs::write(&module, text).unwrap();
     std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \"src\"\n").unwrap();
 
-    let mut lsp = Lsp::start(root.path());
+    // The stdio server loads the project in this process, so its discovery warning reaches
+    // this stderr; a shared backend would log it to its own journal instead.
+    let mut lsp = Lsp::start_stdio(root.path());
     lsp.open(&module, text);
     let uri = lsp_types::Url::from_file_path(&module).unwrap();
     for id in 2..5 {

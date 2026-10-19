@@ -495,6 +495,7 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
         assert!(run_mode_of(Some("Auto"), ""));
         assert!(!run_mode_of(Some("OrdinaryApplication"), ""));
         assert!(!run_mode_of(None, ""), "no main configuration");
+        assert!(!run_mode_of(Some("Foo"), ""), "an unknown mode");
         assert!(
             run_mode_of(Some("ManagedApplication"), "[diagnostics]\nordinaryAppSupport = true\n"),
             "the setting does not change the run mode"

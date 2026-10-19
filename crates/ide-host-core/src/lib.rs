@@ -48,7 +48,7 @@ pub fn apply_ordinary_forms_setting(
 /// [`apply_ordinary_forms_setting`].
 pub fn apply_default_run_mode(db: &mut RootDatabaseImpl, project: Option<&project_model::Project>) {
     let mode = project.and_then(project_model::Project::default_run_mode);
-    let value = mode.as_deref().is_some_and(|mode| mode != "OrdinaryApplication");
+    let value = matches!(mode.as_deref(), Some("ManagedApplication" | "Auto"));
     let mut options = db.env_options();
     if options.managed_run_mode != value {
         tracing::info!(managed_run_mode = value, default_run_mode = ?mode, "updated run mode");

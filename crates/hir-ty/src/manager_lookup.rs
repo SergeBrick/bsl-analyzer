@@ -120,8 +120,9 @@ pub(crate) fn lookup_predefined(
 /// variables. A miss there is the platform's «Возможно ошибочное свойство».
 ///
 /// An object whose predefined items were not read (no `Ext/Predefined.xml`, or one
-/// that failed to parse) leaves the set unknown, as does an object adopted by an
-/// extension whose base is not visible: the base may hold the missing item.
+/// that failed to parse, in the base or in any extension layer) leaves the set
+/// unknown, as does an object adopted by an extension whose base is not visible:
+/// the base may hold the missing item.
 pub(crate) fn manager_members_closed(
     db: &dyn TypeKernelDb,
     resolver: &dyn ObjectResolver,
@@ -142,7 +143,7 @@ pub(crate) fn manager_members_closed(
     }
     match kind {
         MdoType::Enum => true,
-        _ => !mdo.predefined_items.is_empty(),
+        _ => !mdo.predefined_unread && !mdo.predefined_items.is_empty(),
     }
 }
 
@@ -489,6 +490,43 @@ mod tests {
         let db = InMemoryDb::new();
 
         assert!(!closed(&db, &configs, MdoType::Enum, "Состояния"));
+    }
+
+    #[test]
+    fn extension_items_do_not_close_an_unread_base_set() {
+        use bsl_metadata::ObjectBelonging;
+
+        let base_uuid = uuid::Uuid::new_v4();
+        let mut main = Configuration::new("Main");
+        let mut base = catalog("Валюты", vec![]);
+        base.set_uuid(base_uuid);
+        main.add_metadata_object(base);
+
+        let mut ext = Configuration::new("Ext");
+        let mut adopted = catalog("Валюты", vec!["Евро"]);
+        adopted.set_object_belonging(ObjectBelonging::Adopted);
+        adopted.set_extends_uuid(base_uuid);
+        ext.add_metadata_object(adopted);
+
+        let configs = vec![
+            VisibleConfig { name: None, configuration: Arc::new(main) },
+            VisibleConfig { name: Some("Ext".into()), configuration: Arc::new(ext) },
+        ];
+        let db = InMemoryDb::new();
+
+        assert!(!closed(&db, &configs, MdoType::Catalog, "Валюты"));
+    }
+
+    #[test]
+    fn an_unreadable_predefined_layer_keeps_the_set_open() {
+        let mut config = Configuration::new("Test");
+        let mut broken = catalog("Валюты", vec!["Доллар"]);
+        broken.predefined_unread = true;
+        config.add_metadata_object(broken);
+        let configs = wrap(config);
+        let db = InMemoryDb::new();
+
+        assert!(!closed(&db, &configs, MdoType::Catalog, "Валюты"));
     }
 
     #[test]

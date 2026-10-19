@@ -461,6 +461,10 @@ pub struct MetadataObject {
     pub enum_values: Vec<EnumValue>,
     #[serde(default)]
     pub predefined_items: Vec<PredefinedItem>,
+    /// Some layer of this object (the base or an extension) did not yield a readable
+    /// predefined set, so `predefined_items` may miss items that exist.
+    #[serde(default)]
+    pub predefined_unread: bool,
     #[serde(default)]
     pub check_unique: bool,
     #[serde(default)]
@@ -837,6 +841,7 @@ impl MetadataObject {
             children: Vec::new(),
             enum_values: Vec::new(),
             predefined_items: Vec::new(),
+            predefined_unread: false,
             check_unique: false,
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
@@ -865,6 +870,7 @@ impl MetadataObject {
             children: Vec::new(),
             enum_values: Vec::new(),
             predefined_items: Vec::new(),
+            predefined_unread: false,
             check_unique: false,
             code_series: crate::enums::CodeSeries::default(),
             constant_type: None,
@@ -937,6 +943,10 @@ impl MetadataObject {
             self.enum_values.push(enum_value.clone());
         }
 
+        // An empty base set is «not read», so items an extension adds on top of it
+        // do not make the merged set complete.
+        self.predefined_unread |= overlay.predefined_unread
+            || (self.predefined_items.is_empty() && !overlay.predefined_items.is_empty());
         for predefined_item in &overlay.predefined_items {
             self.predefined_items.retain(|existing| {
                 !stdx::case::eq_ignore_case(&existing.name, &predefined_item.name)

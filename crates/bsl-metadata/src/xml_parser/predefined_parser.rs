@@ -1,11 +1,13 @@
 use crate::metadata_object::PredefinedItem;
 
-pub fn parse_predefined_xml(xml: &str) -> Vec<PredefinedItem> {
+/// `None` when the text is not well-formed XML, so a broken file is told apart from
+/// a readable one that lists no items.
+pub fn parse_predefined_xml(xml: &str) -> Option<Vec<PredefinedItem>> {
     let doc = match roxmltree::Document::parse(xml) {
         Ok(doc) => doc,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to parse Predefined.xml");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -15,7 +17,7 @@ pub fn parse_predefined_xml(xml: &str) -> Vec<PredefinedItem> {
     collect_items(&root, &mut items);
 
     tracing::debug!(count = items.len(), "Parsed predefined items");
-    items
+    Some(items)
 }
 
 fn collect_items(node: &roxmltree::Node<'_, '_>, items: &mut Vec<PredefinedItem>) {
@@ -70,7 +72,7 @@ mod tests {
     </Item>
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml);
+        let items = parse_predefined_xml(xml).unwrap();
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].name, "EmailПартнера");
@@ -115,7 +117,7 @@ mod tests {
     </Item>
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml);
+        let items = parse_predefined_xml(xml).unwrap();
 
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].name, "РодительскийЭлемент");
@@ -137,14 +139,13 @@ mod tests {
                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml);
+        let items = parse_predefined_xml(xml).unwrap();
         assert!(items.is_empty());
     }
 
     #[test]
     fn test_parse_predefined_xml_invalid() {
-        let items = parse_predefined_xml("not valid xml <><");
-        assert!(items.is_empty());
+        assert!(parse_predefined_xml("not valid xml <><").is_none());
     }
 
     #[test]
@@ -164,7 +165,7 @@ mod tests {
     </Item>
 </PredefinedData>"#;
 
-        let items = parse_predefined_xml(xml);
+        let items = parse_predefined_xml(xml).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "НормальныйЭлемент");
     }

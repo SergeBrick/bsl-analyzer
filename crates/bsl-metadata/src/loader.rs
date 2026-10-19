@@ -633,17 +633,14 @@ where
                 let main_xml = fs::read_to_string(&xml_path).ok()?;
                 // A sidecar that exists but cannot be read as text goes on as empty text:
                 // it does not parse, so the items are recorded as unreadable, not absent.
-                let predefined_xml = probe_ext_child(
-                    scope,
-                    &path,
-                    bsl_conventions::ConventionalName::PredefinedXml,
-                )
-                .map(|p| {
-                    fs::read_to_string(&p).unwrap_or_else(|error| {
+                let predefined_xml =
+                    probe_ext_child(scope, &path, bsl_conventions::ConventionalName::PredefinedXml)
+                        .map(|p| {
+                            fs::read_to_string(&p).unwrap_or_else(|error| {
                         tracing::warn!(%error, path = %p.display(), "cannot read Predefined.xml");
                         String::new()
                     })
-                });
+                        });
 
                 build_metadata_object(&main_xml, predefined_xml.as_deref(), &parser)
             } else if bsl_conventions::has_extension(&path, bsl_conventions::XML_EXTENSION) {

@@ -75,7 +75,7 @@ pub(crate) fn missing_metadata(
             let [prefix, name] = segments[..] else {
                 return None;
             };
-            let kind = crate::lower::metadata_kind_from_prefix(prefix)?;
+            let kind = crate::lower::metadata_kind_from_prefix(&kind_spelling(prefix))?;
             let mdo = crate::field_enum::mdo_type_for_kind(kind)
                 .or_else(|| crate::field_enum::register_parent_for_kind(kind))
                 .filter(|mdo| is_configuration_kind(*mdo))?;
@@ -98,12 +98,19 @@ pub(crate) fn missing_metadata(
     }
 }
 
+/// A kind name with «ё» read as «е» (`Отчёт`, `РегистрРасчёта`, `ПланСчётов`), the
+/// way the platform takes it; the kind tables list the «е» spelling.
+fn kind_spelling(kind: &str) -> String {
+    kind.replace(['ё', 'Ё'], "е")
+}
+
 /// `<Вид>.<Имя>…` of a kind the configuration holds by name.
 fn configuration_object<'a>(segments: &[&'a str]) -> Option<(MdoType, &'a str)> {
     let [kind, name, ..] = segments[..] else {
         return None;
     };
-    let mdo = MdoType::from_str(kind).ok().filter(|mdo| is_configuration_kind(*mdo))?;
+    let mdo =
+        MdoType::from_str(&kind_spelling(kind)).ok().filter(|mdo| is_configuration_kind(*mdo))?;
     Some((mdo, name))
 }
 

@@ -727,6 +727,25 @@ fn test_preprocessor_if_unclosed_in_method_leaves_the_outer_region_unclosed() {
 }
 
 #[test]
+fn test_preprocessor_if_crossed_by_a_loop_closer_survives_a_method_nested_in_it() {
+    // The block's `#Иначе`/`#ИначеЕсли` is still ahead after the method, so the
+    // method must hand the block back: the diagnostics are the ones the text
+    // gives without the method.
+    for tail in ["#Иначе\n", "#ИначеЕсли С Тогда\n#Иначе\n"] {
+        for (head, end) in [("Процедура Б()", "КонецПроцедуры"), ("Функция Б()", "КонецФункции")]
+        {
+            let method = format!("{head}\n{end}\n");
+            let plain = format!("Пока Х Цикл\n#Если К Тогда\nКонецЦикла;\nКонецЦикла;\n{tail}");
+            let nested =
+                format!("Пока Х Цикл\n#Если К Тогда\nКонецЦикла;\n{method}КонецЦикла;\n{tail}");
+            let (plain_errors, nested_errors) =
+                (parse(&plain).errors().len(), parse(&nested).errors().len());
+            assert_eq!(nested_errors, plain_errors, "{nested}");
+        }
+    }
+}
+
+#[test]
 fn test_preprocessor_if_crossed_survives_a_method_nested_in_it() {
     // A method inside another's body is an error of its own, but it must not
     // take the crossed block of the statement around it: that block's

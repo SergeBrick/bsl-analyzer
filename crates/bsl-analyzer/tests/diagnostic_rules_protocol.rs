@@ -35,7 +35,10 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
         rules::expected(&source, false, true)
     );
 
-    let log_file = dir.path().join("lsp.log");
+    // Outside the project root: the server watches that root recursively, so a log
+    // inside it makes every log line a file change that reloads the project and logs again.
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_file = log_dir.path().join("lsp.log");
     let mut lsp = Lsp::start_with_capabilities_and_log(
         dir.path(),
         json!({"general":{"positionEncodings":["utf-16"]}}),
@@ -85,15 +88,22 @@ fn cli_lsp_ranges_and_load_time_warnings_survive_real_config_reload() {
     let config_uri = lsp_types::Url::from_file_path(dir.path().join("bsl-analyzer.toml")).unwrap();
     lsp.send(json!({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":config_uri,"type":2}]}}));
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if pull(&mut lsp, deadline) == rules::expected(&source, true, false) {
-            break;
+    // The reloaded diagnostics and the reload's load-time warning are published
+    // independently, so wait for both instead of assuming an order.
+    let reloaded = loop {
+        let diagnostics_reloaded =
+            pull(&mut lsp, deadline) == rules::expected(&source, true, false);
+        let warnings = rules::warning_count(&std::fs::read_to_string(&log_file).unwrap());
+        if diagnostics_reloaded && warnings > initial {
+            break warnings;
         }
-        assert!(Instant::now() < deadline, "changed Typo config never reached diagnostics");
+        assert!(
+            Instant::now() < deadline,
+            "changed Typo config never reached diagnostics and the log \
+             (diagnostics: {diagnostics_reloaded}, warnings: {warnings} > {initial})"
+        );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let reloaded = rules::warning_count(&std::fs::read_to_string(&log_file).unwrap());
-    assert!(reloaded > initial);
+    };
     for _ in 0..2 {
         assert_eq!(
             pull(&mut lsp, Instant::now() + Duration::from_secs(60)),

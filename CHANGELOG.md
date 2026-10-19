@@ -56,7 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
   `ТолстыйКлиентОбычноеПриложение` в `[features].checked_environments`, — правила
   диагностик и модель сред больше не расходятся. Действует в LSP, `analyze`,
   `check-config` (показывает источник значения) и в настройках диагностик
-  MCP-сервера; в LSP правка `Configuration.xml` подхватывается без перезапуска.
+  MCP-сервера; правка `Configuration.xml` подхватывается без перезапуска (в MCP —
+  настройками диагностик).
 
 ### Fixed
 

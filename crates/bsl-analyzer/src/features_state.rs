@@ -102,7 +102,7 @@ pub fn apply_compatibility_mode_to_db(
 }
 
 /// The execution model's ordinary-application switch from the same effective value
-/// the diagnostics use ([`project_model::Project::ordinary_app_support`]: the
+/// the diagnostics rules get ([`ide_host_core::effective_ordinary_app_support`]: the
 /// `[diagnostics] ordinaryAppSupport` setting, else `<DefaultRunMode>` of the main
 /// configuration). Naming the legacy thick client in `checked_environments` still
 /// turns it on regardless: an environment that is checked must be modelled.
@@ -122,13 +122,13 @@ pub fn apply_ordinary_app_support_to_db(
         .iter()
         .filter_map(|name| EnvFlags::from_config_name(name))
         .any(|flag| flag.contains(EnvFlags::THICK_CLIENT_ORDINARY));
-    let resolved = project.and_then(|project| project.ordinary_app_support());
-    let value = checked_by_name || resolved.is_some_and(|(value, _)| value);
+    let value =
+        checked_by_name || project.is_some_and(ide_host_core::effective_ordinary_app_support);
     let mut options = db.env_options();
     if options.ordinary_app_support != value {
         tracing::info!(
             ordinary_app_support = value,
-            source = ?resolved.map(|(_, source)| source),
+            source = ?project.and_then(|project| project.ordinary_app_support()).map(|(_, source)| source),
             "updated ordinary-application support"
         );
         options.ordinary_app_support = value;
@@ -453,5 +453,12 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
         );
         apply(&mut db, &project);
         assert!(db.env_options().ordinary_app_support, "a checked legacy client is modelled");
+
+        // A section the diagnostics loader rejects falls back to its defaults as a
+        // whole; the execution model follows the value the rules actually get.
+        let (_invalid, project) =
+            project_with("OrdinaryApplication", "[diagnostics]\ndataflowMaxIterations = \"abc\"\n");
+        apply(&mut db, &project);
+        assert!(!db.env_options().ordinary_app_support, "a rejected section derives nothing");
     }
 }

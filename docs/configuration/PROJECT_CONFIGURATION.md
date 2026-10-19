@@ -786,8 +786,11 @@ CommentedCode = false
 (это же включает его в модель сред независимо от `ordinaryAppSupport`).
 
 Вывод одинаков в LSP, `analyze` и `check-config`; MCP-сервер берёт из него
-настройки диагностик. В LSP правка `DefaultRunMode` в `Configuration.xml`
-подхватывается без перезапуска. `check-config` показывает, откуда взято значение:
+настройки диагностик. Правка `DefaultRunMode` в `Configuration.xml` подхватывается
+без перезапуска и в LSP, и в настройках диагностик MCP-сервера. Если секция
+`[diagnostics]` не загрузилась (например, у другого ключа неверный тип), правила
+работают с умолчаниями, и значение тоже не выводится. `check-config` показывает,
+откуда взято значение:
 `ordinaryAppSupport: true (from DefaultRunMode of Configuration.xml)`.
 
 ### `[code_lens]`

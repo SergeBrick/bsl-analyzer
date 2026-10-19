@@ -1087,11 +1087,8 @@ impl GlobalState {
     /// diagnostics as well as the execution model; rebuild the diagnostics config
     /// only when it did.
     fn rederive_diagnostics_ordinary_app_support(&mut self) {
-        let derived = self
-            .project
-            .as_ref()
-            .and_then(project_model::Project::ordinary_app_support)
-            .is_some_and(|(value, _)| value);
+        let derived =
+            self.project.as_ref().is_some_and(ide_host_core::effective_ordinary_app_support);
         if derived != self.diagnostics_config.ordinary_app_support {
             tracing::info!(
                 ordinary_app_support = derived,

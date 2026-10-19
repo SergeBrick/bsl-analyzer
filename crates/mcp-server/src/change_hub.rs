@@ -49,6 +49,7 @@ const STOP_BUDGET: Duration = Duration::from_secs(5);
 
 /// How often a stop re-checks the two things it waits on (channel space, thread exit).
 const STOP_POLL: Duration = Duration::from_millis(10);
+static NEXT_INGRESS_HUB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The next topology epoch: a monotonic label for the age of one composition of scan roots.
 ///
@@ -1731,8 +1732,11 @@ fn collect_subtree_noting(
     // already full of files must not be read inside an exclusion, under any spelling.
     let mut pruned = project_model::ResolvedDirs::default();
     let walk = WalkDir::new(dir).follow_links(true).into_iter().filter_entry(|entry| {
-        !(entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink())
-            || !user_excluded.prunes_walked_dir(entry.path(), entry.path_is_symlink(), &mut pruned)
+        if entry.file_type().is_dir() || entry.depth() == 0 || entry.path_is_symlink() {
+            !user_excluded.prunes_walked_dir(entry.path(), entry.path_is_symlink(), &mut pruned)
+        } else {
+            !user_excluded.excludes_walked_file(entry.path(), &mut pruned)
+        }
     });
     for entry in walk {
         let entry = match entry {
@@ -1959,6 +1963,28 @@ impl WorkspaceChangeHub {
         &self.thread.control
     }
 
+    /// Queue one editor-provided path hint through the same bounded ingress as watcher
+    /// events. The synthetic event kind is intentionally generic: `ingest_event` re-stats
+    /// the path and derives changed/removed from current filesystem state.
+    pub(crate) fn notify_path_changed(&self, path: &Path) -> bool {
+        if !self.inner.scope().may_record(path) {
+            return false;
+        }
+        let event = Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(path.to_path_buf());
+        match self.control().try_send(HubMsg::Event(Ok(event))) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // The bounded queue dropped detail. Preserve the same loss-debt invariant as
+                // the filesystem callback so every live cursor reconciles instead of silently
+                // missing this hint.
+                self.inner.channel_overflow.store(true, Ordering::Relaxed);
+                true
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
     /// Spawn the hub over one or more roots (the drift-scan universe: the config source
     /// root plus each extension root). Returns immediately — each root is watched
     /// recursively on the hub thread (walking large trees must not block daemon startup).
@@ -2000,8 +2026,8 @@ impl WorkspaceChangeHub {
         user_excluded: ExcludedPaths,
     ) -> Self {
         #[cfg(test)]
-        if let Some(poll) = POLL_INSTEAD_OF_WATCHING.with(std::cell::Cell::get) {
-            return Self::start_seamed_scoped(
+        let hub = if let Some(poll) = POLL_INSTEAD_OF_WATCHING.with(std::cell::Cell::get) {
+            Self::start_seamed_scoped(
                 targets,
                 DEFAULT_CAPACITY,
                 COVERAGE_TICK_PERIOD,
@@ -2012,9 +2038,24 @@ impl WorkspaceChangeHub {
                 user_excluded,
                 poll,
                 BlindPollSeam::default(),
-            );
-        }
-        Self::start_seamed_scoped(
+            )
+        } else {
+            Self::start_seamed_scoped(
+                targets,
+                DEFAULT_CAPACITY,
+                COVERAGE_TICK_PERIOD,
+                false,
+                None,
+                None,
+                excluded,
+                user_excluded,
+                PollConfig::PRODUCTION,
+                #[cfg(test)]
+                BlindPollSeam::default(),
+            )
+        };
+        #[cfg(not(test))]
+        let hub = Self::start_seamed_scoped(
             targets,
             DEFAULT_CAPACITY,
             COVERAGE_TICK_PERIOD,
@@ -2026,7 +2067,20 @@ impl WorkspaceChangeHub {
             PollConfig::PRODUCTION,
             #[cfg(test)]
             BlindPollSeam::default(),
-        )
+        );
+        if std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some() {
+            let hub_id = NEXT_INGRESS_HUB_ID.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                target: "bsl_analyzer::shared_backend",
+                event = "workspace_ingress_created",
+                owner_epoch = crate::broker::process_epoch(),
+                hub_id,
+                hub_count = hub_id,
+                health = ?hub.health(),
+                "shared workspace ingress hub created"
+            );
+        }
+        hub
     }
 
     /// A hub whose thread the operating system refused to start.
@@ -10018,6 +10072,44 @@ mod tests {
         assert_eq!(hub.materialize(cursor).entries.len(), 1, "a source edit was dropped");
     }
 
+    #[test]
+    fn editor_path_hints_use_bounded_ingress_and_current_disk_classification() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("Saved.bsl");
+        let outside = tempdir().unwrap().path().join("Outside.bsl");
+        std::fs::write(&file, "Функция Сохраненная() КонецФункции").unwrap();
+        let hub = WorkspaceChangeHub::start_targets(vec![WatchTarget::recursive(
+            dir.path().to_path_buf(),
+        )]);
+        assert!(hub.wait_until_watching());
+        let cursor = hub.subscribe();
+
+        assert!(hub.notify_path_changed(&file));
+        assert!(eventually(|| {
+            hub.materialize(cursor).entries.iter().any(|entry| entry.raw == file)
+        }));
+        let batch = hub.drain(cursor);
+        assert!(batch
+            .entries
+            .iter()
+            .any(|entry| { entry.raw == file && entry.kind == ChangeKind::MaybeChanged }));
+
+        // The caller only supplies a path. The generic ingress re-stats it after deletion
+        // and derives the tombstone from the current filesystem state.
+        std::fs::remove_file(&file).unwrap();
+        assert!(hub.notify_path_changed(&file));
+        assert!(eventually(|| {
+            hub.materialize(cursor).entries.iter().any(|entry| entry.raw == file)
+        }));
+        let batch = hub.drain(cursor);
+        assert!(batch
+            .entries
+            .iter()
+            .any(|entry| { entry.raw == file && entry.kind == ChangeKind::MaybeRemoved }));
+
+        assert!(!hub.notify_path_changed(&outside), "external paths are rejected by hub scope");
+    }
+
     /// An event names the root by whichever spelling the watch was armed with, and that
     /// is the pre-canonical one. A filter built on the canonical spelling alone matches
     /// nothing on Windows (`\\?\C:\...` against `C:\...`) while staying green anywhere
@@ -10097,6 +10189,39 @@ mod tests {
             records.iter().all(|(_, path, _)| !path.starts_with(&blocked)),
             "an excluded runtime descendant was collected: {records:?}"
         );
+    }
+
+    /// A file that an exclusion pattern names is left out of the runtime walk just as a
+    /// directory it names is, so drift is never reported for a file the scan does not serve.
+    /// The same walk without the pattern collects the file, which is what tells the two apart.
+    #[test]
+    fn a_runtime_subtree_leaves_out_files_matched_by_an_exclusion_pattern() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("runtime");
+        for relative in ["Allowed.bsl", "temp/Hidden.bsl", "Ext/Template.Queries.bsl"] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let collected = |excluded: &ExcludedPaths| {
+            let mut records = Vec::new();
+            collect_subtree_within(&root, &mut records, excluded);
+            let mut files: Vec<PathBuf> = records
+                .into_iter()
+                .map(|(_, path, _)| path.strip_prefix(&root).unwrap().to_path_buf())
+                .collect();
+            files.sort();
+            files
+        };
+
+        assert_eq!(
+            collected(&ExcludedPaths::default()),
+            ["Allowed.bsl", "Ext/Template.Queries.bsl", "temp/Hidden.bsl"].map(PathBuf::from),
+            "positive control: without a pattern every file is collected"
+        );
+        let patterns =
+            ExcludedPaths::default().with_patterns(&root, ["temp", "**/*.Queries.bsl"]).unwrap();
+        assert_eq!(collected(&patterns), [PathBuf::from("Allowed.bsl")]);
     }
 
     /// The default cache is lazy: it does not exist when the hub starts. The exclusion

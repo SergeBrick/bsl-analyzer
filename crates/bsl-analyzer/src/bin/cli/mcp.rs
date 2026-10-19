@@ -13,6 +13,7 @@ use process_record::ProcessRecordGuard;
 use serde::Deserialize;
 
 mod process_record;
+pub(crate) mod shared;
 
 #[derive(Debug, Deserialize)]
 struct OnecConnectionsFile {
@@ -60,7 +61,9 @@ pub struct McpServeArgs {
     #[arg(long = "cache-dir")]
     cache_dir: Option<PathBuf>,
 
-    /// Connection mode. `stdio` (default) serves one client directly. `broker`
+    /// Connection mode. Without this flag, the workspace profile defaults to `broker`
+    /// unless `BSL_MCP_BROKER=0`; the reference profile defaults to direct `stdio`.
+    /// Explicit `stdio` serves one client directly. `broker`
     /// connects to a shared per-project backend (launching it if absent) and relays
     /// — so many clients/reviews reuse one heavy process. The backend stays warm across
     /// client disconnects and reconnects, then idles out on its own once no client has
@@ -72,8 +75,8 @@ pub struct McpServeArgs {
     /// already-running daemon named by `--backend-pid`, whose value the supervisor knows
     /// because it started that daemon: it never launches or falls back to direct stdio, and
     /// it serves the 1C connection the daemon was started with.
-    #[arg(long = "mode", value_enum, default_value = "stdio")]
-    mode: McpServeMode,
+    #[arg(long = "mode", value_enum)]
+    mode: Option<McpServeMode>,
 
     /// PID of the daemon explicitly launched by a supervisor. Required only for
     /// `--mode broker-required`; the connected socket peer must match it.
@@ -167,7 +170,7 @@ impl McpCommand {
         const ROTATE_BYTES: u64 = 50 * 1024 * 1024;
 
         let McpCommand::Serve(args) = self else { return None };
-        if !matches!(args.mode, McpServeMode::Daemon) {
+        if !matches!(args.mode, Some(McpServeMode::Daemon)) {
             return None;
         }
         // Logging is prepared before the arguments are validated, and preparing an explicit
@@ -600,7 +603,8 @@ fn validate_serve_args(args: &McpServeArgs) -> Result<Option<HttpServeOptions>, 
 
     // Ahead of the per-mode blocks below: a flag belonging to one mode has to be rejected in
     // every other mode, http included, and a check living inside one mode's block cannot do it.
-    validate_backend_pid(args.mode, args.backend_pid, mcp_server::broker::peer_pid_available())?;
+    let mode = resolve_serve_mode(args.mode, profile_of(args.runtime_profile))?;
+    validate_backend_pid(mode, args.backend_pid, mcp_server::broker::peer_pid_available())?;
     // Validated against the credential the process will actually use — resolved from either of
     // its two ways in and decoded, exactly as the serving path does. A check reading the raw
     // flag alone would both miss a password arriving through the environment and refuse an
@@ -609,14 +613,9 @@ fn validate_serve_args(args: &McpServeArgs) -> Result<Option<HttpServeOptions>, 
         &args.onec_password,
         env::var("BSL_ONEC_PASSWORD").ok(),
     ));
-    validate_onec_settings(
-        args.mode,
-        args.onec_url.as_deref(),
-        &args.onec_user,
-        &effective_password,
-    )?;
+    validate_onec_settings(mode, args.onec_url.as_deref(), &args.onec_user, &effective_password)?;
 
-    if !matches!(args.mode, McpServeMode::Http) {
+    if !matches!(mode, McpServeMode::Http) {
         if args.host.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -712,7 +711,7 @@ fn resolve_workspace_inputs(
 ///   squatting). The backend stays warm across client reconnects and idles out on its own.
 ///   `BSL_MCP_BROKER=0` forces plain stdio anywhere.
 fn resolve_serve_mode(
-    flag: McpServeMode,
+    flag: Option<McpServeMode>,
     profile: mcp_server::McpProfile,
 ) -> Result<McpServeMode, io::Error> {
     let context =
@@ -730,11 +729,11 @@ struct ServeModeContext {
 }
 
 fn resolve_serve_mode_with_override(
-    flag: McpServeMode,
+    flag: Option<McpServeMode>,
     profile: mcp_server::McpProfile,
     context: ServeModeContext,
 ) -> McpServeMode {
-    if !matches!(flag, McpServeMode::Stdio) {
+    if let Some(flag) = flag {
         return flag;
     }
     if !matches!(profile, mcp_server::McpProfile::Workspace) {
@@ -790,21 +789,11 @@ fn daemon_command(
     // The daemon must resolve the same project this proxy keyed on, and its own
     // config file cannot tell it about a source set that came from argv.
     cmd.args(args.source_set.to_args());
-    // Every requested name, not just the effective ones: the daemon projects them through
-    // the same declaration and so arrives at the identity the proxy keyed on. Dropping one
-    // here would leave the proxy's key promising a surface the daemon does not serve.
-    for tool in &args.enable_tools {
-        cmd.arg("--enable-tool").arg(tool);
-    }
-    if let Some(url) = &args.onec_url {
-        cmd.arg("--onec-url").arg(url);
-    }
-    if !args.onec_user.is_empty() {
-        cmd.arg("--onec-user").arg(&args.onec_user);
-    }
-    if !args.onec_password.is_empty() {
-        cmd.env("BSL_ONEC_PASSWORD", &args.onec_password);
-    }
+    // The detached owner has no caller's native preset or tool gate. Those are
+    // attached privately to each session after peer validation.
+    cmd.env(shared::AUTO_DAEMON_ENV, "1");
+    cmd.env_remove("BSL_ONEC_PASSWORD");
+    cmd.env_remove("BSL_ONEC_CONNECTIONS_FILE");
     cmd.env(mcp_server::broker::TOPOLOGY_FP_ENV, topology_fp.to_string());
     cmd.env(mcp_server::broker::EMBEDDING_QUERY_PREFIX_ENV, &embedding_prefixes.query);
     cmd.env(mcp_server::broker::EMBEDDING_DOCUMENT_PREFIX_ENV, &embedding_prefixes.document);
@@ -932,151 +921,117 @@ fn run_mcp_broker(
     workspace_cache: Option<mcp_server::WorkspaceCacheLayout>,
     onec_password: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let source_dir = require_workspace_broker(profile, source_dir)?;
-    let workspace_cache = workspace_cache.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "workspace broker requires a cache layout")
-    })?;
-
-    let topology_fp = mcp_server::broker::workspace_topology_fingerprint(&source_dir);
-    let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
-    let key = mcp_server::broker::BackendKey::new(
-        &source_dir,
-        workspace_cache.root(),
-        profile,
-        backend_config_fingerprint(&embedding_prefixes, &source_dir),
-        topology_fp,
-        mcp_server::contract::effective_opt_in(profile, &args.enable_tools),
-    );
-
-    // Credentials travel via env rather than argv, while source/cache and the frozen
-    // topology are propagated exactly so proxy and daemon derive one backend key.
-    let cmd = daemon_command(
+    let source = require_workspace_broker(profile, source_dir)?;
+    let cache =
+        workspace_cache.ok_or_else(|| io::Error::other("workspace broker requires cache"))?;
+    shared::prepare_platform_identity(&source)?;
+    let identity = shared::identity(&source, &cache)?;
+    let prefixes = resolve_embedding_prefixes(Some(&source))?;
+    let command = daemon_command(
         &env::current_exe()?,
-        &source_dir,
-        &workspace_cache,
+        &source,
+        &cache,
         args,
-        topology_fp,
-        &embedding_prefixes,
+        mcp_server::broker::workspace_topology_fingerprint(&source),
+        &prefixes,
     );
-
-    tracing::info!(?source_dir, "Starting MCP broker proxy");
+    let context = shared::McpContext {
+        enable_tools: args.enable_tools.clone(),
+        native: shared::NativeContext::from_caller(
+            args.onec_url.clone(),
+            args.onec_user.clone(),
+            onec_password.to_owned(),
+        )?,
+        supervisor_preset: false,
+    };
+    let bytes = serde_json::to_vec(&context)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = rt.block_on(mcp_server::broker::proxy::connect_or_launch(key, cmd));
-    // A completed relay can leave Tokio's uncancellable stdin read blocking runtime drop.
-    rt.shutdown_timeout(Duration::from_secs(2));
-
-    use mcp_server::broker::proxy::ProxyOutcome;
-    match result? {
-        ProxyOutcome::Served => Ok(()),
-        // Connect-phase failure only: no client bytes were relayed yet, so fall back to
-        // serving directly over stdio (the stdio server answers the pending `initialize`
-        // cleanly). A relay-phase failure surfaced as `Err` above and is fatal — we must
-        // not re-serve on a half-consumed stdin.
-        ProxyOutcome::Unavailable(e) => {
-            tracing::warn!(error = %e, "broker backend unavailable; serving directly over stdio");
-            run_mcp_server(
+    let connected = rt.block_on(async {
+        let mut stream = mcp_server::broker::proxy::connect_or_launch_stream(
+            mcp_server::broker::SharedBackendKey::new(identity.clone()),
+            command,
+        )
+        .await?;
+        shared::attach(
+            &mut stream,
+            identity,
+            mcp_server::broker::transport::AdapterKind::Mcp,
+            &bytes,
+        )
+        .await?;
+        anyhow::Ok(stream)
+    });
+    let result = match connected {
+        Ok(stream) => rt.block_on(mcp_server::broker::proxy::relay_stream(stream)),
+        Err(error) => {
+            tracing::warn!(%error, "shared backend unavailable before session; serving stdio");
+            rt.shutdown_timeout(Duration::from_secs(2));
+            return run_mcp_server(
                 profile,
                 ServerInputs {
-                    source_dir: Some(source_dir),
-                    workspace_cache: Some(workspace_cache),
+                    source_dir: Some(source),
+                    workspace_cache: Some(cache),
                     onec_url: args.onec_url.clone(),
                     onec_user: args.onec_user.clone(),
                     onec_password: onec_password.to_owned(),
-                    // The same set the proxy validated: a client that failed to reach the
-                    // daemon must not be served a different surface than one that did.
                     enable_tools: args.enable_tools.clone(),
                 },
-            )
+            );
         }
-    }
+    };
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result?;
+    Ok(())
 }
 
-/// Required broker proxy for supervisor-owned lifecycle. It neither constructs a
-/// daemon command nor has a direct-stdio fallback.
 fn run_mcp_broker_required(
     profile: mcp_server::McpProfile,
     args: &McpServeArgs,
     source_dir: Option<PathBuf>,
     workspace_cache: Option<mcp_server::WorkspaceCacheLayout>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let source_dir = require_workspace_broker(profile, source_dir)?;
-    let workspace_cache = workspace_cache.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "required workspace broker requires a cache layout",
-        )
+    let source = require_workspace_broker(profile, source_dir)?;
+    let cache =
+        workspace_cache.ok_or_else(|| io::Error::other("required broker requires cache"))?;
+    let pid = args
+        .backend_pid
+        .ok_or_else(|| io::Error::other("required broker requires --backend-pid"))?;
+    shared::prepare_platform_identity(&source)?;
+    let identity = shared::identity(&source, &cache)?;
+    let context = serde_json::to_vec(&shared::McpContext {
+        enable_tools: args.enable_tools.clone(),
+        supervisor_preset: true,
+        ..Default::default()
     })?;
-    let expected_pid = args.backend_pid.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "--mode broker-required requires --backend-pid")
-    })?;
-    let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
-    let key = mcp_server::broker::BackendKey::new(
-        &source_dir,
-        workspace_cache.root(),
-        profile,
-        backend_config_fingerprint(&embedding_prefixes, &source_dir),
-        mcp_server::broker::workspace_topology_fingerprint(&source_dir),
-        mcp_server::contract::effective_opt_in(profile, &args.enable_tools),
-    );
-
-    tracing::info!(?source_dir, expected_pid, "Starting required MCP broker proxy");
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = rt.block_on(mcp_server::broker::proxy::connect_required(key, expected_pid));
+    let result = rt.block_on(async {
+        let mut stream = mcp_server::broker::proxy::connect_required_stream(
+            &mcp_server::broker::SharedBackendKey::new(identity.clone()),
+            pid,
+        )
+        .await?;
+        shared::attach(
+            &mut stream,
+            identity,
+            mcp_server::broker::transport::AdapterKind::Mcp,
+            &context,
+        )
+        .await?;
+        mcp_server::broker::proxy::relay_stream(stream).await
+    });
     rt.shutdown_timeout(Duration::from_secs(2));
     result?;
     Ok(())
 }
 
-/// The shared backend: build the resident state once and serve every connecting
-/// proxy from it until idle.
 fn run_mcp_daemon(
     profile: mcp_server::McpProfile,
     inputs: ServerInputs,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let source_dir = require_workspace_broker(profile, inputs.source_dir.clone())?;
-    let workspace_cache = inputs.workspace_cache.clone().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "workspace daemon requires a cache layout")
-    })?;
-
-    // Prefer the frozen identity the spawning proxy passed (see the env write in
-    // `run_mcp_broker`); a directly-launched daemon derives its own.
-    let topology_fp = env::var(mcp_server::broker::TOPOLOGY_FP_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| mcp_server::broker::workspace_topology_fingerprint(&source_dir));
-    let embedding_prefixes = resolve_embedding_prefixes(Some(&source_dir))?;
-    let key = mcp_server::broker::BackendKey::new(
-        &source_dir,
-        workspace_cache.root(),
-        profile,
-        backend_config_fingerprint(&embedding_prefixes, &source_dir),
-        topology_fp,
-        mcp_server::contract::effective_opt_in(profile, &inputs.enable_tools),
-    );
-
-    // Build only after the daemon wins the bind, so a race loser never starts a
-    // competing workspace build against the same per-project databases.
-    let build = move || {
-        build_server(
-            profile,
-            ServerInputs {
-                source_dir: Some(source_dir),
-                workspace_cache: Some(workspace_cache),
-                ..inputs
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))
-    };
-
-    tracing::info!("Starting MCP broker backend (daemon)");
+    require_workspace_broker(profile, inputs.source_dir.clone())?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = rt.block_on(mcp_server::broker::daemon::run(
-        build,
-        key,
-        broker_orphan_grace(),
-        broker_idle_ttl(),
-    ));
-    drop(rt);
+    let result = rt.block_on(shared::run_daemon(inputs));
+    rt.shutdown_timeout(Duration::from_secs(2));
     result?;
     Ok(())
 }
@@ -1435,28 +1390,6 @@ struct ServerInputs {
     enable_tools: Vec<String>,
 }
 
-/// What a backend must agree on beyond its paths: the embedding setup and the
-/// platform help source. A backend fixes its help snapshot for life, so a client
-/// configured for another source must reach a fresh backend, not the old one.
-fn backend_config_fingerprint(
-    embedding_prefixes: &mcp_server::EmbeddingPrefixes,
-    source_dir: &Path,
-) -> u64 {
-    let embedding =
-        mcp_server::broker::embedding_config_fingerprint_with_prefixes(embedding_prefixes);
-    let config = project_model::ProjectConfig::load(source_dir).ok().flatten();
-    let help = platform_help::requested_source(config.as_ref(), source_dir)
-        // `Debug` names the variant: a path and a URL with the same text are
-        // different sources.
-        .map(|request| format!("{request:?}"))
-        .unwrap_or_else(|reason| format!("invalid: {reason}"));
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&embedding.to_le_bytes());
-    hasher.update(help.as_bytes());
-    let digest = hasher.finalize();
-    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
-}
-
 fn build_server(
     profile: mcp_server::McpProfile,
     inputs: ServerInputs,
@@ -1671,7 +1604,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backend_config_fingerprint, daemon_command, decode_password, frozen_embedding_prefixes,
+        daemon_command, decode_password, frozen_embedding_prefixes,
         resolve_embedding_prefix_values, resolve_onec_password, resolve_serve_mode_with_override,
         resolve_token_profile_values, validate_backend_pid, validate_onec_settings,
         validate_serve_args, warn_on_wildcard_allowlist, HttpServeOptions, McpCommand,
@@ -1705,30 +1638,37 @@ mod tests {
     #[test]
     fn backend_key_follows_the_configured_platform_help_source() {
         let dir = tempfile::tempdir().unwrap();
-        let prefixes = mcp_server::EmbeddingPrefixes {
-            query: String::new(),
-            document: String::new(),
-            token_profile: None,
-        };
         let config =
             |body: &str| std::fs::write(dir.path().join("bsl-analyzer.toml"), body).unwrap();
 
         config("");
-        let default = backend_config_fingerprint(&prefixes, dir.path());
+        let default =
+            super::shared::identity(dir.path(), &test_cache_layout(dir.path(), None)).unwrap();
         config("[platform_help]\nsource = \"external\"\npath = \"a.json\"\n");
-        let corpus_a = backend_config_fingerprint(&prefixes, dir.path());
+        let corpus_a =
+            super::shared::identity(dir.path(), &test_cache_layout(dir.path(), None)).unwrap();
         config("[platform_help]\nsource = \"external\"\npath = \"b.json\"\n");
-        let corpus_b = backend_config_fingerprint(&prefixes, dir.path());
-        assert_ne!(default, corpus_a);
-        assert_ne!(corpus_a, corpus_b, "another help source must reach another backend");
+        let corpus_b =
+            super::shared::identity(dir.path(), &test_cache_layout(dir.path(), None)).unwrap();
+        assert!(default != corpus_a, "external help source must reach another backend");
+        assert!(corpus_a != corpus_b, "another help source must reach another backend");
         config("[platform_help]\nsource = \"external\"\npath = \"a.json\"\n");
-        assert_eq!(backend_config_fingerprint(&prefixes, dir.path()), corpus_a);
+        assert!(
+            super::shared::identity(dir.path(), &test_cache_layout(dir.path(), None)).unwrap()
+                == corpus_a,
+            "the same help source must preserve the backend identity"
+        );
 
         // A path and a URL spelled with the same text are different sources.
         config("[platform_help]\nsource = \"external\"\npath = \"/srv/help\"\n");
-        let as_path = backend_config_fingerprint(&prefixes, dir.path());
+        let as_path =
+            super::shared::identity(dir.path(), &test_cache_layout(dir.path(), None)).unwrap();
         config("[platform_help]\nsource = \"external\"\nurl = \"/srv/help\"\n");
-        assert_ne!(backend_config_fingerprint(&prefixes, dir.path()), as_path, "path is not url");
+        assert!(
+            super::shared::identity(dir.path(), &test_cache_layout(dir.path(), None)).unwrap()
+                != as_path,
+            "path is not url"
+        );
     }
     #[test]
     fn embedding_prefix_resolution_honors_project_empty_and_frozen_pair() {
@@ -1948,7 +1888,7 @@ mod tests {
         // Production passes `platform_default_broker: true` on every platform, so the
         // workspace profile with no override resolves to the broker everywhere.
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Stdio,
+            None,
             mcp_server::McpProfile::Workspace,
             ServeModeContext { broker_override: None, platform_default_broker: true },
         );
@@ -1962,7 +1902,7 @@ mod tests {
         // stays on stdio. No production platform sets this today, but the precedence
         // must remain correct if one ever does.
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Stdio,
+            None,
             mcp_server::McpProfile::Workspace,
             ServeModeContext { broker_override: None, platform_default_broker: false },
         );
@@ -1973,7 +1913,7 @@ mod tests {
     #[test]
     fn broker_env_override_off_forces_stdio_even_when_platform_defaults_to_broker() {
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Stdio,
+            None,
             mcp_server::McpProfile::Workspace,
             ServeModeContext { broker_override: Some(false), platform_default_broker: true },
         );
@@ -1984,7 +1924,7 @@ mod tests {
     #[test]
     fn broker_env_override_on_forces_broker_even_when_platform_default_is_off() {
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Stdio,
+            None,
             mcp_server::McpProfile::Workspace,
             ServeModeContext { broker_override: Some(true), platform_default_broker: false },
         );
@@ -1995,7 +1935,7 @@ mod tests {
     #[test]
     fn reference_profile_never_defaults_to_broker() {
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Stdio,
+            None,
             mcp_server::McpProfile::Reference,
             ServeModeContext { broker_override: Some(true), platform_default_broker: true },
         );
@@ -2008,7 +1948,7 @@ mod tests {
         // The re-exec'd daemon passes `--mode daemon`; an explicit flag must survive
         // regardless of profile or platform default.
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Daemon,
+            Some(McpServeMode::Daemon),
             mcp_server::McpProfile::Workspace,
             ServeModeContext { broker_override: Some(false), platform_default_broker: false },
         );
@@ -2019,12 +1959,23 @@ mod tests {
     #[test]
     fn explicit_http_mode_wins_over_broker_defaults() {
         let mode = resolve_serve_mode_with_override(
-            McpServeMode::Http,
+            Some(McpServeMode::Http),
             mcp_server::McpProfile::Workspace,
             ServeModeContext { broker_override: Some(true), platform_default_broker: true },
         );
 
         assert!(matches!(mode, McpServeMode::Http));
+    }
+
+    #[test]
+    fn explicit_stdio_mode_wins_over_broker_defaults() {
+        let mode = resolve_serve_mode_with_override(
+            Some(McpServeMode::Stdio),
+            mcp_server::McpProfile::Workspace,
+            ServeModeContext { broker_override: Some(true), platform_default_broker: true },
+        );
+
+        assert!(matches!(mode, McpServeMode::Stdio));
     }
 
     #[test]
@@ -2283,11 +2234,31 @@ mod tests {
         ])
         .expect("the existing stdio command line must remain valid");
 
-        assert!(matches!(cli.args.mode, McpServeMode::Stdio));
+        assert!(matches!(cli.args.mode, Some(McpServeMode::Stdio)));
         assert!(cli.args.host.is_none());
         assert!(cli.args.port.is_none());
         assert!(cli.args.allowed_hosts.is_empty());
         assert!(cli.args.config.is_none());
+    }
+
+    #[test]
+    fn omitted_mode_remains_distinguishable_from_explicit_stdio() {
+        let omitted =
+            ServeCli::try_parse_from(["serve", "--profile", "workspace", "--source-dir", "."])
+                .expect("the workspace CLI accepts its profile default");
+        assert!(omitted.args.mode.is_none());
+
+        let explicit = ServeCli::try_parse_from([
+            "serve",
+            "--profile",
+            "workspace",
+            "--source-dir",
+            ".",
+            "--mode",
+            "stdio",
+        ])
+        .expect("explicit stdio remains accepted");
+        assert!(matches!(explicit.args.mode, Some(McpServeMode::Stdio)));
     }
 
     #[test]
@@ -2317,7 +2288,7 @@ mod tests {
             "42",
         ])
         .expect("required broker with a supervised PID");
-        assert!(matches!(cli.args.mode, McpServeMode::BrokerRequired));
+        assert!(matches!(cli.args.mode, Some(McpServeMode::BrokerRequired)));
         assert_eq!(cli.args.backend_pid, Some(42));
     }
 
@@ -2739,17 +2710,17 @@ mod tests {
         assert!(!canonical_source.join(".build").exists(), "the default stays lazy");
     }
 
-    /// The daemon derives the backend identity from its own argv, so every name the proxy
-    /// was given has to reach it. A dropped name would leave proxy and daemon keying on
-    /// different surfaces: the proxy would hand clients a socket whose server serves
-    /// something else, and the default-off promise would depend on who started first.
+    /// Tool gates and native credentials attach to sessions rather than the detached owner.
     #[test]
-    fn broker_child_receives_every_enable_tool() {
+    fn broker_child_does_not_inherit_session_tools_or_native_credentials() {
         let source = tempfile::tempdir().unwrap();
         let canonical_source = source.path().canonicalize().unwrap();
         let cache = test_cache_layout(&canonical_source, None);
         let mut args = serve_args(McpServeMode::Broker, None);
         args.enable_tools = vec!["graph".to_owned(), "outline".to_owned()];
+        args.onec_url = Some("http://example.test/private-ib".into());
+        args.onec_user = "session-user".into();
+        args.onec_password = "session-password-marker".into();
 
         let command = daemon_command(
             PathBuf::from("bsl-analyzer").as_path(),
@@ -2762,12 +2733,14 @@ mod tests {
         let argv: Vec<String> =
             command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
 
-        for tool in &args.enable_tools {
-            assert!(
-                argv.windows(2).any(|pair| pair[0] == "--enable-tool" && pair[1] == *tool),
-                "argv does not carry --enable-tool {tool}: {argv:?}"
-            );
-        }
+        assert!(!argv.iter().any(|arg| arg == "--enable-tool" || arg.starts_with("--onec-")));
+        assert!(!argv.iter().any(|arg| arg.contains("session-password-marker")));
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "BSL_ONEC_PASSWORD" && value.is_none()));
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "BSL_ONEC_CONNECTIONS_FILE" && value.is_none()));
     }
 
     #[test]
@@ -2800,7 +2773,7 @@ mod tests {
             source_dir: Some(std::path::PathBuf::from(".")),
             enable_tools: Vec::new(),
             cache_dir: None,
-            mode,
+            mode: Some(mode),
             backend_pid: None,
             host: None,
             port,

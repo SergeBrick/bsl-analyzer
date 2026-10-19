@@ -99,7 +99,7 @@ pub(crate) mod heap_estimate {
             + snapshot.source_exclusions.heap_bytes()
     }
 
-    /// Heap of a [`super::MetadataListingInput`]: the ten per-family `Arc<Vec<_>>`
+    /// Heap of a [`super::MetadataListingInput`]: the per-family `Arc<Vec<_>>`
     /// entry lists plus each entry's owned name string (the other entry fields —
     /// `FileId`s, the MDO kind — are `Copy`). New heap-owning listing families
     /// must be added here too.
@@ -661,6 +661,92 @@ pub fn load_configuration<'db>(
     Arc::new(config)
 }
 
+/// Build a complete configuration from the owner's prepared listing and this
+/// storage's source-file inputs. This path intentionally has no filesystem walk;
+/// every parser below consumes a FileId accepted by the shared owner.
+#[salsa::tracked(
+    lru = 1024,
+    heap_size = heap_estimate::configuration_heap,
+    returns(clone)
+)]
+pub fn load_configuration_from_prepared_inputs<'db>(
+    db: &'db dyn crate::RootDatabase,
+    path_input: ConfigurationPathInput<'db>,
+    listing: MetadataListingInput,
+) -> Arc<Configuration> {
+    let _span = tracing::info_span!("load_configuration_from_prepared_inputs").entered();
+    let root = path_input.path(db);
+    let _ = path_input.root_revision(db);
+
+    // Match the existing directory loader's root header semantics: it does not
+    // read Configuration.xml and uses this default name/UUID behavior.
+    let mut config = Configuration::new("Configuration");
+
+    for entry in listing.entries(db).iter() {
+        let files = MdoFiles::new(db, entry.kind, entry.main, entry.predefined, listing);
+        if entry.kind.is_register() {
+            if let Some(register) = parse_register_query(db, files) {
+                config.add_register((*register).clone());
+            }
+        } else if let Some(object) = parse_mdo_query(db, files) {
+            config.add_metadata_object((*object).clone());
+        }
+    }
+    for entry in listing.defined_types(db).iter() {
+        if let Some(value) = parse_defined_type_query(db, DefinedTypeFile::new(db, entry.main)) {
+            config.add_defined_type((*value).clone());
+        }
+    }
+    for entry in listing.common_modules(db).iter() {
+        if let Some(value) = parse_common_module_query(db, CommonModuleFile::new(db, entry.main)) {
+            config.add_common_module((*value).clone());
+        }
+    }
+    for entry in listing.event_subscriptions(db).iter() {
+        if let Some(value) =
+            parse_event_subscription_query(db, EventSubscriptionFile::new(db, entry.main))
+        {
+            config.add_event_subscription((*value).clone());
+        }
+    }
+    for entry in listing.scheduled_jobs(db).iter() {
+        if let Some(value) = parse_scheduled_job_query(db, ScheduledJobFile::new(db, entry.main)) {
+            config.add_scheduled_job((*value).clone());
+        }
+    }
+    for entry in listing.roles(db).iter() {
+        if let Some(value) = parse_role_query(db, RoleFiles::new(db, entry.main, entry.rights)) {
+            config.add_role((*value).clone());
+        }
+    }
+    for entry in listing.http_services(db).iter() {
+        if let Some(value) = parse_http_service_query(db, HTTPServiceFile::new(db, entry.main)) {
+            config.add_http_service((*value).clone());
+        }
+    }
+    for entry in listing.web_services(db).iter() {
+        if let Some(value) = parse_web_service_query(db, WebServiceFile::new(db, entry.main)) {
+            config.add_web_service((*value).clone());
+        }
+    }
+    for entry in listing.integration_services(db).iter() {
+        if let Some(value) =
+            parse_integration_service_query(db, IntegrationServiceFile::new(db, entry.main))
+        {
+            config.add_integration_service((*value).clone());
+        }
+    }
+    for entry in listing.subsystems(db).iter() {
+        if let Some(value) = parse_subsystem_query(db, SubsystemFile::new(db, entry.main)) {
+            config.add_subsystem((*value).clone());
+        }
+    }
+    config.apply_common_attributes(&common_attribute_set(db, listing));
+
+    tracing::debug!(%root, "built configuration from prepared metadata inputs");
+    Arc::new(config)
+}
+
 /// The user's exclusions, whole, as the whole-config load of `path_input` reads them.
 ///
 /// A projection of the workspace snapshot rather than a read of it, so a snapshot set
@@ -1000,6 +1086,42 @@ pub struct MetadataListingData {
     pub integration_services: Vec<IntegrationServiceEntry>,
     pub subsystems: Vec<SubsystemEntry>,
     pub common_attributes: Vec<CommonAttributeEntry>,
+}
+
+/// Storage-neutral handles to a prepared metadata listing. The values contain
+/// stable `FileId`s and may be shared while each Salsa storage creates new input
+/// IDs of its own.
+#[derive(Clone, Default)]
+pub struct MetadataListingSnapshot {
+    pub entries: Arc<Vec<MdoEntry>>,
+    pub defined_types: Arc<Vec<DefinedTypeEntry>>,
+    pub common_modules: Arc<Vec<CommonModuleEntry>>,
+    pub event_subscriptions: Arc<Vec<EventSubscriptionEntry>>,
+    pub scheduled_jobs: Arc<Vec<ScheduledJobEntry>>,
+    pub roles: Arc<Vec<RoleEntry>>,
+    pub http_services: Arc<Vec<HTTPServiceEntry>>,
+    pub web_services: Arc<Vec<WebServiceEntry>>,
+    pub integration_services: Arc<Vec<IntegrationServiceEntry>>,
+    pub subsystems: Arc<Vec<SubsystemEntry>>,
+    pub common_attributes: Arc<Vec<CommonAttributeEntry>>,
+}
+
+impl From<MetadataListingData> for MetadataListingSnapshot {
+    fn from(data: MetadataListingData) -> Self {
+        Self {
+            entries: Arc::new(data.entries),
+            defined_types: Arc::new(data.defined_types),
+            common_modules: Arc::new(data.common_modules),
+            event_subscriptions: Arc::new(data.event_subscriptions),
+            scheduled_jobs: Arc::new(data.scheduled_jobs),
+            roles: Arc::new(data.roles),
+            http_services: Arc::new(data.http_services),
+            web_services: Arc::new(data.web_services),
+            integration_services: Arc::new(data.integration_services),
+            subsystems: Arc::new(data.subsystems),
+            common_attributes: Arc::new(data.common_attributes),
+        }
+    }
 }
 
 /// The per-config-root *structure* input: the MDOs and defined types that exist in

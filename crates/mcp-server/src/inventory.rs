@@ -656,6 +656,11 @@ enum Waiting {
 /// `thread::sleep` is spelled without its bracket on purpose: two boot retries pass the
 /// function itself as an argument, and a key that ended at `(` would not see them.
 const WAITS: &[(&str, &str, &str, Waiting)] = &[
+    // The opt-in shared-bootstrap test gate expires at its fixed watchdog deadline.
+    ("diagnostics_state/lifecycle.rs", "hold_shared_test_gate", "thread::sleep", Waiting::Bounded),
+    // Private LSP control channels close with their transport; data EOF ends the writer select.
+    ("broker/transport.rs", "new", ".recv(", Waiting::OwnProtocol),
+    ("broker/transport.rs", "recv_control", ".recv(", Waiting::OwnProtocol),
     // The external baseline service: its own `shutdown`, called before the owners stop.
     ("baseline.rs", "serve", ".recv(", Waiting::OwnProtocol),
     ("baseline.rs", "shutdown", ".recv_timeout(", Waiting::OwnProtocol),

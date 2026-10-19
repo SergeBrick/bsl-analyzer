@@ -362,10 +362,16 @@ fn project_scope(project: &project_model::Project) -> std::io::Result<[u8; 32]> 
     let workspace = project.root.canonicalize().map_err(|error| {
         std::io::Error::new(error.kind(), format!("failed to canonicalize workspace: {error}"))
     })?;
+    // Exclusions inside the workspace retain the root spelling they were loaded
+    // through; make those relative before hashing the canonical workspace.
+    let declared_workspace = lexical_normalize(&std::path::absolute(&project.root)?);
     let mut exclusions = Vec::new();
     for path in project.source_exclusions().declared() {
         let normalized = lexical_normalize(path);
-        let spelling = normalized.strip_prefix(&workspace).unwrap_or(&normalized);
+        let spelling = normalized
+            .strip_prefix(&declared_workspace)
+            .or_else(|_| normalized.strip_prefix(&workspace))
+            .unwrap_or(&normalized);
         exclusions.push(spelling.as_os_str().as_encoded_bytes().to_vec());
     }
     exclusions.sort();
@@ -376,6 +382,12 @@ fn project_scope(project: &project_model::Project) -> std::io::Result<[u8; 32]> 
     append_field(&mut hasher, project.extension_topology().fingerprint().as_bytes());
     for exclusion in exclusions {
         append_field(&mut hasher, &exclusion);
+    }
+    // Patterns are folded in only when declared, so a project without them keeps the
+    // stamp it had before patterns existed. The NUL in the tag keeps a pattern apart
+    // from a literal exclusion: no file system path holds one.
+    for pattern in project.source_exclusions().patterns() {
+        append_field(&mut hasher, &[b"pattern\0".as_slice(), pattern.as_bytes()].concat());
     }
     Ok(*hasher.finalize().as_bytes())
 }
@@ -670,6 +682,39 @@ mod tests {
             d.root(),
             "creating an excluded directory is not a declaration change"
         );
+
+        std::fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nexclude = [\"ignored\"]\nexclude_globs = [\"**/*.Queries.bsl\"]\n",
+        )
+        .unwrap();
+        let patterns_added = project(workspace.path());
+        let e = WorkspaceCacheLayout::for_project(
+            &patterns_added,
+            Some(Path::new("cache")),
+            cwd.path(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(c.root(), e.root(), "declared exclusion patterns identify the scan topology");
+
+        let stamp = |config: &str| {
+            std::fs::write(workspace.path().join("bsl-analyzer.toml"), config).unwrap();
+            WorkspaceCacheLayout::for_project(
+                &project(workspace.path()),
+                Some(Path::new("cache")),
+                cwd.path(),
+                None,
+            )
+            .unwrap()
+            .root()
+            .to_path_buf()
+        };
+        assert_ne!(
+            stamp("[source]\nexclude = [\"a\", \"pattern\", \"q\"]\n"),
+            stamp("[source]\nexclude = [\"a\"]\nexclude_globs = [\"q\"]\n"),
+            "a pattern is told apart from a literal exclusion spelled like its tag"
+        );
     }
 
     #[test]
@@ -859,6 +904,96 @@ mod tests {
         .unwrap();
         assert_eq!(a.scope_stamp(), b.scope_stamp());
         assert_eq!(a.root(), b.root());
+    }
+
+    #[test]
+    fn workspace_cache_scope_normalizes_exclusions_across_root_spellings() {
+        let workspace = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let alias_parent = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\"excluded\"]\n",
+        )
+        .unwrap();
+
+        let declared_root = project(workspace.path());
+        #[cfg(unix)]
+        let alternate_root = {
+            use std::os::unix::fs::symlink;
+
+            let alias = alias_parent.path().join("workspace-link");
+            symlink(workspace.path(), &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let alternate_root = workspace.path().canonicalize().unwrap();
+        #[cfg(not(any(unix, windows)))]
+        let alternate_root = workspace.path().to_path_buf();
+        let alternate_project = project(&alternate_root);
+        let declared_layout = WorkspaceCacheLayout::for_project(
+            &declared_root,
+            Some(cache.path()),
+            workspace.path(),
+            None,
+        )
+        .unwrap();
+        let alternate_layout = WorkspaceCacheLayout::for_project(
+            &alternate_project,
+            Some(cache.path()),
+            workspace.path(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(declared_layout.scope_stamp(), alternate_layout.scope_stamp());
+        assert!(declared_layout.verify_project(&alternate_project).is_ok());
+
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                workspace.path().join("bsl-analyzer.toml"),
+                "[source]\nroot = \".\"\nexclude = [\"../outside-absent-directory\"]\n",
+            )
+            .unwrap();
+            let declared_external_exclusion = project(workspace.path());
+            let alternate_external_exclusion = project(&alternate_root);
+            let declared_external_layout = WorkspaceCacheLayout::for_project(
+                &declared_external_exclusion,
+                Some(cache.path()),
+                workspace.path(),
+                None,
+            )
+            .unwrap();
+            let alternate_external_layout = WorkspaceCacheLayout::for_project(
+                &alternate_external_exclusion,
+                Some(cache.path()),
+                workspace.path(),
+                None,
+            )
+            .unwrap();
+            assert_ne!(
+                declared_external_layout.scope_stamp(),
+                alternate_external_layout.scope_stamp(),
+                "outside exclusions retain their resolved absolute identity"
+            );
+        }
+
+        std::fs::write(
+            workspace.path().join("bsl-analyzer.toml"),
+            "[source]\nroot = \".\"\nexclude = [\"another-absent-directory\"]\n",
+        )
+        .unwrap();
+        let changed_exclusion = project(workspace.path());
+        let changed_layout = WorkspaceCacheLayout::for_project(
+            &changed_exclusion,
+            Some(cache.path()),
+            workspace.path(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(declared_layout.scope_stamp(), changed_layout.scope_stamp());
     }
 
     #[test]

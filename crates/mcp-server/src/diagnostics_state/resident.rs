@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -37,14 +36,13 @@ fn partitioned_baseline_error(
 
 /// Adapts the resident's owned [`Vfs`] to the lock-neutral [`ide_host_core::VfsWrite`]
 /// the shared metadata policy expects. The resident is only ever touched while the
-/// caller holds the state mutex (the db is `!Sync`), so a single-threaded `RefCell`
-/// gives the interning critical section its interior mutability without a second lock —
-/// the same discipline the LSP's `parking_lot`-locked adapter has, minus the lock.
-pub(super) struct ResidentVfs(pub(super) RefCell<Vfs>);
+/// caller holds the state mutex (the db is `!Sync`); the shared catalog supplies the
+/// one path interner used by disk and editor views.
+pub(super) struct ResidentVfs(pub(super) ide_host_core::WorkspaceCatalog);
 
 impl ide_host_core::VfsWrite for ResidentVfs {
     fn with_write<R>(&self, f: impl FnOnce(&mut Vfs) -> R) -> R {
-        f(&mut self.0.borrow_mut())
+        self.0.with_vfs(f)
     }
 }
 
@@ -128,7 +126,7 @@ pub(super) fn retry_resident_holes(
         .map(|(k, o)| (k.clone(), *o))
         .collect();
 
-    {
+    let effects = {
         let vfs = &resident.vfs;
         let db = &mut resident.db;
         let by_path = &mut resident.by_path;
@@ -171,8 +169,8 @@ pub(super) fn retry_resident_holes(
                 }
             }
         });
-        apply_source_batch(db, crate::graph::input::GRAPH_SOURCE_ROOT, changes);
-    }
+        apply_source_batch(db.database_mut(), crate::graph::input::GRAPH_SOURCE_ROOT, changes)
+    };
 
     // The substrate is re-issued for every transition, not just for paths that were
     // never registered. Whether a module's back-link is currently `None` depends on
@@ -186,9 +184,12 @@ pub(super) fn retry_resident_holes(
         .map(PathBuf::from)
         .filter(|p| project_model::is_substrate_listed_body_path(p))
         .collect();
-    if !touched.is_empty() {
-        ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &touched);
-    }
+    let metadata_changed = !touched.is_empty()
+        && ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &touched);
+    let mut paths = effects.affected_paths;
+    paths.extend(healed.iter().map(|(key, _)| PathBuf::from(key)));
+    paths.extend(vanished.iter().map(PathBuf::from));
+    resident.db.publish_change(effects.changed_file_ids, paths, metadata_changed);
 
     (healed, vanished)
 }
@@ -211,7 +212,7 @@ pub(super) enum HoleOrigin {
 /// path to the Salsa input it set. Held behind the [`std::sync::Mutex`]; reads borrow it,
 /// a reload mutates `db` in place.
 pub(crate) struct DiagnosticsResident {
-    pub(super) db: RootDatabaseImpl,
+    pub(super) db: ide_host_core::WorkspaceBackend,
     /// Trims [`Self::trim_after_read`] has run, for a test that every read trims.
     #[cfg(test)]
     pub(super) read_trims: u32,
@@ -364,7 +365,7 @@ impl DiagnosticsResident {
     #[cfg(test)]
     pub(super) fn file_set_has_for_test(&self, file_id: FileId) -> bool {
         use base_db::SourceDatabase;
-        let db = &self.db;
+        let db = self.db.database();
         db.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
             .root(db)
             .file_set()
@@ -378,6 +379,10 @@ impl DiagnosticsResident {
         &self.workspace_root
     }
 
+    pub(crate) fn project(&self) -> &project_model::Project {
+        &self.project
+    }
+
     /// This resident's own root table — the one its files were enumerated under, so a
     /// location built from it addresses a file this resident can actually serve.
     pub(crate) fn workspace_roots(&self) -> &bsl_search::WorkspaceRoots {
@@ -387,13 +392,12 @@ impl DiagnosticsResident {
     /// An `Analysis` view over a cloned db handle. The clone shares the Salsa storage
     /// (memo/LRU cache), and is dropped before the read guard is released.
     pub(crate) fn analysis(&self) -> Analysis {
-        Analysis::from_database(self.db.clone())
+        self.db.analysis()
     }
 
-    /// The resident Salsa database, for the `metadata` tool's root-scoped metadata
-    /// reads (`resolve_*_across_roots` point-lookups and the Channel-2
-    /// `configuration_for_root` header/enumeration). Borrowed under the state lock, so
-    /// the borrow cannot outlive the read and a reload can never alias it.
+    /// Test-only access for root-scoped metadata and cancellation cases. Borrowed under
+    /// the state lock, so the borrow cannot outlive the read and a reload cannot alias it.
+    #[cfg(test)]
     pub(crate) fn db(&self) -> &RootDatabaseImpl {
         &self.db
     }
@@ -602,7 +606,7 @@ impl DiagnosticsResident {
             if cancel.is_cancelled() {
                 return;
             }
-            let seed = SweepWorker::new(self.db.clone());
+            let seed = SweepWorker::new(self.db.database().clone());
             let outcome = self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                 chunk.par_iter().try_for_each_with(seed, |worker, (file_id, _)| {
                     let file_id = *file_id;
@@ -795,7 +799,7 @@ impl DiagnosticsResident {
                 prepared.extend(chunk.iter().map(|_| None));
                 continue;
             }
-            let mut seed = SweepWorker::new(self.db.clone());
+            let mut seed = SweepWorker::new(self.db.database().clone());
             // Warm the configuration inventory HERE, before the pool opens: a job that
             // first-loads a config root fans out over the loader's own rayon scope, parks,
             // and can steal a sibling job carrying a different db clone onto this thread.
@@ -1028,7 +1032,7 @@ impl DiagnosticsResident {
         let per_file: Vec<Vec<(String, ide::SeverityBucket)>> = if swept.is_empty() {
             Vec::new()
         } else {
-            let seed = SweepWorker::new(self.db.clone());
+            let seed = SweepWorker::new(self.db.database().clone());
             self.sweep_pool.get_or_init(build_sweep_pool).install(move || {
                 swept
                     .par_iter()
@@ -1284,14 +1288,62 @@ pub(super) fn canonical_key(path: &Path) -> String {
     crate::change_hub::resolve_as_far_as_it_goes(path).to_string_lossy().into_owned()
 }
 
+/// Whether the batch needs a full rebuild, answered before any write. The apply pass
+/// reaches the same conditions as it goes, and a request raised there would land after
+/// its earlier writes reached the db and the file set, with no generation published for
+/// them. Each check below reads the state the apply pass will see at that point: adds
+/// land before removals, and removals before body updates.
+fn batch_needs_rebuild(
+    resident: &DiagnosticsResident,
+    added_bsl: &[String],
+    modified_bsl: &[String],
+    removed_bsl: &[String],
+    fp_of: &impl Fn(&str) -> Option<u64>,
+    stats: &HashMap<String, u64>,
+) -> bool {
+    use ide_host_core::VfsWrite;
+    use rustc_hash::FxHashSet;
+
+    // A registration takes the id the VFS already holds for its path, or a fresh id that
+    // matches none. An unreadable add never reaches that step and becomes a hole; the
+    // rebuild answers that case too, so the answer stays conservative rather than exact.
+    let aliased_add = added_bsl.iter().any(|path| {
+        resident.by_path.get(path.as_str()).is_some_and(|known| {
+            resident.vfs.with_write(|vfs| vfs.file_id(&VfsPath::new(PathBuf::from(path))))
+                != Some(*known)
+        })
+    });
+    if aliased_add {
+        return true;
+    }
+
+    // An add of this batch holds its path whenever its fingerprint is known, since the
+    // apply pass skips only a path with neither a fingerprint nor a file on disk. A
+    // removal runs after every add and drops the path from both maps, so it wins.
+    let added: FxHashSet<&str> = added_bsl.iter().map(String::as_str).collect();
+    let removed: FxHashSet<&str> = removed_bsl.iter().map(String::as_str).collect();
+    modified_bsl.iter().any(|path| {
+        let Some(fp) = fp_of(path) else { return false };
+        if stats.get(path.as_str()) == Some(&fp) {
+            return false;
+        }
+        let held = !removed.contains(path.as_str())
+            && (added.contains(path.as_str())
+                || resident.by_path.contains_key(path.as_str())
+                || resident.holes.contains_key(path.as_str()));
+        !held
+    })
+}
+
 /// Apply drifted XML metadata + modified BSL bodies to the resident under an
 /// already-held lock, shared by the scan and event-driven drift paths so both mutate
 /// the resident identically. Returns `(needs_rebuild, moved)`: a full rebuild is
 /// needed when an XML path resolves outside every config root (a symlink the
-/// point-refresh cannot express) or a modified `.bsl` has no resident FileId (the file
-/// universe moved); `moved` is whether any Salsa input actually changed. `fp_of` yields
-/// the on-disk fingerprint of a `modified_bsl` path so an already-current body is
-/// skipped. The caller owns the drift-baseline update (full rebase vs incremental).
+/// point-refresh cannot express) or [`batch_needs_rebuild`] finds a path the delta
+/// cannot express. A `needs_rebuild` answer leaves the resident untouched; `moved` is
+/// whether any Salsa input actually changed. `fp_of` yields the on-disk fingerprint of a
+/// `modified_bsl` path so an already-current body is skipped. The caller owns the
+/// drift-baseline update (full rebase vs incremental).
 pub(super) fn apply_resident_changes(
     resident: &mut DiagnosticsResident,
     xml_paths: &[PathBuf],
@@ -1314,9 +1366,11 @@ pub(super) fn apply_resident_changes(
     if xml_outside_roots {
         return (true, false);
     }
+    if batch_needs_rebuild(resident, added_bsl, modified_bsl, removed_bsl, &fp_of, stats) {
+        return (true, false);
+    }
 
     let mut moved = false;
-    let mut needs_rebuild = false;
     let mut became_holes: Vec<PathBuf> = Vec::new();
     let mut changed_membership_paths: Vec<PathBuf> = Vec::new();
     let mut phase = 0;
@@ -1331,9 +1385,6 @@ pub(super) fn apply_resident_changes(
     let holes = &mut resident.holes;
     let changes = std::iter::from_fn(|| {
         loop {
-            if needs_rebuild {
-                return None;
-            }
             match phase {
                 0 if added < added_bsl.len() => {
                     let path = &added_bsl[added];
@@ -1356,13 +1407,9 @@ pub(super) fn apply_resident_changes(
                         }
                     };
                     let vfs_path = VfsPath::new(path.clone());
+                    // `batch_needs_rebuild` has ruled out an alias, so this registration
+                    // cannot displace another id.
                     let file_id = vfs.with_write(|vfs| vfs.alloc_file_id(vfs_path.clone()));
-                    if by_path.get(path.as_str()).is_some_and(|known| *known != file_id) {
-                        // The path is already registered under another id; aliasing needs
-                        // a full rescan, preserving the existing registration unchanged.
-                        needs_rebuild = true;
-                        return None;
-                    }
                     by_path.insert(path.clone(), file_id);
                     holes.remove(path.as_str());
                     return Some(SourceBatchChange::Upsert {
@@ -1404,11 +1451,13 @@ pub(super) fn apply_resident_changes(
                         continue;
                     }
                     let Some(&file_id) = by_path.get(path) else {
-                        if holes.contains_key(path) {
-                            continue;
-                        }
-                        needs_rebuild = true;
-                        return None;
+                        // `batch_needs_rebuild` admitted only bodies this batch or the
+                        // resident holds, so a body missing from `by_path` is a hole.
+                        assert!(
+                            holes.contains_key(path),
+                            "batch preflight admitted an unknown path"
+                        );
+                        continue;
                     };
                     let vfs_path = VfsPath::new(PathBuf::from(path));
                     match base_db::read_disk_text(Path::new(path)) {
@@ -1438,11 +1487,9 @@ pub(super) fn apply_resident_changes(
             }
         }
     });
-    let source_effects = apply_source_batch(db, crate::graph::input::GRAPH_SOURCE_ROOT, changes);
+    let source_effects =
+        apply_source_batch(db.database_mut(), crate::graph::input::GRAPH_SOURCE_ROOT, changes);
     moved |= source_effects.bsl_source_changed;
-    if needs_rebuild {
-        return (true, moved);
-    }
     let changed_source_paths: FxHashSet<_> =
         source_effects.affected_paths.iter().chain(&changed_membership_paths).cloned().collect();
 
@@ -1460,16 +1507,21 @@ pub(super) fn apply_resident_changes(
         .filter(|p| config_roots.iter().any(|(_, root)| p.starts_with(root)))
         .filter(|p| changed_source_paths.contains(p))
         .collect();
+    let mut metadata_changed = false;
+    let mut metadata_paths = Vec::new();
     if !xml_paths.is_empty() || !structural_listing_bodies.is_empty() {
         let mut refresh: Vec<PathBuf> = xml_paths.to_vec();
         refresh.extend(structural_listing_bodies);
-        ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &refresh);
+        metadata_changed |=
+            ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &refresh);
+        metadata_paths.extend(refresh);
         if !xml_paths.is_empty() {
             resident.db.bump_config_for_paths(xml_paths.iter().map(|p| p.as_path()));
             apply_project_compatibility_mode(
                 &mut resident.db,
                 resident.project.compatibility_mode(),
             );
+            metadata_changed = true;
         }
         moved = true;
     }
@@ -1490,8 +1542,19 @@ pub(super) fn apply_resident_changes(
         .filter(|p| config_roots.iter().any(|(_, root)| p.starts_with(root)))
         .collect();
     if !became_holes.is_empty() {
-        ide_host_core::refresh_metadata_substrate(&mut resident.db, &resident.vfs, &became_holes);
+        metadata_changed |= ide_host_core::refresh_metadata_substrate(
+            &mut resident.db,
+            &resident.vfs,
+            &became_holes,
+        );
+        metadata_paths.extend(became_holes);
     }
+
+    metadata_paths.extend_from_slice(xml_paths);
+    let mut paths = source_effects.affected_paths;
+    paths.extend(changed_membership_paths);
+    paths.extend(metadata_paths);
+    resident.db.publish_change(source_effects.changed_file_ids, paths, metadata_changed);
 
     (false, moved)
 }
@@ -1721,10 +1784,9 @@ mod tests {
             let other_id = resident.file_id_for(&other_path).expect("other file is resident");
             assert_ne!(target_id, other_id, "collision uses a different existing FileId");
 
-            let source_root = resident
-                .db
-                .source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
-                .root(&resident.db);
+            let database = resident.db.database();
+            let source_root =
+                database.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT).root(database);
             let file_set_before = source_root.file_set().clone();
             let target_vfs_path = file_set_before
                 .path_for_file(&target_id)
@@ -1732,10 +1794,10 @@ mod tests {
                 .clone();
             assert_eq!(file_set_before.file_for_path(&target_vfs_path), Some(&target_id));
             assert_eq!(file_set_before.path_for_file(&target_id), Some(&target_vfs_path));
-            let revision_before = resident.db.file_revision_input(target_id);
-            let revision_value_before = revision_before.revision(&resident.db);
-            let unreadable_before = revision_before.unreadable(&resident.db);
-            let salsa_revision_before = salsa::plumbing::current_revision(&resident.db);
+            let revision_before = database.file_revision_input(target_id);
+            let revision_value_before = revision_before.revision(database);
+            let unreadable_before = revision_before.unreadable(database);
+            let salsa_revision_before = salsa::plumbing::current_revision(database);
             let text_before = resident.analysis().file_text(target_id).to_string();
             assert!(
                 resident.db.try_file_text(target_id).is_none(),
@@ -1753,17 +1815,16 @@ mod tests {
 
             assert_eq!(result, (true, false), "an existing path/id collision requests rebuild");
             assert_eq!(resident.by_path.get(&key).copied(), by_path_before);
-            let source_root_after = resident
-                .db
-                .source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT)
-                .root(&resident.db);
+            let database = resident.db.database();
+            let source_root_after =
+                database.source_root_input(crate::graph::input::GRAPH_SOURCE_ROOT).root(database);
             let file_set_after = source_root_after.file_set();
             assert_eq!(file_set_after, &file_set_before, "the FileSet registration is untouched");
-            let revision_after = resident.db.file_revision_input(target_id);
-            assert_eq!(revision_after.revision(&resident.db), revision_value_before);
-            assert_eq!(revision_after.unreadable(&resident.db), unreadable_before);
+            let revision_after = database.file_revision_input(target_id);
+            assert_eq!(revision_after.revision(database), revision_value_before);
+            assert_eq!(revision_after.unreadable(database), unreadable_before);
             assert_eq!(
-                salsa::plumbing::current_revision(&resident.db),
+                salsa::plumbing::current_revision(database),
                 salsa_revision_before,
                 "the collision path performs no same-value Salsa write"
             );
@@ -1780,6 +1841,125 @@ mod tests {
             matches!(outcome, ResidentOutcome::Ready((true, false), _)),
             "the resident reports rebuild required without a partial source mutation"
         );
+    }
+
+    /// Whether the source root's file set maps `path` to a FileId, which is what a consumer
+    /// of the db sees as the file being present.
+    fn file_set_serves(resident: &DiagnosticsResident, path: &str) -> bool {
+        resident
+            .vfs_file_id_for_test(Path::new(path))
+            .is_some_and(|file_id| resident.file_set_has_for_test(file_id))
+    }
+
+    /// Control for the batch test below: an applied add with no rebuild request is published.
+    /// Without it, a generation that does not move could be a fault of the probe rather
+    /// than of the batch.
+    #[test]
+    fn an_applied_add_without_a_rebuild_request_advances_the_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let mut resident = DiagnosticsState::build_resident_for_test(root);
+
+        write(
+            root,
+            "CommonModules/Добавленный/Ext/Module.bsl",
+            "Процедура Добавленная()\nКонецПроцедуры\n",
+        );
+        let added = canonical_key(&module_path(root, "Добавленный"));
+
+        let (rebuild, applied, before, after) = {
+            let resident = &mut resident;
+            let before = resident.db.snapshot().generation;
+            let (rebuild, _) = apply_resident_changes(
+                resident,
+                &[],
+                std::slice::from_ref(&added),
+                &[],
+                &[],
+                |_| None,
+                &HashMap::new(),
+            );
+            let applied = file_set_serves(resident, &added);
+            (rebuild, applied, before, resident.db.snapshot().generation)
+        };
+
+        assert!(!rebuild, "a readable add needs no rebuild");
+        assert!(applied, "the add reached the file set, or the control proves nothing");
+        assert!(after > before, "an applied add is published: generation {before} -> {after}");
+    }
+
+    /// What a consumer of the resident sees for one path: the generation it is served at,
+    /// the registrations and holes behind the file set, and whether the file set serves
+    /// the path.
+    #[derive(Debug, PartialEq)]
+    struct ResidentView {
+        generation: u64,
+        registrations: usize,
+        holes: usize,
+        registered: bool,
+        served: bool,
+    }
+
+    fn resident_view(resident: &DiagnosticsResident, path: &str) -> ResidentView {
+        ResidentView {
+            generation: resident.db.snapshot().generation,
+            registrations: resident.by_path.len(),
+            holes: resident.holes.len(),
+            registered: resident.by_path.contains_key(path),
+            served: file_set_serves(resident, path),
+        }
+    }
+
+    /// A batch that adds a readable file and also modifies a body the resident never
+    /// admitted asks for a rebuild, and that answer covers the whole batch. Applying the
+    /// add first would put it into the db and the file set with no generation published
+    /// for it, so followers would not see it until the rebuild lands. The batch must
+    /// leave the resident exactly as it was.
+    #[test]
+    fn a_batch_that_requests_a_rebuild_mutates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        sample_workspace(root);
+
+        let mut resident = DiagnosticsState::build_resident_for_test(root);
+
+        write(
+            root,
+            "CommonModules/Добавленный/Ext/Module.bsl",
+            "Процедура Добавленная()\nКонецПроцедуры\n",
+        );
+        write(
+            root,
+            "CommonModules/Неизвестный/Ext/Module.bsl",
+            "Процедура Неизвестная()\nКонецПроцедуры\n",
+        );
+        let added = canonical_key(&module_path(root, "Добавленный"));
+        let unknown = canonical_key(&module_path(root, "Неизвестный"));
+        let stats = HashMap::from([(unknown.clone(), 1u64)]);
+
+        let (rebuild, before, after) = {
+            let resident = &mut resident;
+            let before = resident_view(resident, &added);
+            let (rebuild, _) = apply_resident_changes(
+                resident,
+                &[],
+                std::slice::from_ref(&added),
+                std::slice::from_ref(&unknown),
+                &[],
+                |path| (path == unknown.as_str()).then_some(2),
+                &stats,
+            );
+            (rebuild, before, resident_view(resident, &added))
+        };
+
+        assert!(
+            !before.served,
+            "the add is not in the resident before the batch, or the check proves nothing"
+        );
+        assert!(rebuild, "a modified path the resident never admitted requests a rebuild");
+        assert_eq!(after, before, "a batch that requests a rebuild leaves the resident as it was");
     }
 
     /// The resident loads the project's `bsl-analyzer.toml` and exposes it as the

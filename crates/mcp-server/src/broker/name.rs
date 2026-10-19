@@ -8,8 +8,12 @@
 //! on a different name by construction.
 
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::McpProfile;
 
@@ -149,6 +153,143 @@ impl BackendKey {
         }
         Ok(())
     }
+}
+
+/// Identity shared by LSP and MCP launches that own the same workspace state.
+/// The four supplied fingerprints must be digests of resolved, non-secret settings.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SharedBackendIdentity {
+    source_dir: PathBuf,
+    cache_dir: PathBuf,
+    scope: [u8; 32],
+    config: [u8; 32],
+    platform: [u8; 32],
+    build: [u8; 32],
+}
+
+impl SharedBackendIdentity {
+    pub fn new(
+        source_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<PathBuf>,
+        scope: [u8; 32],
+        config: [u8; 32],
+        platform: [u8; 32],
+        build: [u8; 32],
+    ) -> Self {
+        let source_dir = source_dir.into();
+        let source_dir = std::fs::canonicalize(&source_dir).unwrap_or(source_dir);
+        let cache_dir = cache_dir.into();
+        let cache_dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
+        Self { source_dir, cache_dir, scope, config, platform, build }
+    }
+
+    /// Hash the running executable once, reading it incrementally.
+    pub fn current_exe_build_fingerprint() -> io::Result<[u8; 32]> {
+        let mut file = File::open(std::env::current_exe()?)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0; 64 * 1024];
+        loop {
+            let read = file.read(&mut buf)?;
+            if read == 0 {
+                return Ok(*hasher.finalize().as_bytes());
+            }
+            hasher.update(&buf[..read]);
+        }
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"bsl-shared-workspace-v1\0");
+        hasher.update(self.source_dir.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.cache_dir.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(&self.scope);
+        hasher.update(&self.config);
+        hasher.update(&self.platform);
+        hasher.update(&self.build);
+        hasher.update(&SHARED_PROTOCOL_VERSION.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    pub(crate) fn handshake_fingerprints(&self) -> [[u8; 32]; 4] {
+        [self.scope, self.config, self.platform, self.build]
+    }
+}
+
+/// New rendezvous namespace for the mixed LSP/MCP daemon.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SharedBackendKey {
+    identity: SharedBackendIdentity,
+}
+
+impl SharedBackendKey {
+    pub fn new(identity: SharedBackendIdentity) -> Self {
+        Self { identity }
+    }
+
+    pub fn digest(&self) -> String {
+        blake3::Hash::from_bytes(self.identity.digest()).to_hex()[..32].to_owned()
+    }
+
+    pub fn socket_path(&self) -> io::Result<PathBuf> {
+        let layout = runtime_socket_layout()?;
+        let path = layout.dir.join(format!("{}.sock", self.digest()));
+        validate_shared_runtime_output(&self.identity, &path)?;
+        prepare_runtime_socket_dir(&layout)?;
+        #[cfg(unix)]
+        if path.as_os_str().as_encoded_bytes().len() >= SUN_PATH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared broker socket exceeds sun_path capacity",
+            ));
+        }
+        Ok(path)
+    }
+
+    pub fn runtime_log_path(&self) -> io::Result<PathBuf> {
+        let layout = runtime_socket_layout()?;
+        let path = layout.dir.join(format!("shared-{}.log", self.digest()));
+        validate_shared_runtime_output(&self.identity, &path)?;
+        prepare_runtime_socket_dir(&layout)?;
+        Ok(path)
+    }
+
+    pub fn identity_fingerprint(&self) -> [u8; 32] {
+        self.identity.digest()
+    }
+
+    pub fn identity(&self) -> &SharedBackendIdentity {
+        &self.identity
+    }
+}
+
+fn validate_shared_runtime_output(identity: &SharedBackendIdentity, path: &Path) -> io::Result<()> {
+    let project = crate::project::at(&identity.source_dir)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Some(root) = crate::WorkspaceCacheLayout::overlapping_source_root(&project, path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "broker runtime endpoint {} overlaps workspace input root {}",
+                path.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Private wire version. It deliberately differs from the legacy raw-MCP endpoint.
+pub const SHARED_PROTOCOL_VERSION: u16 = 1;
+
+/// Stable opaque identifier for this daemon process, shared by adapter and owner markers.
+pub fn process_epoch() -> u64 {
+    static EPOCH: OnceLock<u64> = OnceLock::new();
+    *EPOCH.get_or_init(|| {
+        (SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64)
+            ^ (u64::from(std::process::id()) << 32)
+    })
 }
 
 fn validate_runtime_endpoint(project: &project_model::Project, path: &Path) -> io::Result<()> {
@@ -427,7 +568,11 @@ pub fn embedding_config_fingerprint_with_prefixes(prefixes: &crate::EmbeddingPre
         hasher.update(key.as_bytes());
         hasher.update(b"=");
         if let Ok(value) = std::env::var(key) {
-            hasher.update(value.as_bytes());
+            if key == "EMBEDDING_URL" {
+                hasher.update(embedding_endpoint_identity(&value).as_bytes());
+            } else {
+                hasher.update(value.as_bytes());
+            }
         }
         hasher.update(b"\0");
     }
@@ -471,6 +616,19 @@ pub const EMBEDDING_TOKENIZER_SHA256_ENV: &str = "BSL_MCP_EFFECTIVE_EMBEDDING_TO
 /// their respective project reads.
 pub const TOPOLOGY_FP_ENV: &str = "BSL_MCP_TOPOLOGY_FP";
 
+/// The part of an embedding endpoint that decides what an index means: the endpoint
+/// without its userinfo, plus the query, which can select an API version or a deployment.
+/// The credential travels in `EMBEDDING_API_KEY` as a header, so the query is not where a
+/// key belongs.
+fn embedding_endpoint_identity(url: &str) -> String {
+    let redacted = bsl_platform::redact_url(url);
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    match without_fragment.split_once('?') {
+        Some((_, query)) => format!("{redacted}?{query}"),
+        None => redacted,
+    }
+}
+
 /// Stable 64-bit identity of the project's extension topology at `source_dir`, for
 /// backend keying: a daemon whose graph/search/diagnostics caches were built for
 /// one dependency graph must not be reused by a client whose config now declares
@@ -508,6 +666,23 @@ pub fn backend_name(key: &BackendKey) -> io::Result<interprocess::local_socket::
         // directory is created, just as the Unix socket path does.
         let _ = key.runtime_log_path()?;
         format!("bsl-mcp-{}.sock", key.digest()).to_ns_name::<GenericNamespaced>()
+    }
+}
+
+/// Cross-platform rendezvous name for the mixed-protocol backend.
+pub fn shared_backend_name(
+    key: &SharedBackendKey,
+) -> io::Result<interprocess::local_socket::Name<'static>> {
+    #[cfg(unix)]
+    {
+        use interprocess::local_socket::{GenericFilePath, ToFsName};
+        key.socket_path()?.to_fs_name::<GenericFilePath>()
+    }
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+        let _ = key.runtime_log_path()?;
+        format!("bsl-shared-{}.sock", key.digest()).to_ns_name::<GenericNamespaced>()
     }
 }
 
@@ -652,6 +827,21 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
         assert!(!runtime.exists(), "the preflight must not create the overlapping path");
+    }
+
+    #[test]
+    fn embedding_endpoint_identity_keeps_the_query_and_drops_userinfo() {
+        let identity = embedding_endpoint_identity;
+        assert_ne!(
+            identity("https://h.example/v1/embeddings?api-version=2023-05-15"),
+            identity("https://h.example/v1/embeddings?api-version=2024-02-01"),
+            "a query that selects the API version is part of what an index means"
+        );
+        assert_eq!(
+            identity("https://user:one@h.example/v1/embeddings?model=a"),
+            identity("https://user:two@h.example/v1/embeddings?model=a#part"),
+            "userinfo and the fragment are not"
+        );
     }
 
     #[test]

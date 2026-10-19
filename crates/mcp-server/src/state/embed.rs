@@ -274,7 +274,7 @@ impl SharedState {
         semantic_runtime: Arc<Mutex<SemanticRuntimeStatus>>,
         index_progress: Arc<IndexProgress>,
         embed_flight: Arc<EmbedFlight>,
-        overlay_retry: Option<Arc<super::overlay_retry::OverlayRetry>>,
+        overlay_retry: Arc<Mutex<Option<Arc<super::overlay_retry::OverlayRetry>>>>,
         root_drift_epoch: Arc<AtomicU64>,
         embedding_prefixes: super::types::EmbeddingPrefixes,
         lease: crate::workspace_lease::WorkspaceLease,
@@ -322,7 +322,9 @@ impl SharedState {
                 );
             }
             if pending_overlay_embeddings {
-                if let Some(retry) = &overlay_retry {
+                if let Some(retry) =
+                    overlay_retry.lock().unwrap_or_else(|poison| poison.into_inner()).as_ref()
+                {
                     retry.kick_fresh();
                 }
             }
@@ -2297,7 +2299,7 @@ mod tests {
             Arc::clone(&semantic_runtime),
             Arc::clone(&progress),
             Arc::clone(&flight),
-            None,
+            Arc::new(Mutex::new(None)),
             Arc::new(AtomicU64::new(0)),
             super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -2585,7 +2587,7 @@ mod tests {
             Arc::new(Mutex::new(crate::state::SemanticRuntimeStatus::Disabled)),
             bsl_search::IndexProgress::new(),
             super::EmbedFlight::new(),
-            None,
+            Arc::new(Mutex::new(None)),
             Arc::new(AtomicU64::new(0)),
             super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -3181,7 +3183,7 @@ mod tests {
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
-            None,
+            Arc::new(Mutex::new(None)),
             Arc::new(AtomicU64::new(0)),
             super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),
@@ -3292,7 +3294,7 @@ mod tests {
             Arc::clone(&semantic_runtime),
             Arc::clone(&index_progress),
             Arc::clone(&embed_flight),
-            None,
+            Arc::new(Mutex::new(None)),
             Arc::new(AtomicU64::new(0)),
             super::super::types::EmbeddingPrefixes::default(),
             crate::workspace_lease::WorkspaceLease::unmanaged(),

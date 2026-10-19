@@ -2507,6 +2507,7 @@ dependencies = [
  "salsa",
  "serde_json",
  "tempfile",
+ "test-utils",
  "tracing",
  "vfs",
 ]
@@ -5029,6 +5030,7 @@ version = "0.3.2"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
+ "globset",
  "ignore",
  "itertools 0.12.1",
  "jod-thread",

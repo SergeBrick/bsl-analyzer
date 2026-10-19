@@ -154,15 +154,150 @@ pub fn main_loop(connection: Connection) -> Result<()> {
     Ok(())
 }
 
+/// Start an LSP session backed by an already-owned MCP workspace. The owner is
+/// responsible for disk loading and metadata; this session creates an editor
+/// storage only when the first admissible document opens.
+pub fn main_loop_shared(
+    connection: Connection,
+    workspace: mcp_server::WorkspaceHandle,
+) -> Result<()> {
+    crate::panic_watch::install();
+    let (initialize_id, initialize_value) =
+        connection.initialize_start().context("Failed to start initialization")?;
+    run_shared_initialized(connection, workspace, initialize_value, Some(initialize_id), 1, 0, None)
+}
+
+/// Resume a private proxy-rebound session without sending another `initialize`.
+pub fn main_loop_resumed(
+    connection: Connection,
+    workspace: mcp_server::WorkspaceHandle,
+    initialize_params: serde_json::Value,
+    announced_capabilities: Option<serde_json::Value>,
+    next_server_request_id: i32,
+    progress_generation: u64,
+) -> Result<()> {
+    crate::panic_watch::install();
+    run_shared_initialized(
+        connection,
+        workspace,
+        initialize_params,
+        None,
+        next_server_request_id,
+        progress_generation,
+        announced_capabilities,
+    )
+}
+
+fn run_shared_initialized(
+    connection: Connection,
+    workspace: mcp_server::WorkspaceHandle,
+    initialize_value: serde_json::Value,
+    initialize_id: Option<lsp_server::RequestId>,
+    next_server_request_id: i32,
+    progress_generation: u64,
+    announced_capabilities: Option<serde_json::Value>,
+) -> Result<()> {
+    let raw_capabilities = initialize_value.get("capabilities").cloned().unwrap_or_default();
+    let initialize_params: InitializeParams =
+        serde_json::from_value(initialize_value).context("Failed to parse InitializeParams")?;
+    let position_encoding = PositionEncoding::negotiate(&initialize_params.capabilities);
+    let workspace_root = extract_workspace_root(&initialize_params);
+    let early_config =
+        workspace_root.as_ref().and_then(|root| match project_model::ProjectConfig::load(root) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(%error, "project config unreadable; capabilities use defaults");
+                None
+            }
+        });
+    let help_root =
+        workspace_root.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+    platform_help::bootstrap(early_config.as_ref(), &help_root);
+    let diagnostics_scope =
+        early_config.map(|config| config.features.workspace_diagnostics).unwrap_or_default();
+    let pull_provider_announced =
+        announced_capabilities.as_ref().map_or(diagnostics_scope.is_enabled(), |capabilities| {
+            !capabilities["diagnosticProvider"].is_null()
+        });
+
+    if let Some(initialize_id) = initialize_id {
+        let result = lsp_types::InitializeResult {
+            capabilities: server_capabilities(position_encoding, diagnostics_scope),
+            server_info: Some(lsp_types::ServerInfo {
+                name: "bsl-analyzer".to_owned(),
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            }),
+        };
+        let mut value = serde_json::to_value(result)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "offsetEncoding".to_owned(),
+                serde_json::json!([position_encoding.as_offset_encoding()]),
+            );
+        }
+        connection
+            .initialize_finish(initialize_id, value)
+            .context("Failed to finish initialization")?;
+    }
+
+    let mut state = GlobalState::new_shared(connection.sender.clone(), workspace.clone());
+    state.next_request_id.store(next_server_request_id.max(1), std::sync::atomic::Ordering::SeqCst);
+    state.progress_generation = progress_generation;
+    state.position_encoding = position_encoding;
+    state.supports_insert_text_mode_adjust_indentation =
+        client_supports_insert_text_mode_adjust_indentation(&initialize_params.capabilities);
+    state.supports_code_description =
+        client_supports_code_description(&initialize_params.capabilities);
+    state.supports_diagnostic_tags =
+        crate::lsp::to_proto::ClientTags::from_capabilities(&initialize_params.capabilities);
+    state.supports_workspace_edit_document_changes =
+        client_supports_workspace_edit_document_changes(&initialize_params.capabilities);
+    state.folding_range_limit = client_folding_range_limit(&initialize_params.capabilities);
+    state.pull_diagnostics_active = pull_provider_announced
+        && client_supports_pull_diagnostics(&initialize_params.capabilities);
+    state.supports_workspace_diagnostic_refresh =
+        client_supports_workspace_diagnostic_refresh(&raw_capabilities);
+    state.supports_semantic_tokens_refresh =
+        client_supports_semantic_tokens_refresh(&initialize_params.capabilities);
+    state.init_empty_source_root();
+    state.lsp_locale = initialize_params.locale.as_deref().map(parse_lsp_locale);
+    state.workspace_root = workspace_root.clone();
+    state.vfs_done = matches!(
+        workspace.readiness(),
+        mcp_server::WorkspaceReadiness::Ready { .. }
+            | mcp_server::WorkspaceReadiness::Frozen { .. }
+    );
+    if let Some(root) = workspace_root {
+        if let mcp_server::WorkspaceRead::Ready(project) = workspace.project() {
+            state.adopt_shared_project(root, project);
+        }
+    } else {
+        tracing::warn!("No workspace root provided by client");
+        state.vfs_done = true;
+    }
+    if refresh_shared_readiness(&mut state) {
+        state.request_semantic_tokens_refresh();
+    }
+
+    let loop_result = run_event_loop(&mut state, &connection.receiver);
+    cancel_latency_requests_on_shutdown(&mut state);
+    loop_result?;
+    Ok(())
+}
+
 /// Requests may still own Analysis clones when the client disconnects. Cancel their
 /// tokens and drop all logical retry state before GlobalState goes away; no queued retry
 /// is admitted after the event loop has ended.
 fn cancel_latency_requests_on_shutdown(state: &mut GlobalState) {
+    if let Some(stop) = &state.shared_bridge_stop {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
     for (_, token) in state.request_tokens.drain() {
         token.cancel();
     }
     state.request_token_owners.clear();
     state.request_lifecycles.clear();
+    state.shared_request_stamps.clear();
     state.pending_latency_retries.clear();
     state.retry_dispatch = None;
 }
@@ -238,7 +373,7 @@ fn client_supports_workspace_diagnostic_refresh(raw_capabilities: &serde_json::V
         .any(|key| workspace[key]["refreshSupport"].as_bool().unwrap_or(false))
 }
 
-fn extract_workspace_root(params: &InitializeParams) -> Option<PathBuf> {
+pub fn extract_workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     #[allow(deprecated)]
     if let Some(ref root_uri) = params.root_uri {
         if let Ok(path) = root_uri.to_file_path() {
@@ -251,6 +386,193 @@ fn extract_workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
+mod shared_backend_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_and_adapter_choose_the_same_explicit_root() {
+        let root = tempfile::tempdir().unwrap();
+        let explicit = root.path().join("explicit");
+        let folder = root.path().join("folder");
+        let params: InitializeParams = serde_json::from_value(serde_json::json!({
+            "capabilities": {},
+            "rootUri": lsp_types::Url::from_file_path(&explicit).unwrap(),
+            "workspaceFolders": [{"uri": lsp_types::Url::from_file_path(folder).unwrap(), "name": "other"}],
+        })).unwrap();
+        assert_eq!(extract_workspace_root(&params), Some(explicit));
+        let unsupported: InitializeParams = serde_json::from_value(serde_json::json!({
+            "capabilities": {}, "rootUri": "untitled:workspace", "rootPath": root.path(),
+        }))
+        .unwrap();
+        assert_eq!(extract_workspace_root(&unsupported), None);
+    }
+
+    /// A shared view change retires the in-flight diagnostics of every open document, not
+    /// only of the one that was edited. The retired result is discarded as stale, so the
+    /// document whose work was in flight must be queued again or its last edit is never
+    /// published; a document whose diagnostics had already finished is left alone.
+    #[test]
+    fn a_shared_view_change_requeues_diagnostics_it_retired_in_flight() {
+        use crate::global_state::Task;
+        use salsa::Database as _;
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        let in_flight = crate::test_uri::file_uri("in_flight.bsl");
+        let finished = crate::test_uri::file_uri("finished.bsl");
+        state.mem_docs.insert(in_flight.clone(), "in flight".into(), 3);
+        state.mem_docs.insert(finished.clone(), "finished".into(), 5);
+        let token = state.analysis_host.raw_database().cancellation_token();
+        state.diagnostics_tokens.insert(in_flight.clone(), token.clone());
+        state.diagnostics_generation.insert(in_flight.clone(), 7);
+        state
+            .diagnostics_tokens
+            .insert(finished.clone(), state.analysis_host.raw_database().cancellation_token());
+        state.diagnostics_generation.insert(finished.clone(), 2);
+        handle_task(
+            &mut state,
+            Task::DiagnosticsReady {
+                uri: finished.clone(),
+                diagnostics: Vec::new(),
+                version: 5,
+                generation: 2,
+                completed_at: std::time::Instant::now(),
+            },
+        )
+        .unwrap();
+
+        state.mark_shared_view_changed();
+        handle_task(
+            &mut state,
+            Task::DiagnosticsCancelled {
+                uri: in_flight.clone(),
+                version: 3,
+                generation: 7,
+                kind: salsa::Cancelled::Local,
+                completed_at: std::time::Instant::now(),
+            },
+        )
+        .unwrap();
+
+        assert!(token.is_cancelled(), "the retired diagnostics kept running");
+        assert_eq!(
+            state.pending_diagnostics_uris,
+            vec![in_flight],
+            "only the document whose diagnostics were in flight is queued again"
+        );
+    }
+
+    /// A retry the client cancels while it waits in the queue never finishes, so nothing
+    /// else would drop the stamp its earlier attempt left behind.
+    #[test]
+    fn cancelling_a_queued_retry_drops_its_shared_stamp() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new(sender);
+        let id = lsp_server::RequestId::from(17);
+        state.request_lifecycles.insert(
+            id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 1,
+                method: "textDocument/hover".into(),
+                request: None,
+                attempt: 1,
+                phase: RequestLifecyclePhase::RetryQueued,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: None,
+                client_cancelled: false,
+            },
+        );
+        state.shared_request_stamps.insert(
+            id.clone(),
+            (0, salsa::plumbing::current_revision(state.analysis_host.raw_database())),
+        );
+
+        crate::handlers::notification::handle_cancel(
+            &mut state,
+            lsp_types::CancelParams { id: lsp_types::NumberOrString::Number(17) },
+        )
+        .unwrap();
+
+        assert!(!state.request_lifecycles.contains_key(&id));
+        assert!(state.shared_request_stamps.is_empty(), "the cancelled retry left its stamp");
+    }
+
+    #[test]
+    fn shared_stamp_rejects_a_success_from_an_old_view_and_preserves_client_cancel() {
+        for client_cancelled in [false, true] {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            let mut state = GlobalState::new(sender);
+            let id = lsp_server::RequestId::from(17);
+            let key = RequestAttemptKey { id: id.clone(), generation: 1, attempt: 1 };
+            state.request_lifecycles.insert(
+                id.clone(),
+                crate::global_state::RequestLifecycle {
+                    generation: 1,
+                    method: "textDocument/rename".into(),
+                    request: None,
+                    attempt: 1,
+                    phase: RequestLifecyclePhase::Running,
+                    retry_origin_revision: None,
+                    retry_eligible: false,
+                    origin: None,
+                    client_cancelled,
+                },
+            );
+            state.shared_request_stamps.insert(
+                id.clone(),
+                (0, salsa::plumbing::current_revision(state.analysis_host.raw_database())),
+            );
+            state.shared_request_generation = 1;
+            let outcome = LatencyAttemptOutcome::Response(Response::new_ok(
+                id.clone(),
+                serde_json::json!({"stale": true}),
+            ));
+            handle_latency_request_finished(&mut state, key.clone(), outcome).unwrap();
+            let Message::Response(response) = receiver.recv().unwrap() else {
+                panic!("expected response")
+            };
+            assert_eq!(
+                response.error.unwrap().code,
+                if client_cancelled {
+                    lsp_server::ErrorCode::RequestCanceled as i32
+                } else {
+                    lsp_server::ErrorCode::ContentModified as i32
+                }
+            );
+            assert!(state.shared_request_stamps.is_empty());
+            handle_latency_request_finished(
+                &mut state,
+                key,
+                LatencyAttemptOutcome::Response(Response::new_ok(id, serde_json::Value::Null)),
+            )
+            .unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+}
+
+fn hold_shared_test_gate(variable: &str) {
+    if std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_none() {
+        return;
+    }
+    let Some(gate) = std::env::var_os(variable).map(PathBuf::from) else { return };
+    if std::fs::create_dir_all(&gate).is_err() {
+        return;
+    }
+    let entered = gate.join("entered");
+    let Ok(_marker) = std::fs::OpenOptions::new().write(true).create_new(true).open(entered) else {
+        return;
+    };
+    let release = gate.join("release");
+    // Held until the test that set the gate releases it, however long that takes on the
+    // machine running it; a gate never released is a hang the test runner reports.
+    while !release.is_file() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Result<()> {
     loop {
         select! {
@@ -258,9 +580,6 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
                 state.note_loop_activity();
                 refresh_diagnostics_baseline(state);
                 handle_lsp_msg(state, msg?)?;
-                while let Ok(msg) = receiver.try_recv() {
-                    handle_lsp_msg(state, msg)?;
-                }
             }
 
             recv(&state.loader_receiver) -> msg => {
@@ -273,14 +592,23 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
                 state.note_loop_activity();
                 refresh_diagnostics_baseline(state);
                 handle_task(state, task?)?;
-                while let Ok(task) = state.task_pool.receiver.try_recv() {
-                    handle_task(state, task)?;
-                }
             }
 
             default(IDLE_TRIM_TICK) => {
                 handle_idle_tick(state);
             }
+        }
+
+        // Every wake services each ready source; a continuous request or task
+        // producer cannot starve the other source or the disk writer.
+        for task in state.task_pool.receiver.clone().try_iter().take(16) {
+            handle_task(state, task)?;
+        }
+        if let Ok(message) = state.loader_receiver.try_recv() {
+            handle_loader_msg(state, message)?;
+        }
+        for message in receiver.try_iter().take(16) {
+            handle_lsp_msg(state, message)?;
         }
 
         if state.shutdown_requested {
@@ -289,6 +617,10 @@ fn run_event_loop(state: &mut GlobalState, receiver: &Receiver<Message>) -> Resu
         }
 
         admit_pending_latency_retries(state)?;
+        state.schedule_shared_seed();
+        if state.shared_seed_running {
+            hold_shared_test_gate("BSL_TEST_SHARED_LSP_EVENT_GATE");
+        }
 
         // The capacity gate keeps this from spinning: a schedule that finds the
         // pool still saturated would requeue the same URI, and the loop only
@@ -636,7 +968,23 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
             for (path, contents) in &files {
                 let path: &std::path::Path = path.as_ref();
                 if contents.is_none() && !path.exists() && project_model::is_bsl_source_path(path) {
+                    let file_id = state.vfs.read().file_id(&vfs::VfsPath::new(path.to_path_buf()));
+                    let mut invalidated_uris: Vec<_> = file_id
+                        .into_iter()
+                        .flat_map(|file_id| {
+                            state
+                                .open_file_uri_ids
+                                .iter()
+                                .filter(move |&(_, &open_file_id)| open_file_id == file_id)
+                                .map(|(uri, _)| uri.clone())
+                        })
+                        .collect();
                     if let Ok(uri) = lsp_types::Url::from_file_path(path) {
+                        invalidated_uris.push(uri);
+                    }
+                    invalidated_uris.sort_unstable();
+                    invalidated_uris.dedup();
+                    for uri in invalidated_uris {
                         state.mem_docs.invalidate_identity(&uri);
                     }
                 }
@@ -751,16 +1099,182 @@ fn invalidate_diagnostics(state: &mut GlobalState, uris: &[lsp_types::Url]) {
     }
 }
 
+fn refresh_shared_readiness(state: &mut GlobalState) -> bool {
+    let first_ready_generation = state.shared_owner_generation.is_none();
+    let readiness = state.analysis_host.owner().map(|owner| owner.readiness());
+    match readiness {
+        Some(mcp_server::WorkspaceReadiness::Ready { generation }) => {
+            state.shared_configuration_error = None;
+            if state.shared_owner_generation != Some(generation) {
+                state.shared_owner_generation = Some(generation);
+                state.mark_shared_view_changed();
+            }
+            if let Some(view) = state.analysis_host.view() {
+                state.shared_seed_queued =
+                    !(state.shared_view_seeded && view.generation() == generation);
+            }
+            state.vfs_done = state.open_files.is_empty() || state.shared_view_seeded;
+        }
+        Some(mcp_server::WorkspaceReadiness::Frozen { generation, error }) => {
+            if state.shared_configuration_error.as_ref() != Some(&error) {
+                state.show_error_message(error.clone());
+                state.shared_configuration_error = Some(error);
+            }
+            state.shared_owner_generation = Some(generation);
+            state.shared_seed_queued = state.analysis_host.view().is_some()
+                && (!state.shared_view_seeded
+                    || state
+                        .analysis_host
+                        .view()
+                        .is_some_and(|view| view.generation() != generation));
+            state.vfs_done = state.open_files.is_empty() || state.shared_view_seeded;
+        }
+        Some(mcp_server::WorkspaceReadiness::RejectedScope(message)) => {
+            if !state.project_rejected {
+                state.show_error_message(message);
+            }
+            state.project_rejected = true;
+            state.vfs_done = false;
+            state.shared_seed_queued = false;
+        }
+        Some(mcp_server::WorkspaceReadiness::Failed(message)) => {
+            state.show_error_message(message);
+            state.vfs_done = false;
+            state.shared_seed_queued = false;
+        }
+        _ => state.vfs_done = false,
+    }
+    first_ready_generation && state.vfs_done && state.shared_owner_generation.is_some()
+}
+
+/// Adopt the project the owner accepted, and bring the open documents in line with its
+/// exclusions: the ones it now covers leave the view, the ones it no longer covers return.
+fn apply_shared_project(
+    state: &mut GlobalState,
+    root: std::path::PathBuf,
+    project: project_model::Project,
+) {
+    state.adopt_shared_project(root, project);
+    let excluded: Vec<_> = state
+        .opened_document_uris()
+        .into_iter()
+        .filter(|uri| crate::handlers::notification::is_excluded_document(state, uri))
+        .collect();
+    for uri in excluded {
+        if let Ok(file_id) = crate::lsp::file_id(state, &uri) {
+            if let Some(view) = state.analysis_host.view_mut() {
+                view.close(file_id);
+            }
+            state.open_files.remove(&file_id);
+        }
+        crate::handlers::notification::withdraw_document_diagnostics(state, &uri);
+    }
+    readmit_shared_documents(state);
+    if state.open_files.is_empty() {
+        state.analysis_host.take_view();
+        state.shared_view_epoch = state.shared_view_epoch.wrapping_add(1);
+    }
+}
+
+/// Put back into the view the open documents the exclusions no longer cover, with the
+/// editor's buffer as their text: one taken out by an earlier exclusion and one opened while
+/// it was in force alike. Only didOpen otherwise puts a document into the view.
+fn readmit_shared_documents(state: &mut GlobalState) {
+    for uri in state.opened_document_uris() {
+        if crate::handlers::notification::is_excluded_document(state, &uri) {
+            continue;
+        }
+        if state.open_file_uri_ids.get(&uri).is_some_and(|id| state.open_files.contains(id)) {
+            continue;
+        }
+        let Some(text) = state.mem_docs.get(&uri) else { continue };
+        match state.vfs_file_for_url(&uri) {
+            Ok(file_id) => {
+                crate::handlers::notification::open_shared_document(state, &uri, file_id, &text)
+            }
+            Err(error) => {
+                tracing::warn!(%uri, %error, "cannot readmit a no longer excluded document")
+            }
+        }
+    }
+}
+
 pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Task) -> Result<()> {
     use crate::global_state::Task;
 
     match task {
-        Task::DiagnosticsReady { uri, diagnostics, generation, completed_at } => {
+        Task::SharedWorkspaceChanged { generation } => {
+            state.shared_generation_pending.store(false, std::sync::atomic::Ordering::Release);
+            tracing::debug!(generation, "shared disk workspace generation changed");
+            if let (Some(owner), Some(root)) =
+                (state.analysis_host.owner().cloned(), state.workspace_root.clone())
+            {
+                if let mcp_server::WorkspaceRead::Ready(project) = owner.project() {
+                    apply_shared_project(state, root, project);
+                }
+            }
+            let changed = state.analysis_host.catch_up();
+            if changed {
+                state.shared_view_seeded = true;
+            }
+            let first_ready_generation = refresh_shared_readiness(state);
+            if changed && state.vfs_done {
+                crate::handlers::notification::refresh_after_shared_catch_up(state);
+            } else if first_ready_generation {
+                state.request_semantic_tokens_refresh();
+            }
+        }
+        Task::SharedWorkspaceSeedReady { epoch } => {
+            state.shared_seed_running = false;
+            let prepared = {
+                state
+                    .shared_seed_snapshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
+            if epoch == state.shared_view_epoch && !state.open_files.is_empty() {
+                if let Some((prepared_epoch, view)) = prepared {
+                    if prepared_epoch == epoch {
+                        state.analysis_host.request_cancellation();
+                        if let Some(current) = state.analysis_host.view_mut() {
+                            if current.replace_from_prepared(view) {
+                                state.shared_view_seeded = true;
+                                state.mark_shared_view_changed();
+                                if std::env::var_os("BSL_SHARED_BACKEND_MARKERS").is_some() {
+                                    tracing::info!(
+                                        target: "bsl_analyzer::shared_backend",
+                                        event = "lsp_editor_view_seed_published",
+                                        epoch,
+                                        "shared LSP editor view seed published"
+                                    );
+                                }
+                            }
+                        }
+                        state.update_diagnostics_config();
+                        state.update_features_config();
+                    }
+                }
+                state.analysis_host.catch_up();
+                refresh_shared_readiness(state);
+                if state.vfs_done {
+                    for uri in state.opened_document_uris() {
+                        crate::handlers::schedule_diagnostics(state, &uri);
+                    }
+                    state.request_semantic_tokens_refresh();
+                }
+            }
+        }
+        Task::DiagnosticsReady { uri, diagnostics, version, generation, completed_at } => {
             let current = state.diagnostics_generation.get(&uri).copied().unwrap_or(0);
+            // The latest schedule has finished, so its token no longer marks work in flight.
+            if generation == current {
+                state.diagnostics_tokens.remove(&uri);
+            }
             // Publish only the latest schedule for this uri (`== current`) and only
             // while it is still open — a result that finished after the document was
             // closed must not be published for a closed file.
-            if generation == current && state.mem_docs.contains(&uri) {
+            if generation == current && state.mem_docs.get_version(&uri) == Some(version) {
                 let publish_delay_ms = completed_at.elapsed().as_millis() as u64;
                 let diagnostic_count = diagnostics.len();
                 let allocated_mb = profile::memory_usage().allocated.megabytes();
@@ -772,8 +1286,11 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                     allocated_mb,
                     "publishing diagnostics",
                 );
-                let params =
-                    lsp_types::PublishDiagnosticsParams { uri, diagnostics, version: None };
+                let params = lsp_types::PublishDiagnosticsParams {
+                    uri,
+                    diagnostics,
+                    version: Some(version),
+                };
                 let notification =
                     Notification::new("textDocument/publishDiagnostics".to_string(), params);
                 state.sender.send(notification.into())?;
@@ -781,12 +1298,23 @@ pub(crate) fn handle_task(state: &mut GlobalState, task: crate::global_state::Ta
                 tracing::debug!(generation, current, "discarding stale diagnostics");
             }
         }
-        Task::DiagnosticsCancelled { generation, completed_at } => {
+        Task::DiagnosticsCancelled { uri, version, generation, kind, completed_at } => {
             tracing::debug!(
                 generation,
+                ?kind,
                 publish_delay_ms = completed_at.elapsed().as_millis() as u64,
                 "diagnostics cancelled",
             );
+            if state.diagnostics_generation.get(&uri) == Some(&generation) {
+                state.diagnostics_tokens.remove(&uri);
+            }
+            // Batch LRU writes can cancel the latest open-buffer diagnostics too.
+            if matches!(kind, salsa::Cancelled::PendingWrite | salsa::Cancelled::Local)
+                && state.diagnostics_generation.get(&uri) == Some(&generation)
+                && state.mem_docs.get_version(&uri) == Some(version)
+            {
+                state.enqueue_pending_diagnostics(uri);
+            }
         }
         Task::DependenciesPreloaded { file_id, count } => {
             tracing::debug!(file_id = file_id.0, count, "dependencies preloaded");
@@ -920,7 +1448,7 @@ const MAX_LATENCY_ATTEMPTS: u8 = 3;
 fn handle_latency_request_finished(
     state: &mut GlobalState,
     key: RequestAttemptKey,
-    outcome: LatencyAttemptOutcome,
+    mut outcome: LatencyAttemptOutcome,
 ) -> Result<()> {
     let Some(lifecycle) = state.request_lifecycles.get(&key.id) else {
         tracing::debug!(request_id = ?key.id, generation = key.generation, attempt = key.attempt, "discarding completion without a live request");
@@ -959,6 +1487,17 @@ fn handle_latency_request_finished(
         return Ok(());
     }
 
+    if matches!(&outcome, LatencyAttemptOutcome::Response(response) if response.error.is_none()) {
+        if let Some(&(generation, revision)) = state.shared_request_stamps.get(&key.id) {
+            if generation != state.shared_request_generation {
+                outcome = LatencyAttemptOutcome::Cancelled {
+                    kind: salsa::Cancelled::PendingWrite,
+                    revision,
+                };
+            }
+        }
+    }
+
     let response = match outcome {
         LatencyAttemptOutcome::Response(response) => response,
         LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::Local, .. } => {
@@ -969,8 +1508,7 @@ fn handle_latency_request_finished(
             )
         }
         LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::PendingWrite, revision } => {
-            let current_revision =
-                salsa::plumbing::current_revision(state.analysis_host.raw_database());
+            let current_revision = state.analysis_host.request_revision();
             match queue_latency_retry(
                 state,
                 &key,
@@ -988,40 +1526,32 @@ fn handle_latency_request_finished(
                 ),
             }
         }
+        LatencyAttemptOutcome::Panicked { revision } => {
+            tracing::error!(request_id = ?key.id, method, attempt = key.attempt,
+                revision = ?revision, "propagated LSP unwind followed a real panic");
+            Response::new_err(
+                key.id.clone(),
+                lsp_server::ErrorCode::InternalError as i32,
+                "internal handler panic".to_string(),
+            )
+        }
         LatencyAttemptOutcome::Cancelled { kind: salsa::Cancelled::PropagatedPanic, revision } => {
-            let current_revision =
-                salsa::plumbing::current_revision(state.analysis_host.raw_database());
-            if crate::panic_watch::panicked_in(revision) {
-                tracing::error!(
-                    request_id = ?key.id,
-                    method,
-                    attempt = key.attempt,
-                    revision = ?revision,
-                    current_revision = ?current_revision,
-                    "propagated LSP unwind followed a real panic"
-                );
-                Response::new_err(
+            let current_revision = state.analysis_host.request_revision();
+            match queue_latency_retry(
+                state,
+                &key,
+                &method,
+                "propagated-after-write",
+                revision,
+                current_revision,
+                true,
+            ) {
+                RetryQueueResult::Queued => return Ok(()),
+                RetryQueueResult::Refused(refusal) => Response::new_err(
                     key.id.clone(),
-                    lsp_server::ErrorCode::InternalError as i32,
-                    "internal handler panic".to_string(),
-                )
-            } else {
-                match queue_latency_retry(
-                    state,
-                    &key,
-                    &method,
-                    "propagated-after-write",
-                    revision,
-                    current_revision,
-                    true,
-                ) {
-                    RetryQueueResult::Queued => return Ok(()),
-                    RetryQueueResult::Refused(refusal) => Response::new_err(
-                        key.id.clone(),
-                        lsp_server::ErrorCode::ContentModified as i32,
-                        refusal.message().to_string(),
-                    ),
-                }
+                    lsp_server::ErrorCode::ContentModified as i32,
+                    refusal.message().to_string(),
+                ),
             }
         }
         LatencyAttemptOutcome::Cancelled { .. } => Response::new_err(
@@ -1038,16 +1568,29 @@ fn request_origin_matches(
     state: &GlobalState,
     origin: &crate::global_state::RequestOriginGuard,
 ) -> bool {
-    let Ok(path) = origin.uri.to_file_path() else {
+    let Ok(uri_path) = origin.uri.to_file_path() else {
         return false;
     };
     let Some(project) = state.project.as_ref() else {
         return false;
     };
     let current_source_roots = project.source_roots();
+    let open_file_path = state
+        .open_file_uri_ids
+        .get(&origin.uri)
+        .filter(|file_id| state.open_files.contains(file_id))
+        .and_then(|file_id| {
+            let vfs = state.vfs.read();
+            (file_id.0 < vfs.num_file_ids())
+                .then(|| vfs.file_path(*file_id).as_path().to_path_buf())
+        });
+    let path =
+        crate::workspace::canonicalize_shared_path(open_file_path.as_deref().unwrap_or(&uri_path));
     let source_eligible = project_model::is_bsl_source_path(&path)
-        && current_source_roots.iter().any(|root| path.starts_with(root))
-        && !project.is_source_excluded(&path);
+        && current_source_roots
+            .iter()
+            .any(|root| path.starts_with(crate::workspace::canonicalize_shared_path(root)))
+        && !project.is_source_excluded(&uri_path);
     state.mem_docs.identity(&origin.uri) == Some(origin.identity)
         && state.workspace_root == origin.workspace_root
         && current_source_roots == origin.source_roots
@@ -1178,6 +1721,7 @@ fn finish_latency_request(state: &mut GlobalState, key: &RequestAttemptKey, resp
         .pending_latency_retries
         .retain(|pending| pending.id != key.id || pending.generation != key.generation);
     state.request_lifecycles.remove(&key.id);
+    state.shared_request_stamps.remove(&key.id);
     if state
         .request_token_owners
         .get(&key.id)
@@ -1382,7 +1926,6 @@ fn advance_workspace_batch(state: &mut GlobalState) -> Result<()> {
         // and OOMs (the budget upstream decides *whether* memory needs releasing; this
         // block is *how*). Also release the parser's thread-local green-node cache on
         // this thread (the worker released its own before returning).
-        let db = state.analysis_host.raw_database_mut();
         if finished {
             // Deep final trim: the sweep's parse trees and lowered bodies are pure
             // batch working set nothing will read again, so this leaves a lean
@@ -1391,9 +1934,9 @@ fn advance_workspace_batch(state: &mut GlobalState) -> Result<()> {
             // running the whole sweep on the shrunk profile was measured to cost
             // several percent of wall time (each trim evicts hot shared parses that
             // the next chunk re-derives) for only a marginal peak reduction.
-            ide::sweep_lru_deep(db);
+            state.analysis_host.enforce_lru(true);
         } else {
-            db.enforce_lru();
+            state.analysis_host.enforce_lru(false);
         }
         syntax::clear_shared_node_cache();
     }
@@ -1484,7 +2027,10 @@ fn apply_workspace_batch_chunk(
         // Handoff: a file opened mid-batch is served live by the interactive stream.
         // Skipping here (and never recording it) keeps the two streams from
         // double-reporting; `handle_did_open` already cleared any earlier batch push.
-        if state.mem_docs.contains(&item.uri) {
+        let opened_file_id = crate::lsp::file_id(state, &item.uri).ok();
+        if state.mem_docs.contains(&item.uri)
+            || opened_file_id.is_some_and(|file_id| state.open_files.contains(&file_id))
+        {
             continue;
         }
 
@@ -1505,10 +2051,17 @@ fn apply_workspace_batch_chunk(
         }
 
         // Diff-push: republish only when the diagnostics hash moved since the last batch.
-        if state.batch_pushed.get(&item.uri) == Some(&item.result_id) {
+        if state
+            .batch_pushed
+            .get(&item.uri)
+            .is_some_and(|pushed| pushed.result_id == item.result_id)
+        {
             continue;
         }
-        state.batch_pushed.insert(item.uri.clone(), item.result_id);
+        state.batch_pushed.insert(
+            item.uri.clone(),
+            crate::global_state::BatchPush { result_id: item.result_id, file_id: opened_file_id },
+        );
         let params = lsp_types::PublishDiagnosticsParams {
             uri: item.uri,
             diagnostics: item.diagnostics,
@@ -5089,6 +5642,143 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn g1_origin_guard_queues_retry_for_open_case_alias_after_external_delete() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::write(canonical_root.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .unwrap();
+        let canonical_file = canonical_root.join("Caller.bsl");
+        std::fs::write(&canonical_file, "Процедура X() КонецПроцедуры").unwrap();
+        let alias_path = PathBuf::from(
+            root.path()
+                .to_string_lossy()
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_lowercase() {
+                        ch.to_ascii_uppercase()
+                    } else if ch.is_ascii_uppercase() {
+                        ch.to_ascii_lowercase()
+                    } else {
+                        ch
+                    }
+                })
+                .collect::<String>(),
+        )
+        .join("cALLER.BSL");
+        assert!(alias_path.is_file(), "case-alias path must resolve on Windows");
+        let uri = lsp_types::Url::from_file_path(&alias_path).unwrap();
+
+        state.workspace_root = Some(canonical_root.clone());
+        state.project = Some(project_model::Project::new(&canonical_root).unwrap());
+        let source_roots = state.project.as_ref().unwrap().source_roots();
+        assert!(source_roots.iter().any(|source_root| {
+            crate::workspace::canonicalize_shared_path(source_root) == canonical_root
+        }));
+        let raw_alias_path = uri.to_file_path().unwrap();
+        assert!(
+            !source_roots.iter().any(|source_root| raw_alias_path.starts_with(source_root)),
+            "the raw Windows URI must not already match the canonical project root"
+        );
+
+        let vfs_path = vfs::VfsPath::new(canonical_file.clone());
+        state.vfs.write().set_file_contents(
+            vfs_path.clone(),
+            Some(std::sync::Arc::from("Процедура X() КонецПроцедуры")),
+        );
+        let file_id = state.vfs.read().file_id(&vfs_path).unwrap();
+        state.open_files.insert(file_id);
+        state.open_file_uri_ids.insert(uri.clone(), file_id);
+        state.mem_docs.insert(uri.clone(), "Процедура X() КонецПроцедуры".to_owned(), 1);
+        let identity = state.mem_docs.identity(&uri).unwrap();
+        let capture_origin =
+            |state: &crate::global_state::GlobalState| crate::global_state::RequestOriginGuard {
+                uri: uri.clone(),
+                identity: state.mem_docs.identity(&uri).unwrap(),
+                workspace_root: state.workspace_root.clone(),
+                source_roots: state.project.as_ref().unwrap().source_roots(),
+            };
+        let initial_origin = capture_origin(&state);
+        assert!(request_origin_matches(&state, &initial_origin));
+        std::fs::write(canonical_root.join("bsl-analyzer.toml"), "[source\n").unwrap();
+        assert!(!state.reload_project_config(), "invalid config must keep the last-good Project");
+        assert_eq!(state.project.as_ref().unwrap().source_roots(), source_roots);
+        assert!(request_origin_matches(&state, &initial_origin));
+        let canonical_uri = lsp_types::Url::from_file_path(&canonical_file).unwrap();
+        assert_ne!(uri, canonical_uri, "the alias must retain a distinct raw URI");
+        std::fs::remove_file(&canonical_file).unwrap();
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::Changed {
+                files: vec![(paths::AbsPathBuf::assert_utf8(canonical_file), None)],
+            },
+        )
+        .unwrap();
+        assert_eq!(state.open_file_uri_ids.get(&uri), Some(&file_id));
+        assert!(state.open_files.contains(&file_id));
+        assert_ne!(state.mem_docs.identity(&uri), Some(identity));
+        assert_eq!(state.mem_docs.get(&uri).as_deref(), Some("Процедура X() КонецПроцедуры"));
+        assert!(
+            !request_origin_matches(&state, &initial_origin),
+            "deleting the underlying FileId invalidates origins for every open URI alias"
+        );
+
+        let origin = capture_origin(&state);
+        assert!(request_origin_matches(&state, &origin));
+
+        let request_id = lsp_server::RequestId::from(907);
+        let request = g1_json_request(
+            907,
+            lsp_types::request::HoverRequest::METHOD,
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        );
+        let key = crate::global_state::RequestAttemptKey {
+            id: request_id.clone(),
+            generation: 1,
+            attempt: 1,
+        };
+        state.request_lifecycles.insert(
+            request_id.clone(),
+            crate::global_state::RequestLifecycle {
+                generation: 1,
+                method: lsp_types::request::HoverRequest::METHOD.to_owned(),
+                request: Some(request),
+                attempt: 1,
+                phase: RequestLifecyclePhase::Running,
+                retry_origin_revision: None,
+                retry_eligible: true,
+                origin: Some(origin),
+                client_cancelled: false,
+            },
+        );
+        let revision = salsa::plumbing::current_revision(state.analysis_host.raw_database());
+        assert_eq!(
+            queue_latency_retry(
+                &mut state,
+                &key,
+                lsp_types::request::HoverRequest::METHOD,
+                "pending-write",
+                revision,
+                revision,
+                false,
+            ),
+            RetryQueueResult::Queued,
+            "the unchanged admitted alias origin permits the automatic retry"
+        );
+        assert_eq!(
+            state.pending_latency_retries.front(),
+            Some(&crate::global_state::RequestAttemptKey { attempt: 2, ..key })
+        );
+    }
+
     #[test]
     fn baseline_reload_invalidates_diagnostics_before_pool_scheduling() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
@@ -5472,6 +6162,7 @@ mod tests {
         let task = crate::global_state::Task::DiagnosticsReady {
             uri,
             diagnostics: Vec::new(),
+            version: 1,
             generation: 1,
             completed_at: std::time::Instant::now(),
         };
@@ -5482,6 +6173,78 @@ mod tests {
             receiver.try_recv().is_err(),
             "diagnostics for a closed document must not be published"
         );
+    }
+
+    #[test]
+    fn diagnostics_cancelled_by_writer_requeue_only_current_open_version() {
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let uri = crate::test_uri::file_uri("cancelled.bsl");
+        state.mem_docs.insert(uri.clone(), "new".into(), 42);
+        state.diagnostics_generation.insert(uri.clone(), 7);
+        let task = |version, generation, kind| Task::DiagnosticsCancelled {
+            uri: uri.clone(),
+            version,
+            generation,
+            kind,
+            completed_at: std::time::Instant::now(),
+        };
+        handle_task(&mut state, task(42, 7, salsa::Cancelled::PendingWrite)).unwrap();
+        assert_eq!(std::mem::take(&mut state.pending_diagnostics_uris), vec![uri.clone()]);
+        for cancelled in [
+            task(17, 7, salsa::Cancelled::PendingWrite),
+            task(42, 6, salsa::Cancelled::Local),
+            task(42, 7, salsa::Cancelled::PropagatedPanic),
+        ] {
+            handle_task(&mut state, cancelled).unwrap();
+            assert!(
+                state.pending_diagnostics_uris.is_empty(),
+                "stale/panicked work is not retried"
+            );
+        }
+        state.mem_docs.remove(&uri);
+        handle_task(&mut state, task(42, 7, salsa::Cancelled::PendingWrite)).unwrap();
+        assert!(state.pending_diagnostics_uris.is_empty(), "closed documents are not retried");
+    }
+
+    #[test]
+    fn diagnostics_keep_wire_version_and_reject_results_from_before_an_edit() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        let uri = crate::test_uri::file_uri("changed.bsl");
+        state.mem_docs.insert(uri.clone(), "old".into(), 17);
+        state.diagnostics_generation.insert(uri.clone(), 1);
+        state
+            .mem_docs
+            .update_versioned(
+                &uri,
+                vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "new".into(),
+                }],
+                crate::lsp::PositionEncoding::Utf16,
+                42,
+            )
+            .unwrap();
+
+        let task = |version| crate::global_state::Task::DiagnosticsReady {
+            uri: uri.clone(),
+            diagnostics: Vec::new(),
+            version,
+            generation: 1,
+            completed_at: std::time::Instant::now(),
+        };
+        handle_task(&mut state, task(17)).unwrap();
+        assert!(receiver.try_recv().is_err(), "a queued older result must not publish");
+        handle_task(&mut state, task(42)).unwrap();
+        let Message::Notification(message) = receiver.try_recv().unwrap() else {
+            panic!("expected publishDiagnostics")
+        };
+        let params: lsp_types::PublishDiagnosticsParams =
+            serde_json::from_value(message.params).unwrap();
+        assert_eq!(params.version, Some(42));
+        assert_eq!(params.uri, uri);
     }
 
     #[test]
@@ -5651,7 +6414,10 @@ mod tests {
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
         handle_task(&mut state, chunk).unwrap();
         assert_eq!(recv_publish(&receiver), (uri.clone(), 1));
-        assert_eq!(state.batch_pushed.get(&uri).map(String::as_str), Some("h1"));
+        assert_eq!(
+            state.batch_pushed.get(&uri).map(|pushed| pushed.result_id.as_str()),
+            Some("h1")
+        );
 
         // Same hash again: diff-push skips the republish.
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h1", vec![dummy_diagnostic()])]);
@@ -5665,7 +6431,10 @@ mod tests {
         );
         handle_task(&mut state, chunk).unwrap();
         assert_eq!(recv_publish(&receiver), (uri.clone(), 2));
-        assert_eq!(state.batch_pushed.get(&uri).map(String::as_str), Some("h2"));
+        assert_eq!(
+            state.batch_pushed.get(&uri).map(|pushed| pushed.result_id.as_str()),
+            Some("h2")
+        );
     }
 
     #[test]
@@ -5703,8 +6472,14 @@ mod tests {
         let kept = crate::test_uri::file_uri("kept.bsl");
 
         // Two files were pushed by an earlier sweep.
-        state.batch_pushed.insert(gone.clone(), "h1".to_string());
-        state.batch_pushed.insert(kept.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            gone.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
+        state.batch_pushed.insert(
+            kept.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
 
         // The final (only) chunk reports just `kept` (unchanged hash → no republish);
         // reaching the cursor end reconciles: `gone`, never reported, is cleared.
@@ -5723,7 +6498,10 @@ mod tests {
         let mut state = crate::global_state::GlobalState::new(sender);
         install_test_plan(&mut state, 5);
         let uri = crate::test_uri::file_uri("a.bsl");
-        state.batch_pushed.insert(uri.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
 
         // A cancelled chunk (a concurrent edit cancelled it) reported nothing: it must
         // NOT clear the pushed file, must keep the plan, and must NOT advance the cursor
@@ -5753,7 +6531,10 @@ mod tests {
         let uri = crate::test_uri::file_uri("a.bsl");
 
         // Prime a pushed file, then re-report it clean: one empty publish clears it.
-        state.batch_pushed.insert(uri.clone(), "h1".to_string());
+        state.batch_pushed.insert(
+            uri.clone(),
+            crate::global_state::BatchPush { result_id: "h1".to_string(), file_id: None },
+        );
         let chunk = current_chunk(&state, vec![batch_item(&uri, "h0", vec![])]);
         handle_task(&mut state, chunk).unwrap();
         assert_eq!(
@@ -6052,5 +6833,242 @@ mod tests {
         let chunk = current_chunk(&state, vec![]);
         handle_task(&mut state, chunk).unwrap();
         assert!(state.workspace_batch_plan.is_none(), "the sweep must finalize on the last chunk");
+    }
+
+    /// Lifting `[source].exclude` while a document stays open puts the editor's buffer
+    /// back into the view, both for a document open before the exclusion and for one
+    /// opened while it was in force: edits made after that reach analysis. Each config
+    /// edit is applied the way a shared workspace change applies the project the owner
+    /// accepted, with the project read straight from the edited file.
+    #[test]
+    fn shared_reload_readmits_open_documents_the_exclusion_no_longer_covers() {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        let config = root.path().join("bsl-analyzer.toml");
+        std::fs::write(&config, "[source]\nroot = \".\"\n").expect("write project config");
+        let hidden = root.path().join("Hidden");
+        std::fs::create_dir(&hidden).expect("create the directory to exclude");
+        let before = hidden.join("Before.bsl");
+        let during = hidden.join("During.bsl");
+        std::fs::write(&before, "Процедура ДискДо() КонецПроцедуры\n").expect("write source");
+        std::fs::write(&during, "Процедура ДискВо() КонецПроцедуры\n").expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        state.vfs_done = true;
+        let edit_config = |state: &mut GlobalState, text: &str| {
+            std::fs::write(&config, text).expect("write project config");
+            let project = mcp_server::project::at(root.path()).expect("load the edited project");
+            apply_shared_project(state, root.path().to_path_buf(), project);
+        };
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
+            let uri = lsp_types::Url::from_file_path(path).unwrap();
+            crate::handlers::notification::handle_did_open(
+                state,
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "bsl".to_owned(),
+                        version: 1,
+                        text: text.to_owned(),
+                    },
+                },
+            )
+            .expect("open the document");
+            uri
+        };
+        let before_buffer = "Процедура БуферДо() КонецПроцедуры\n";
+        let during_buffer = "Процедура БуферВо() КонецПроцедуры\n";
+        let before_uri = open(&mut state, &before, before_buffer);
+        let before_id = crate::lsp::file_id(&state, &before_uri).expect("resolve the open URI");
+        assert!(state.open_files.contains(&before_id));
+
+        edit_config(&mut state, "[source]\nroot = \".\"\nexclude = [\"Hidden\"]\n");
+        assert!(!state.open_files.contains(&before_id), "the exclusion takes the document out");
+        let during_uri = open(&mut state, &during, during_buffer);
+
+        edit_config(&mut state, "[source]\nroot = \".\"\n");
+
+        for (uri, buffer) in [(&before_uri, before_buffer), (&during_uri, during_buffer)] {
+            let file_id = crate::lsp::file_id(&state, uri).expect("resolve the readmitted URI");
+            assert!(state.open_files.contains(&file_id), "{uri} is open again");
+            let analysis = state.analysis_host.view().expect("open editor view").analysis();
+            assert_eq!(&*analysis.file_text(file_id), buffer, "{uri} is analysed from its buffer");
+        }
+
+        let edited = "Процедура Правка() КонецПроцедуры\n";
+        crate::handlers::notification::handle_did_change(
+            &mut state,
+            lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    uri: before_uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: edited.to_owned(),
+                }],
+            },
+        )
+        .expect("edit the readmitted document");
+        let analysis = state.analysis_host.view().expect("open editor view").analysis();
+        assert_eq!(&*analysis.file_text(before_id), edited, "a later edit reaches analysis");
+        drop(analysis);
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    /// Saving or closing a document catches the view up with whatever the owner
+    /// published since the last workspace change, so the `SharedWorkspaceChanged` queued
+    /// for that publication later finds the view current. The other open documents must
+    /// be rescheduled by the event that applied it: the input is an owner publication
+    /// from a closed file that lands before the event on an unrelated open document,
+    /// with no diagnostics in flight.
+    fn assert_owner_publication_reschedules_open_documents(
+        apply: impl FnOnce(&mut GlobalState, lsp_types::Url),
+    ) {
+        let root = tempfile::tempdir().expect("create shared workspace");
+        std::fs::write(root.path().join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n")
+            .expect("write project config");
+        let closed = root.path().join("Closed.bsl");
+        std::fs::write(&closed, "Процедура Было() Экспорт КонецПроцедуры\n").expect("write source");
+        let watched = root.path().join("Watched.bsl");
+        let touched = root.path().join("Touched.bsl");
+        let watched_text = "Процедура Смотрим() КонецПроцедуры\n";
+        let touched_text = "Процедура Трогаем() КонецПроцедуры\n";
+        std::fs::write(&watched, watched_text).expect("write source");
+        std::fs::write(&touched, touched_text).expect("write source");
+
+        let project = mcp_server::project::at(root.path()).expect("load test workspace project");
+        let cache_parent = tempfile::tempdir().expect("create disposable workspace cache");
+        let cache = mcp_server::WorkspaceCacheLayout::for_project(
+            &project,
+            Some(cache_parent.path()),
+            root.path(),
+            None,
+        )
+        .expect("create explicit disposable cache");
+        let backend = mcp_server::SharedState::shared_workspace_with_cache_and_prefixes(
+            root.path().to_path_buf(),
+            cache,
+            None,
+        )
+        .expect("create disk-only owner for test workspace");
+        let owner = backend.workspace_handle();
+        let deadline = std::time::Instant::now()
+            + test_utils::wait::ceiling(std::time::Duration::from_secs(20));
+        while !matches!(owner.readiness(), mcp_server::WorkspaceReadiness::Ready { .. }) {
+            assert!(std::time::Instant::now() < deadline, "shared owner did not become ready");
+            std::thread::yield_now();
+        }
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = GlobalState::new_shared(sender, owner.clone());
+        apply_shared_project(&mut state, root.path().to_path_buf(), project);
+        let open = |state: &mut GlobalState, path: &std::path::Path, text: &str| {
+            let uri = lsp_types::Url::from_file_path(path).unwrap();
+            crate::handlers::notification::handle_did_open(
+                state,
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "bsl".to_owned(),
+                        version: 1,
+                        text: text.to_owned(),
+                    },
+                },
+            )
+            .expect("open the document");
+            uri
+        };
+        let watched_uri = open(&mut state, &watched, watched_text);
+        let touched_uri = open(&mut state, &touched, touched_text);
+        while !state.shared_view_seeded {
+            let task = state
+                .task_pool
+                .receiver
+                .recv_timeout(test_utils::wait::ceiling(std::time::Duration::from_secs(20)))
+                .expect("the editor view is seeded");
+            handle_task(&mut state, task).unwrap();
+        }
+        assert!(state.vfs_done, "a seeded view over a ready owner finishes loading");
+        // The diagnostics scheduled so far have been published.
+        state.diagnostics_tokens.clear();
+        state.pending_diagnostics_uris.clear();
+
+        let seeded = state.analysis_host.view().expect("open editor view").generation();
+        std::fs::write(&closed, "Процедура Стало() Экспорт КонецПроцедуры\n")
+            .expect("rewrite the closed source");
+        let mcp_server::WorkspaceRead::Ready(published) = owner.refresh_saved_path(&closed) else {
+            panic!("the owner publishes the closed file's new text");
+        };
+        assert!(published.generation > seeded, "the owner is ahead of the view");
+
+        apply(&mut state, touched_uri);
+        assert_eq!(
+            state.analysis_host.view().expect("open editor view").generation(),
+            published.generation,
+            "the event applies the owner's publication"
+        );
+        handle_task(
+            &mut state,
+            crate::global_state::Task::SharedWorkspaceChanged { generation: published.generation },
+        )
+        .unwrap();
+
+        assert!(
+            state.diagnostics_tokens.contains_key(&watched_uri)
+                || state.pending_diagnostics_uris.contains(&watched_uri),
+            "the open document is rescheduled against the owner's new text"
+        );
+        drop(state);
+        drop(owner);
+        drop(backend);
+    }
+
+    #[test]
+    fn a_save_that_applies_owner_changes_reschedules_open_documents() {
+        assert_owner_publication_reschedules_open_documents(|state, uri| {
+            crate::handlers::handle_did_save(
+                state,
+                lsp_types::DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                    text: None,
+                },
+            )
+            .expect("save the open document");
+        });
+    }
+
+    #[test]
+    fn a_close_that_applies_owner_changes_reschedules_open_documents() {
+        assert_owner_publication_reschedules_open_documents(|state, uri| {
+            crate::handlers::notification::handle_did_close(
+                state,
+                lsp_types::DidCloseTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri },
+                },
+            )
+            .expect("close the open document");
+        });
     }
 }

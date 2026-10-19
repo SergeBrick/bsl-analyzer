@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use lsp_types::Url;
+use project_model::Project;
 use vfs::{loader, FileId, VfsPath};
 
 use crate::global_state::GlobalState;
@@ -42,6 +43,64 @@ pub struct ChangeOutcome {
 }
 
 impl GlobalState {
+    pub(crate) fn adopt_shared_project(&mut self, root: PathBuf, project: Project) {
+        let previous = self.project.clone();
+        let previous_notices: Vec<_> = previous
+            .as_ref()
+            .into_iter()
+            .flat_map(|old| [old.standalone_extension_notice(), old.standalone_external_notice()])
+            .flatten()
+            .collect();
+        for notice in [project.standalone_extension_notice(), project.standalone_external_notice()]
+            .into_iter()
+            .flatten()
+        {
+            if !previous_notices.contains(&notice) {
+                self.show_warning_message(notice);
+            }
+        }
+        let previous_legacy_warning =
+            previous.as_ref().and_then(Project::legacy_extension_scope_warning);
+        if let Some(warning) = project.legacy_extension_scope_warning() {
+            if previous_legacy_warning.as_deref() != Some(warning.as_str()) {
+                self.show_warning_message(format!("bsl-analyzer: {warning}"));
+            }
+        }
+
+        let baseline_config_changed = previous
+            .as_ref()
+            .is_none_or(|old| old.diagnostics_baseline() != project.diagnostics_baseline());
+        if baseline_config_changed || self.diagnostics_baseline.moved_since_load(&project) {
+            let snapshot = previous.as_ref().map_or_else(
+                || ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load(&project),
+                |_| {
+                    ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot::load_reusing(
+                        &project,
+                        &self.diagnostics_baseline,
+                    )
+                },
+            );
+            self.install_diagnostics_baseline_confirming(snapshot, None);
+        }
+
+        let previous_diff_base =
+            previous.as_ref().and_then(|old| old.config.analysis.diff_base.as_ref());
+        let diff_base_changed = previous_diff_base != project.config.analysis.diff_base.as_ref();
+
+        self.source_exclusions =
+            project.source_exclusions().respelled_under(&project.source_roots());
+        self.workspace_root = Some(root);
+        self.project = Some(project);
+        self.project_rejected = false;
+        self.update_diagnostics_config();
+        self.update_features_config();
+        if diff_base_changed {
+            self.request_scope_rebuild();
+            self.maybe_spawn_scope_build();
+        }
+        self.warn_author_filter_unsupported();
+    }
+
     pub fn init_empty_source_root(&mut self) {
         use base_db::{SourceDatabase, SourceRoot, SourceRootId};
 
@@ -581,7 +640,7 @@ impl GlobalState {
         let changed = snapshot.epoch() != old_epoch;
         let reconfigure = snapshot.observation_paths() != old_paths;
         self.install_diagnostics_baseline_confirming(snapshot, confirming);
-        if reconfigure {
+        if reconfigure && !self.analysis_host.is_shared() {
             self.configure_loader();
         }
         changed
@@ -782,6 +841,13 @@ impl GlobalState {
             {
                 continue;
             }
+            if self
+                .open_file_uri_ids
+                .get(&uri)
+                .is_some_and(|file_id| self.open_files.contains(file_id))
+            {
+                continue;
+            }
             let vfs_path = VfsPath::new(path);
             let already_open =
                 self.vfs.read().file_id(&vfs_path).is_some_and(|id| self.open_files.contains(&id));
@@ -791,6 +857,10 @@ impl GlobalState {
             let Some(text) = self.mem_docs.get(&uri) else { continue };
             let Ok(file_id) = self.vfs_file_for_url(&uri) else { continue };
             self.open_files.insert(file_id);
+            if self.analysis_host.owner().is_some() {
+                self.open_file_uri_ids.insert(uri, file_id);
+            }
+            let vfs_path = self.vfs.read().file_path(file_id).clone();
             self.vfs.write().set_file_contents(vfs_path, Some(Arc::from(text.as_str())));
             readmitted = true;
         }
@@ -1119,6 +1189,44 @@ impl GlobalState {
             return Err(anyhow!("File is excluded by [source].exclude: {}", url));
         }
 
+        if self.analysis_host.owner().is_some() && self.mem_docs.contains(url) {
+            if let Some(&file_id) = self.open_file_uri_ids.get(url) {
+                return Ok(file_id);
+            }
+        }
+
+        if let Some(owner) = self.analysis_host.owner().cloned() {
+            let catalog = owner.catalog();
+            let path = canonicalize_shared_path(&path);
+            let canonical_id = catalog.intern_path(path.clone());
+            let mut catalog_files = catalog.files();
+            catalog_files.sort_by_key(|file| file.file_id);
+            let mut vfs = self.vfs.write();
+            for file in catalog_files {
+                let vfs_path = VfsPath::new(file.path);
+                if let Some(existing) = vfs.file_id(&vfs_path) {
+                    if existing != file.file_id {
+                        return Err(anyhow!(
+                            "Shared VFS id mismatch for {:?}: local {}, owner {}",
+                            vfs_path,
+                            existing.0,
+                            file.file_id.0
+                        ));
+                    }
+                    continue;
+                }
+                let allocated = vfs.alloc_file_id(vfs_path);
+                if allocated != file.file_id {
+                    return Err(anyhow!(
+                        "Shared VFS allocation order mismatch: local {}, owner {}",
+                        allocated.0,
+                        file.file_id.0
+                    ));
+                }
+            }
+            return Ok(canonical_id);
+        }
+
         let vfs_path = VfsPath::new(path);
 
         let mut vfs = self.vfs.write();
@@ -1139,6 +1247,26 @@ impl GlobalState {
         Url::from_file_path(std_path)
             .map_err(|_| anyhow!("Failed to convert path to URL: {:?}", std_path))
     }
+}
+
+pub(crate) fn canonicalize_shared_path(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let mut cursor = path.to_path_buf();
+    let mut suffix = Vec::new();
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else { break };
+        suffix.push(name.to_os_string());
+        if !cursor.pop() {
+            break;
+        }
+    }
+    let mut result = cursor.canonicalize().unwrap_or(cursor);
+    for name in suffix.into_iter().rev() {
+        result.push(name);
+    }
+    result
 }
 
 /// Whether `path` belongs in the BSL source root: never inside an exclusion, open or

@@ -32,4 +32,4 @@ pub mod task_pool;
 pub(crate) mod test_uri;
 pub mod workspace;
 
-pub use server::main_loop;
+pub use server::{main_loop, main_loop_resumed, main_loop_shared};

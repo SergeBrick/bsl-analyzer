@@ -900,8 +900,9 @@ fn wait_for_lease_pid(path: &Path, timeout: Duration) -> u32 {
 }
 
 #[cfg(unix)]
-fn wait_for_cache_adoption_log(
+fn wait_for_daemon_log(
     path: &Path,
+    needle: &str,
     minimum_count: usize,
     timeout: Duration,
 ) -> Vec<String> {
@@ -919,8 +920,8 @@ fn wait_for_cache_adoption_log(
             Some(
                 String::from_utf8_lossy(&bytes)
                     .lines()
-                    .filter(|line| line.contains(CACHE_ADOPTION_LOG))
-                    .map(|_| CACHE_ADOPTION_LOG.to_owned())
+                    .filter(|line| line.contains(needle))
+                    .map(|_| needle.to_owned())
                     .collect::<Vec<_>>(),
             )
         })()
@@ -2811,11 +2812,12 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let mut daemon = daemon_command.spawn().expect("direct native daemon starts");
     let mut daemon_stderr = StderrCapture::attach(daemon.stderr.take().unwrap());
     let daemon_pid = daemon.id();
-    let daemon_lease = wait_for_lease_pid(
-        &layout.lease_path(),
-        test_utils::wait::ceiling(Duration::from_secs(30)),
-    );
-    assert_eq!(daemon_lease, daemon_pid, "the direct daemon owns the live lease");
+    daemon_stderr
+        .wait_for_text(
+            "shared broker listening",
+            test_utils::wait::ceiling(Duration::from_secs(30)),
+        )
+        .expect("supervised listener must bind before the one-attempt required proxy starts");
 
     let mut required = McpSession::start_transport(
         root.path(),
@@ -2828,6 +2830,11 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
         None,
         Some(daemon_pid),
     );
+    let daemon_lease = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
+    assert_eq!(daemon_lease, daemon_pid, "the direct daemon owns the live lease");
     let graph_required = graph_overview(&mut required);
     assert_eq!(graph_required["nodes"], 2, "required proxy reaches the supervised daemon");
     let marker_required = wait_for_marker(&mut required, "CACHE_LEXICAL_A_235");
@@ -2859,11 +2866,17 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     let mut warm_daemon = daemon_command.spawn().expect("direct native warm daemon starts");
     let mut warm_daemon_stderr = StderrCapture::attach(warm_daemon.stderr.take().unwrap());
     let warm_daemon_pid = warm_daemon.id();
-    let warm_lease_pid = wait_for_lease_pid(
-        &layout.lease_path(),
-        test_utils::wait::ceiling(Duration::from_secs(30)),
+    assert!(
+        !wait_for_daemon_log(
+            &daemon_log,
+            "shared broker listening",
+            0,
+            test_utils::wait::ceiling(Duration::from_secs(30)),
+        )
+        .is_empty(),
+        "warm supervised listener must bind before the required proxy starts: {}",
+        warm_daemon_stderr.snapshot(),
     );
-    assert_eq!(warm_lease_pid, warm_daemon_pid, "warm daemon owns the live lease");
     let mut warm_required = McpSession::start_transport(
         root.path(),
         &flags,
@@ -2875,12 +2888,18 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
         None,
         Some(warm_daemon_pid),
     );
+    let warm_lease_pid = wait_for_lease_pid(
+        &layout.lease_path(),
+        test_utils::wait::ceiling(Duration::from_secs(30)),
+    );
+    assert_eq!(warm_lease_pid, warm_daemon_pid, "warm daemon owns the live lease");
     let graph_warm_direct = graph_overview(&mut warm_required);
     assert_eq!(graph_warm_direct, graph_required, "direct warm daemon serves the same graph");
     let marker_warm_direct = wait_for_marker(&mut warm_required, "CACHE_LEXICAL_A_235");
     assert!(!marker_warm_direct.is_empty(), "direct warm daemon serves its search marker");
-    let direct_warm_adoption = wait_for_cache_adoption_log(
+    let direct_warm_adoption = wait_for_daemon_log(
         &daemon_log,
+        CACHE_ADOPTION_LOG,
         0,
         test_utils::wait::ceiling(Duration::from_secs(10)),
     );
@@ -2928,8 +2947,9 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
     assert_eq!(graph_broker, graph_required, "broker proxy starts from the warm daemon cache");
     let marker_broker = wait_for_marker(&mut broker, "CACHE_LEXICAL_A_235");
     assert!(!marker_broker.is_empty(), "broker proxy serves the scoped search marker");
-    let broker_cache_adoption = wait_for_cache_adoption_log(
+    let broker_cache_adoption = wait_for_daemon_log(
         &daemon_log,
+        CACHE_ADOPTION_LOG,
         direct_warm_adoption.len(),
         test_utils::wait::ceiling(Duration::from_secs(10)),
     );

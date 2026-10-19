@@ -284,6 +284,60 @@ fn lsp_definition_at(
     .unwrap_or_else(|| panic!("LSP definition {needle} exceeded {timeout:?}"))
 }
 
+#[test]
+fn closed_definition_target_comparison_uses_canonical_file_locations() {
+    let root = tempfile::tempdir().expect("definition URI fixture");
+    let target = root.path().join("target.bsl");
+    let other = root.path().join("other.bsl");
+    std::fs::write(&target, "target").expect("target file");
+    std::fs::write(&other, "other").expect("other file");
+    let target_uri = lsp_types::Url::from_file_path(&target).expect("target URI");
+    let other_uri = lsp_types::Url::from_file_path(&other).expect("other URI");
+    let missing_uri =
+        lsp_types::Url::from_file_path(root.path().join("missing.bsl")).expect("missing file URI");
+
+    assert!(common::definition_targets_file(
+        &json!({"uri": target_uri.as_str(), "range": {}}),
+        &target_uri,
+    ));
+    assert!(common::definition_targets_file(
+        &json!([{"targetUri": target_uri.as_str(), "targetRange": {}}]),
+        &target_uri,
+    ));
+    assert!(!common::definition_targets_file(
+        &json!({"uri": other_uri.as_str(), "range": {}}),
+        &target_uri,
+    ));
+    assert!(!common::definition_targets_file(&json!({"uri": target_uri.as_str()}), &missing_uri,));
+    assert!(!common::definition_targets_file(&json!({"uri": missing_uri.as_str()}), &target_uri,));
+    assert!(!common::definition_targets_file(&json!({"uri": missing_uri.as_str()}), &missing_uri,));
+    assert!(!common::definition_targets_file(
+        &json!({"message": target_uri.as_str()}),
+        &target_uri,
+    ));
+
+    #[cfg(windows)]
+    {
+        let mut alternate_drive_case = target_uri.as_str().to_owned();
+        let drive_index = "file:///".len();
+        let drive =
+            alternate_drive_case[drive_index..].chars().next().expect("Windows URI drive letter");
+        let alternate_drive = if drive.is_ascii_uppercase() {
+            drive.to_ascii_lowercase()
+        } else {
+            drive.to_ascii_uppercase()
+        };
+        alternate_drive_case
+            .replace_range(drive_index..drive_index + 1, &alternate_drive.to_string());
+        let alternate_uri =
+            lsp_types::Url::parse(&alternate_drive_case).expect("alternate drive URI");
+        assert!(common::definition_targets_file(
+            &json!({"uri": alternate_uri.as_str()}),
+            &target_uri,
+        ));
+    }
+}
+
 fn lsp_hover(lsp: &mut Lsp, id: u64, uri: &lsp_types::Url, text: &str, needle: &str) -> Value {
     let (line, character) = position(text, needle);
     lsp.request(
@@ -307,25 +361,25 @@ fn wait_lsp_target(
     let mut id = first_id;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(!remaining.is_zero(), "LSP never resolved {needle}");
+        assert!(!remaining.is_zero(), "LSP never resolved {needle} to {target_uri}");
         let response = lsp_definition(lsp, id, uri, needle, remaining);
         if response["error"]["code"] == -32801 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "LSP definition remained ContentModified for {needle}: {response}"
+                "LSP definition remained ContentModified for {needle} targeting {target_uri}: {response}"
             );
             id += 1;
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
-        assert!(response["error"].is_null(), "LSP definition failed: {response}");
-        if response["result"].to_string().contains(target_uri.as_str()) {
+        assert!(response["error"].is_null(), "LSP definition failed for {target_uri}: {response}");
+        if common::definition_targets_file(&response["result"], target_uri) {
             return;
         }
         assert!(
             response["result"].is_null()
                 || response["result"].as_array().is_some_and(Vec::is_empty),
-            "definition resolved to an unexpected source-set target: {response}"
+            "definition did not resolve to expected source-set target {target_uri}: {response}"
         );
         assert!(std::time::Instant::now() < deadline, "LSP never resolved {needle}");
         id += 1;

@@ -147,7 +147,7 @@ const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchan
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
 /// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
 /// latency measure.
-const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 /// Drains child stderr continuously while retaining only a bounded tail. This
 /// keeps native startup diagnostics available without allowing a verbose child
@@ -785,6 +785,8 @@ impl EmbeddingStub {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         use std::io::{Read, Write};
+                        // Windows hands the listener's non-blocking mode to the accepted stream.
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(test_utils::wait::ceiling(
                             Duration::from_secs(2),
                         )));

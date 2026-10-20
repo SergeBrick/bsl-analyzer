@@ -34,7 +34,7 @@ fn diagnostics_rules_stdio_reuses_config_until_real_reload_and_preserves_ranges(
     let source = diagnostic_rules::project(dir.path());
     let mut session = McpSession::start(dir.path(), &[]);
     let findings = |session: &mut McpSession| {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + HANG_WATCHDOG;
         loop {
             let response = session.diagnostics(serde_json::json!({
                 "action":"file", "path":"src/Module.bsl", "min_severity":"hint"
@@ -50,34 +50,36 @@ fn diagnostics_rules_stdio_reuses_config_until_real_reload_and_preserves_ranges(
         }
     };
     assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
-    let initial_log = session
-        .stderr
-        .wait_for_text(diagnostic_rules::WARNING, Duration::from_secs(2))
-        .expect("the load-time warning reaches stderr");
-    let initial = diagnostic_rules::warning_count(&initial_log);
+    assert!(
+        test_utils::wait::poll_until(HANG_WATCHDOG, Duration::from_millis(20), || {
+            session.stderr.retained().contains(diagnostic_rules::WARNING)
+        }),
+        "the load-time warning reaches stderr"
+    );
+    let initial = diagnostic_rules::warning_count(&session.stderr.retained());
     assert!(initial > 0);
     for _ in 0..2 {
         assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
     }
-    assert_eq!(diagnostic_rules::warning_count(&session.stderr.snapshot()), initial);
+    assert_eq!(diagnostic_rules::warning_count(&session.stderr.retained()), initial);
 
     diagnostic_rules::replace_config(dir.path(), 7);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + HANG_WATCHDOG;
     loop {
         if findings(&mut session) == diagnostic_rules::expected(&source, false, false)
-            && diagnostic_rules::warning_count(&session.stderr.snapshot()) > initial
+            && diagnostic_rules::warning_count(&session.stderr.retained()) > initial
         {
             break;
         }
         assert!(Instant::now() < deadline, "MCP config reload did not change the Typo result");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let reloaded = diagnostic_rules::warning_count(&session.stderr.snapshot());
+    let reloaded = diagnostic_rules::warning_count(&session.stderr.retained());
     assert!(reloaded > initial);
     for _ in 0..2 {
         assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, false));
     }
-    assert_eq!(diagnostic_rules::warning_count(&session.stderr.snapshot()), reloaded);
+    assert_eq!(diagnostic_rules::warning_count(&session.stderr.retained()), reloaded);
     assert!(session.shutdown().unwrap().success());
 }
 
@@ -105,11 +107,18 @@ const STDERR_TAIL_LIMIT: usize = 64 * 1024;
 /// latency measure.
 const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
 
-/// Drains child stderr continuously while retaining only a bounded tail. This
-/// keeps native startup diagnostics available without allowing a verbose child
-/// to block on a full stderr pipe or grow the fixture's memory without bound.
+/// Stderr lines a test counts or searches for over the child's whole life. The bounded tail
+/// cannot answer that: the volume logged between two such lines grows with the time the
+/// child takes, so on a slow run the earlier line has already been trimmed away.
+const RETAINED_STDERR: [&str; 2] = [diagnostic_rules::WARNING, diagnostic_rules::PRIVATE_VALUE];
+
+/// Drains child stderr continuously while retaining only a bounded tail, plus every
+/// line naming one of [`RETAINED_STDERR`]. This keeps native startup diagnostics
+/// available without allowing a verbose child to block on a full stderr pipe or grow
+/// the fixture's memory without bound.
 struct StderrCapture {
     tail: Arc<Mutex<String>>,
+    retained: Arc<Mutex<String>>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -119,13 +128,22 @@ impl StderrCapture {
 
         let tail = Arc::new(Mutex::new(String::new()));
         let reader_tail = Arc::clone(&tail);
+        let retained = Arc::new(Mutex::new(String::new()));
+        let reader_retained = Arc::clone(&retained);
         let reader = std::thread::spawn(move || {
             let mut stderr = stderr;
             let mut buffer = [0_u8; 4096];
+            let mut line = Vec::new();
             loop {
                 match stderr.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
+                        for &byte in &buffer[..read] {
+                            line.push(byte);
+                            if byte == b'\n' {
+                                Self::retain_line(&reader_retained, &mut line);
+                            }
+                        }
                         let text = String::from_utf8_lossy(&buffer[..read]);
                         let mut tail = reader_tail.lock().expect("stderr capture mutex");
                         tail.push_str(&text);
@@ -139,12 +157,26 @@ impl StderrCapture {
                     }
                 }
             }
+            Self::retain_line(&reader_retained, &mut line);
         });
-        Self { tail, reader: Some(reader) }
+        Self { tail, retained, reader: Some(reader) }
+    }
+
+    fn retain_line(retained: &Mutex<String>, line: &mut Vec<u8>) {
+        let text = String::from_utf8_lossy(line);
+        if RETAINED_STDERR.iter().any(|needle| text.contains(needle)) {
+            retained.lock().expect("stderr capture mutex").push_str(&text);
+        }
+        line.clear();
     }
 
     fn snapshot(&self) -> String {
         self.tail.lock().expect("stderr capture mutex").clone()
+    }
+
+    /// Every [`RETAINED_STDERR`] line written so far, none of them trimmed.
+    fn retained(&self) -> String {
+        self.retained.lock().expect("stderr capture mutex").clone()
     }
 
     #[cfg(unix)]

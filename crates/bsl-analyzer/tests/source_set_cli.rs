@@ -111,10 +111,10 @@ const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs
 /// child takes, so on a slow run the earlier line has already been trimmed away.
 const RETAINED_STDERR: [&str; 2] = [diagnostic_rules::WARNING, diagnostic_rules::PRIVATE_VALUE];
 
-/// Drains child stderr continuously while retaining only a bounded tail, plus every
-/// line naming one of [`RETAINED_STDERR`]. This keeps native startup diagnostics
-/// available without allowing a verbose child to block on a full stderr pipe or grow
-/// the fixture's memory without bound.
+/// Drains child stderr continuously while retaining a bounded tail, plus every line
+/// naming one of [`RETAINED_STDERR`]. This keeps native startup diagnostics available
+/// without allowing a verbose child to block on a full stderr pipe; the fixture's memory
+/// grows only with those named lines, never with the rest of the output.
 struct StderrCapture {
     tail: Arc<Mutex<String>>,
     retained: Arc<Mutex<String>>,
@@ -133,16 +133,18 @@ impl StderrCapture {
             let mut stderr = stderr;
             let mut buffer = [0_u8; 4096];
             let mut line = Vec::new();
+            let mut named = false;
             loop {
                 match stderr.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
                         for &byte in &buffer[..read] {
                             line.push(byte);
-                            // A line past the tail limit is taken as finished, so output
-                            // without newlines cannot grow the fixture's memory.
-                            if byte == b'\n' || line.len() >= STDERR_TAIL_LIMIT {
-                                Self::retain_line(&reader_retained, &mut line);
+                            if byte == b'\n' {
+                                Self::retain_line(&reader_retained, &mut line, &mut named, true);
+                            } else if line.len() >= STDERR_TAIL_LIMIT {
+                                // Output without newlines must not grow the fixture's memory.
+                                Self::retain_line(&reader_retained, &mut line, &mut named, false);
                             }
                         }
                         let text = String::from_utf8_lossy(&buffer[..read]);
@@ -158,24 +160,38 @@ impl StderrCapture {
                     }
                 }
             }
-            Self::retain_line(&reader_retained, &mut line);
+            Self::retain_line(&reader_retained, &mut line, &mut named, true);
         });
         Self { tail, retained, reader: Some(reader) }
     }
 
-    fn retain_line(retained: &Mutex<String>, line: &mut Vec<u8>) {
-        let text = String::from_utf8_lossy(line);
-        if RETAINED_STDERR.iter().any(|needle| text.contains(needle)) {
+    /// Hands the buffered part of a line over: to `retained` once the line has named a
+    /// [`RETAINED_STDERR`] needle, otherwise away. `named` carries that across the parts
+    /// of one overlong line. An unnamed part that is not the line's `end` keeps its last
+    /// bytes, so a needle cut by the split is still found whole in the next part.
+    fn retain_line(retained: &Mutex<String>, line: &mut Vec<u8>, named: &mut bool, end: bool) {
+        let text = String::from_utf8_lossy(line).into_owned();
+        *named |= RETAINED_STDERR.iter().any(|needle| text.contains(needle));
+        if *named {
             retained.lock().expect("stderr capture mutex").push_str(&text);
+            line.clear();
+        } else if end {
+            line.clear();
+        } else {
+            let longest = RETAINED_STDERR.iter().map(|needle| needle.len()).max().unwrap_or(0);
+            line.drain(..line.len().saturating_sub(longest.saturating_sub(1)));
         }
-        line.clear();
+        if end {
+            *named = false;
+        }
     }
 
     fn snapshot(&self) -> String {
         self.tail.lock().expect("stderr capture mutex").clone()
     }
 
-    /// Every [`RETAINED_STDERR`] line written so far, none of them trimmed.
+    /// Every [`RETAINED_STDERR`] line written so far. A line longer than the tail limit
+    /// keeps only its last part from just before the needle on.
     fn retained(&self) -> String {
         self.retained.lock().expect("stderr capture mutex").clone()
     }

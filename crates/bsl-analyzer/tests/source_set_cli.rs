@@ -140,7 +140,9 @@ impl StderrCapture {
                     Ok(read) => {
                         for &byte in &buffer[..read] {
                             line.push(byte);
-                            if byte == b'\n' {
+                            // A line past the tail limit is taken as finished, so output
+                            // without newlines cannot grow the fixture's memory.
+                            if byte == b'\n' || line.len() >= STDERR_TAIL_LIMIT {
                                 Self::retain_line(&reader_retained, &mut line);
                             }
                         }

@@ -746,7 +746,6 @@ fn apply_docs_gap_member_context_overlay(
         {
             context.thin_client = true;
             context.thick_client = true;
-            context.mobile_client = true;
         }
         if CLIENT_EXECUTABLE_METHODS
             .iter()
@@ -781,7 +780,8 @@ const CLIENT_EXECUTABLE_METHODS: &[(&str, &str)] = &[
 /// 8.3.27 with and without a compatibility mode) executes these calls in the thin
 /// and thick clients. Deprecation is `DeprecatedPlatformApi`'s business; the
 /// environment check must not turn it into "unavailable". The web client stays
-/// out: the type itself is absent there.
+/// out: the type itself is absent there. The mobile client was not checked and
+/// is left as the help says.
 const CLIENT_DEPRECATED_HTTP_CONNECTION_METHODS: &[&str] =
     &["Get", "Post", "Put", "Patch", "Delete", "Head", "CallHTTPMethod"];
 
@@ -1397,6 +1397,7 @@ mod tests {
             );
             assert!(ctx.server && ctx.external_connection, "{name} keeps its server contexts");
             assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
+            assert!(!ctx.mobile_client, "{name}: the mobile client was not checked and stays out");
         }
 
         // Narrow: a synchronous collaboration-system method that the thin client

@@ -10,6 +10,8 @@ The current implementation is a local HIR + CFG check:
 
 - if `GetTempFileName()` is assigned to a variable, the diagnostic looks for a reachable later deletion or move call that uses the same variable;
 - if `GetTempFileName()` is used inline, the diagnostic always reports it because cleanup cannot be tracked reliably;
+- a deletion that is the first statement of its own `Try` block (`Try DeleteFiles(Name); Except ... EndTry;`) counts as cleanup on the handler path too: any exception the handler receives is raised by the deletion attempt or after it;
+- `Return Name` hands the file over to the caller and ends tracking on that path;
 - the set of cleanup methods is configurable through `searchDeleteFileMethod`.
 
 By default the diagnostic treats these methods as cleanup:

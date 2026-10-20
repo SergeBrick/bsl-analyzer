@@ -1,7 +1,7 @@
 use hir::cfg::ControlFlowGraph;
 use hir::dataflow::temp_resource::{analyze_open_resources, ResourceEvent, ResourceProvider};
 use hir::LocalRange;
-use hir::{Body, BodySourceMap, Expr, ExprId, ExprIdx, IdConversion, Stmt};
+use hir::{Body, BodySourceMap, Expr, ExprId, ExprIdx, IdConversion, Stmt, StmtId};
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
@@ -113,10 +113,12 @@ fn check_body_resources(
     }
 
     let known_vars: FxHashSet<String> = tracked.values().map(|ag| ag.lower_name.clone()).collect();
+    let returned = collect_returned_names(body, &known_vars);
     let provider = TempFileProvider {
         deletion_methods: &config.deletion_methods,
         tracked: &tracked,
         known_vars: &known_vars,
+        returned: &returned,
     };
     let Some(result) = analyze_open_resources::<_, String>(body, cfg, provider) else {
         return diagnostics;
@@ -171,10 +173,48 @@ fn collect_assigned_gets(body: &Body) -> (FxHashMap<ExprIdx, AssignedGet>, FxHas
     (tracked, suppressed)
 }
 
+/// `Возврат ИмяФайла` hands the name to the caller, which becomes responsible
+/// for deleting the file; only the bare variable counts, not an expression
+/// that merely mentions it.
+fn collect_returned_names(
+    body: &Body,
+    known_vars: &FxHashSet<String>,
+) -> FxHashMap<ExprIdx, String> {
+    let mut returned = FxHashMap::default();
+    for (_, stmt) in body.stmts_iter() {
+        let Stmt::Return { value: Some(value) } = stmt else { continue };
+        let Expr::Path(name) = body.expr_idx(*value) else { continue };
+        let lower = name.as_str().fold_lower();
+        if known_vars.contains(&lower) {
+            returned.insert(*value, lower);
+        }
+    }
+    returned
+}
+
 struct TempFileProvider<'a> {
     deletion_methods: &'a Regex,
     tracked: &'a FxHashMap<ExprIdx, AssignedGet>,
     known_vars: &'a FxHashSet<String>,
+    returned: &'a FxHashMap<ExprIdx, String>,
+}
+
+impl TempFileProvider<'_> {
+    fn deleted_vars(&self, body: &Body, expr_idx: ExprIdx) -> FxHashSet<String> {
+        let mut closed: FxHashSet<String> = FxHashSet::default();
+        let (callee_path, args) = match body.expr_idx(expr_idx) {
+            Expr::Call { callee, args } => (extract_call_path(body, *callee), args),
+            Expr::MethodCall { method, args, .. } => (method.as_str().to_string(), args),
+            _ => return closed,
+        };
+        if !self.deletion_methods.is_match(&callee_path) {
+            return closed;
+        }
+        for &arg in args.iter() {
+            collect_referenced_vars(body, arg, self.known_vars, &mut closed);
+        }
+        closed
+    }
 }
 
 impl<'a> ResourceProvider<String> for TempFileProvider<'a> {
@@ -186,19 +226,21 @@ impl<'a> ResourceProvider<String> for TempFileProvider<'a> {
         if let Some(open) = self.classify(body, expr_idx) {
             return vec![open];
         }
-        let (callee_path, args) = match body.expr_idx(expr_idx) {
-            Expr::Call { callee, args } => (extract_call_path(body, *callee), args),
-            Expr::MethodCall { method, args, .. } => (method.as_str().to_string(), args),
-            _ => return Vec::new(),
-        };
-        if !self.deletion_methods.is_match(&callee_path) {
-            return Vec::new();
+        if let Some(var) = self.returned.get(&expr_idx) {
+            return vec![ResourceEvent::Close(var.clone())];
         }
-        let mut closed: FxHashSet<String> = FxHashSet::default();
-        for &arg in args.iter() {
-            collect_referenced_vars(body, arg, self.known_vars, &mut closed);
-        }
-        closed.into_iter().map(ResourceEvent::Close).collect()
+        self.deleted_vars(body, expr_idx).into_iter().map(ResourceEvent::Close).collect()
+    }
+
+    /// `Попытка УдалитьФайлы(Имя); Исключение ... КонецПопытки;`: when the
+    /// deletion is the first protected statement, every exception the handler
+    /// can receive is raised by the deletion attempt itself or after it, so
+    /// the handler path does not leave the file undeleted by the code.
+    fn closed_at_try_entry(&self, body: &Body, try_stmt: StmtId) -> Vec<String> {
+        let Stmt::Try { body: protected, .. } = body.stmt(try_stmt) else { return Vec::new() };
+        let Some(&first) = protected.first() else { return Vec::new() };
+        let Stmt::Expr(call) = body.stmt_idx(first) else { return Vec::new() };
+        self.deleted_vars(body, *call).into_iter().collect()
     }
 }
 
@@ -697,6 +739,113 @@ mod tests {
               severity: Major
             MissingTemporaryFileDeletion @ 4:25..4:58
               message: Нужно добавить удаление временного файла 'Файл2' после использования
+              severity: Major"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn test_deletion_as_first_protected_statement_is_cleanup() {
+        let code = r#"
+            Процедура Тест(Данные)
+                ИмяФайла = ПолучитьИмяВременногоФайла("zip");
+                Данные.Записать(ИмяФайла);
+                Попытка
+                    УдалитьФайлы(ИмяФайла);
+                Исключение
+                КонецПопытки;
+
+                ИмяКаталога = ПолучитьИмяВременногоФайла();
+                Попытка
+                    УдалитьФайлы(ИмяКаталога);
+                Исключение
+                    ЗаписьЖурналаРегистрации("Тест", УровеньЖурналаРегистрации.Ошибка, , ,
+                        ПодробноеПредставлениеОшибки(ИнформацияОбОшибке()));
+                КонецПопытки;
+            КонецПроцедуры
+        "#;
+        let diagnostics = check_body_diagnostic(code, check_body);
+        expect![[r#""#]].assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn test_try_with_work_before_deletion_still_leaks() {
+        let code = r#"
+            Процедура Тест(Данные)
+                ИмяФайла = ПолучитьИмяВременногоФайла("zip");
+                Попытка
+                    Данные.Записать(ИмяФайла);
+                    УдалитьФайлы(ИмяФайла);
+                Исключение
+                КонецПопытки;
+            КонецПроцедуры
+        "#;
+        let diagnostics = check_body_diagnostic(code, check_body);
+        expect![[r#"
+            MissingTemporaryFileDeletion @ 3:28..3:61
+              message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
+              severity: Major"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn test_second_deletion_in_same_try_still_leaks() {
+        let code = r#"
+            Процедура Тест()
+                Файл1 = ПолучитьИмяВременногоФайла("xml");
+                Файл2 = ПолучитьИмяВременногоФайла("txt");
+                Попытка
+                    УдалитьФайлы(Файл1);
+                    УдалитьФайлы(Файл2);
+                Исключение
+                КонецПопытки;
+            КонецПроцедуры
+        "#;
+        let diagnostics = check_body_diagnostic(code, check_body);
+        expect![[r#"
+            MissingTemporaryFileDeletion @ 4:25..4:58
+              message: Нужно добавить удаление временного файла 'Файл2' после использования
+              severity: Major"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn test_try_deleting_other_file_does_not_clean_up() {
+        let code = r#"
+            Процедура Тест(ДругойФайл)
+                ИмяФайла = ПолучитьИмяВременногоФайла("zip");
+                Попытка
+                    УдалитьФайлы(ДругойФайл);
+                Исключение
+                КонецПопытки;
+            КонецПроцедуры
+        "#;
+        let diagnostics = check_body_diagnostic(code, check_body);
+        expect![[r#"
+            MissingTemporaryFileDeletion @ 3:28..3:61
+              message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
+              severity: Major"#]]
+        .assert_eq(&format_diags(code, &diagnostics));
+    }
+
+    #[test]
+    fn test_returned_name_is_left_to_caller() {
+        let code = r#"
+            Функция ИмяФайлаДанных(Данные)
+                ИмяФайла = ПолучитьИмяВременногоФайла("xml");
+                Данные.Записать(ИмяФайла);
+                Возврат ИмяФайла;
+            КонецФункции
+
+            Функция РазмерДанных(Данные)
+                ИмяФайла = ПолучитьИмяВременногоФайла("xml");
+                Данные.Записать(ИмяФайла);
+                Возврат СтрДлина(ИмяФайла);
+            КонецФункции
+        "#;
+        let diagnostics = check_body_diagnostic(code, check_body);
+        expect![[r#"
+            MissingTemporaryFileDeletion @ 9:28..9:61
+              message: Нужно добавить удаление временного файла 'ИмяФайла' после использования
               severity: Major"#]]
         .assert_eq(&format_diags(code, &diagnostics));
     }

@@ -71,6 +71,10 @@ pub trait Transfer<L: Lattice> {
     }
 
     fn transfer_loop_var_bind(&self, _loop_var: hir_def::BindingId, _state: &mut L, _body: &Body) {}
+
+    /// Entry of `Попытка`: the state computed here flows both into the
+    /// protected statements and along the exception edge into the handler.
+    fn transfer_try_entry(&self, _try_stmt: hir_def::StmtId, _state: &mut L, _body: &Body) {}
 }
 
 pub struct DataflowSolver<L: Lattice, T: Transfer<L>> {
@@ -413,6 +417,14 @@ impl<L: Lattice, T: Transfer<L>> DataflowSolver<L, T> {
                     &mut state,
                     &self.body,
                 );
+                state
+            }
+
+            CfgVertex::Try => {
+                let mut state = in_state.clone();
+                if let Some(try_stmt) = self.cfg.source_stmt_id(block_idx) {
+                    self.transfer.transfer_try_entry(try_stmt, &mut state, &self.body);
+                }
                 state
             }
 

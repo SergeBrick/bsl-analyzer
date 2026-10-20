@@ -255,6 +255,12 @@ pub struct EnvOptions {
     /// application. `None` — not known (no main configuration, as in a project
     /// of external data processors alone): both thick clients count.
     pub ordinary_forms_in_managed_app: Option<bool>,
+    /// `DefaultRunMode` of the main configuration is known and is not
+    /// `OrdinaryApplication` (`ManagedApplication` or `Auto`): the configuration
+    /// runs as a managed application, and the thick client of the managed
+    /// application compiles its object, manager, record set and value manager
+    /// modules. `false` when the mode is `OrdinaryApplication` or not known.
+    pub managed_run_mode: bool,
 }
 
 impl Default for EnvOptions {
@@ -269,6 +275,7 @@ impl Default for EnvOptions {
                 | EnvFlags::THICK_CLIENT_MANAGED
                 | EnvFlags::SERVER,
             ordinary_forms_in_managed_app: None,
+            managed_run_mode: false,
         }
     }
 }
@@ -321,15 +328,25 @@ pub fn module_base_env(metadata: &ModuleMetadata, opts: &EnvOptions) -> EnvFlags
             opts.managed_client_envs()
         }
         ModuleType::OrdinaryApplicationModule => EnvFlags::THICK_CLIENT_ORDINARY,
+        // The thick client of the managed application compiles these modules too.
+        // There it is a client: in the client-server variant a common module that is
+        // only `Server` is not visible and a `&НаСервере` method of the module is not
+        // compiled, so the managed thick client is judged as in that variant. It is
+        // added only for a configuration run as a managed application; the platform
+        // also compiles them there in an `OrdinaryApplication` configuration, but
+        // such a configuration is normally not run in that client.
         ModuleType::ObjectModule
         | ModuleType::ManagerModule
         | ModuleType::RecordSetModule
         | ModuleType::ValueManagerModule => {
+            let mut env = EnvFlags::SERVER_SIDE;
             if opts.ordinary_app_support {
-                EnvFlags::SERVER_SIDE | EnvFlags::THICK_CLIENT_ORDINARY
-            } else {
-                EnvFlags::SERVER_SIDE
+                env = env | EnvFlags::THICK_CLIENT_ORDINARY;
             }
+            if opts.managed_run_mode {
+                env = env | (opts.managed_client_envs() & EnvFlags::THICK_CLIENT_MANAGED);
+            }
+            env
         }
         ModuleType::SessionModule => EnvFlags::SERVER_SIDE,
         ModuleType::ExternalConnectionModule => EnvFlags::EXTERNAL_CONNECTION,
@@ -398,6 +415,20 @@ pub fn directive_env(
             _ => EnvFlags::ALL,
         },
     }
+}
+
+/// Whether client code of a module of `module_type` may reach a server method of the
+/// same module, as a form reaches its `&НаСервере` methods by a remote call. Not in
+/// an object, manager, record set or value manager module: there a `&НаСервере`
+/// method is simply not compiled in a client (checked live on 8.3.17 and 8.3.27).
+pub fn local_server_call_is_remote(module_type: ModuleType) -> bool {
+    !matches!(
+        module_type,
+        ModuleType::ObjectModule
+            | ModuleType::ManagerModule
+            | ModuleType::RecordSetModule
+            | ModuleType::ValueManagerModule
+    )
 }
 
 /// Environment set of one method body: where the module runs, narrowed by the
@@ -776,6 +807,57 @@ mod tests {
             body_env(&md, &[], &on),
             EnvFlags::SERVER_SIDE | EnvFlags::THICK_CLIENT_ORDINARY
         );
+    }
+
+    /// A configuration run as a managed application compiles object-family modules in
+    /// the managed thick client too; a `&НаСервере` method is then server-side only.
+    #[test]
+    fn object_family_modules_run_in_the_managed_thick_client_of_a_managed_configuration() {
+        let managed = EnvOptions { managed_run_mode: true, ..EnvOptions::default() };
+        let thick = EnvFlags::SERVER_SIDE | EnvFlags::THICK_CLIENT_MANAGED;
+        for ty in [
+            ModuleType::ObjectModule,
+            ModuleType::ManagerModule,
+            ModuleType::RecordSetModule,
+            ModuleType::ValueManagerModule,
+        ] {
+            let md = ModuleMetadata::unknown(ty);
+            assert_eq!(body_env(&md, &[], &managed), thick, "{ty:?}");
+            assert_eq!(module_code_env(&md, &managed), thick, "{ty:?}");
+            assert_eq!(
+                body_env(&md, &[AnnotationKind::AtServer], &managed),
+                EnvFlags::SERVER_SIDE,
+                "{ty:?}"
+            );
+            assert_eq!(
+                body_env(&md, &[AnnotationKind::AtClient], &managed),
+                EnvFlags::THICK_CLIENT_MANAGED,
+                "{ty:?}"
+            );
+            assert!(!local_server_call_is_remote(ty), "{ty:?}");
+        }
+
+        // Not without the managed thick client among the client environments.
+        let without = EnvOptions {
+            managed_run_mode: true,
+            client_environments: EnvFlags::THIN_CLIENT | EnvFlags::WEB_CLIENT,
+            ..EnvOptions::default()
+        };
+        let md = ModuleMetadata::unknown(ModuleType::ObjectModule);
+        assert_eq!(body_env(&md, &[], &without), EnvFlags::SERVER_SIDE);
+
+        // The ordinary thick client still follows `ordinary_app_support` alone.
+        let both = EnvOptions {
+            managed_run_mode: true,
+            ordinary_app_support: true,
+            ..EnvOptions::default()
+        };
+        assert_eq!(body_env(&md, &[], &both), thick | EnvFlags::THICK_CLIENT_ORDINARY);
+
+        // Form, command and common modules keep the remote server call.
+        for ty in [ModuleType::FormModule, ModuleType::CommandModule, ModuleType::CommonModule] {
+            assert!(local_server_call_is_remote(ty), "{ty:?}");
+        }
     }
 
     #[test]

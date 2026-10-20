@@ -793,6 +793,12 @@ CommentedCode = false
 откуда взято значение:
 `ordinaryAppSupport: true (from DefaultRunMode of Configuration.xml)`.
 
+Сам `<DefaultRunMode>` (без учёта `ordinaryAppSupport`) решает ещё одно: при
+`ManagedApplication` и `Auto` модули объектов, менеджеров, наборов записей и
+менеджеров значения проверяются и относительно толстого клиента управляемого
+приложения — платформа компилирует их там. Подробнее — в документации
+`UnavailableInEnvironment`.
+
 ### `[code_lens]`
 
 Поддерживаются два булевых флага:

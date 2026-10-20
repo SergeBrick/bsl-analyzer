@@ -105,7 +105,7 @@ const CACHE_ADOPTION_LOG: &str = "reused cached graph database (workspace unchan
 const STDERR_TAIL_LIMIT: usize = 64 * 1024;
 /// Bound of a wait for an event that a regression would never deliver; a hang watchdog, not a
 /// latency measure.
-const HANG_WATCHDOG: Duration = test_utils::wait::ceiling(Duration::from_secs(60));
+const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
 /// Stderr lines a test counts or searches for over the child's whole life. The bounded tail
 /// cannot answer that: the volume logged between two such lines grows with the time the

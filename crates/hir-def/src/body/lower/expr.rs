@@ -11,6 +11,7 @@ use crate::hir::{BinaryOp, Expr, ExprIdx, Literal, UnaryOp};
 use crate::Name;
 
 use super::diagnostics::{is_deprecated_method, is_followed_by_loop_exit};
+use super::query_fragment::{self, ConcatRole};
 use super::utils::{extract_string_content, looks_like_sdbl};
 use super::LoweringCtx;
 
@@ -147,16 +148,27 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                 None => extract_string_content(node).unwrap_or_default(),
             };
 
-            if looks_like_sdbl(&value) {
-                let (sdbl_text, quote_corrections, literal_map) = match torn {
-                    Some((text, map)) => (text, Vec::new(), Some(map)),
-                    None => {
-                        let (text, corrections) = syntax::extract_sdbl_with_corrections(node)
-                            .unwrap_or_else(|| (value.clone(), vec![]));
-                        (text, corrections, None)
+            let role = query_fragment::concat_role(node);
+            let query_source = match role {
+                // The head's query holds the text of this literal.
+                ConcatRole::Tail => None,
+                ConcatRole::Head(pieces) => syntax::sdbl_query::extract_concatenated_text(&pieces)
+                    .filter(|(text, _)| looks_like_sdbl(text))
+                    .map(|(text, map)| (text, Vec::new(), Some(map), false)),
+                ConcatRole::Alone | ConcatRole::Dynamic => looks_like_sdbl(&value).then(|| {
+                    let dynamic = matches!(role, ConcatRole::Dynamic);
+                    match torn {
+                        Some((text, map)) => (text, Vec::new(), Some(map), dynamic),
+                        None => {
+                            let (text, corrections) = syntax::extract_sdbl_with_corrections(node)
+                                .unwrap_or_else(|| (value.clone(), vec![]));
+                            (text, corrections, None, dynamic)
+                        }
                     }
-                };
+                }),
+            };
 
+            if let Some((sdbl_text, quote_corrections, literal_map, dynamic)) = query_source {
                 let sdbl_ast = parser::parse_sdbl_with_shared_cache(&sdbl_text);
                 let literal_text = node.text().to_string();
                 let error_ranges_in_bsl: Vec<_> =
@@ -173,6 +185,10 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                             (bsl_range, err)
                         })
                         .collect();
+                // Asked only of a text that fails to parse: a clean one has nothing to hide.
+                let incomplete = dynamic
+                    || (!error_ranges_in_bsl.is_empty()
+                        && query_fragment::is_completed_elsewhere(node, &sdbl_text));
 
                 let query = syntax::SdblQuery {
                     query_text: sdbl_text,
@@ -180,6 +196,7 @@ fn lower_literal(ctx: &mut LoweringCtx, node: &SyntaxNode) -> Expr {
                     quote_corrections,
                     error_ranges_in_bsl,
                     literal_map,
+                    incomplete,
                 };
 
                 ctx.pending_sdbl.push((node.text_range(), query));

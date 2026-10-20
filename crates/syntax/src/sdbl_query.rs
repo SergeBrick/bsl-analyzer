@@ -14,9 +14,16 @@ pub struct SdblQueryInfo {
 
     pub error_ranges_in_bsl: Vec<(TextRange, ParseError)>,
 
-    /// How the query text lies in a literal torn by extension markers; `None`
-    /// for an ordinary literal, whose query lies line for line.
+    /// How the query text lies in the source: in a literal torn by extension
+    /// markers, or in the literals of a constant concatenation it was joined from;
+    /// `None` for an ordinary literal, whose query lies line for line.
     pub literal_map: Option<LiteralTextMap>,
+
+    /// The literal holds a piece or a template of a query text rather than the text
+    /// itself: it is concatenated with a value known only at run time, completed
+    /// later by concatenation or substitution, or carries placeholders. Its parse
+    /// errors are those of the piece, not of a query the platform executes.
+    pub incomplete: bool,
 }
 
 /// The parsed query of one string literal without the literal's position —
@@ -33,9 +40,16 @@ pub struct SdblQuery {
     /// Parse errors in the coordinates of the literal text.
     pub error_ranges_in_bsl: Vec<(TextRange, ParseError)>,
 
-    /// How the query text lies in a literal torn by extension markers; `None`
-    /// for an ordinary literal, whose query lies line for line.
+    /// How the query text lies in the source: in a literal torn by extension
+    /// markers, or in the literals of a constant concatenation it was joined from;
+    /// `None` for an ordinary literal, whose query lies line for line.
     pub literal_map: Option<LiteralTextMap>,
+
+    /// The literal holds a piece or a template of a query text rather than the text
+    /// itself: it is concatenated with a value known only at run time, completed
+    /// later by concatenation or substitution, or carries placeholders. Its parse
+    /// errors are those of the piece, not of a query the platform executes.
+    pub incomplete: bool,
 }
 
 impl SdblQuery {
@@ -57,6 +71,7 @@ impl SdblQueryInfo {
             quote_corrections: query.quote_corrections.clone(),
             error_ranges_in_bsl: query.error_ranges_in_bsl.clone(),
             literal_map: query.literal_map.clone(),
+            incomplete: query.incomplete,
         }
     }
 
@@ -74,6 +89,7 @@ impl SdblQueryInfo {
             quote_corrections,
             error_ranges_in_bsl,
             literal_map: None,
+            incomplete: false,
         }
     }
 
@@ -382,10 +398,53 @@ pub fn extract_torn_literal(literal: &SyntaxNode) -> Option<(String, LiteralText
     if !is_torn_literal(literal) {
         return None;
     }
-    let base = literal.text_range().start();
-    let relative = |offset: TextSize| u32::from(offset - base);
-
     let mut builder = TornLiteralBuilder::default();
+    push_literal_text(&mut builder, literal, literal.text_range().start()).then(|| builder.finish())
+}
+
+/// One operand of a constant string concatenation: a string literal, or a
+/// character constant such as `Символы.ПС` standing at `range`.
+#[derive(Debug, Clone)]
+pub enum ConcatPiece {
+    Literal(SyntaxNode),
+    Char(char, TextRange),
+}
+
+/// The text a constant concatenation of strings evaluates to, and where each of
+/// its bytes stands in the source, relative to the start of the first piece.
+///
+/// `"ВЫБРАТЬ 1 КАК Один," + " 2 КАК Два"` is one query to the platform, not two
+/// literals: only the joined text says whether it parses, and only the map
+/// places an error of the second literal in the second literal. `None` when the
+/// first piece is not a literal or a literal holds no text.
+pub fn extract_concatenated_text(pieces: &[ConcatPiece]) -> Option<(String, LiteralTextMap)> {
+    let Some(ConcatPiece::Literal(first)) = pieces.first() else { return None };
+    let base = first.text_range().start();
+    let mut builder = TornLiteralBuilder::default();
+    for piece in pieces {
+        match piece {
+            ConcatPiece::Literal(literal) => {
+                if !push_literal_text(&mut builder, literal, base) {
+                    return None;
+                }
+            }
+            ConcatPiece::Char(ch, range) => {
+                let start = u32::from(range.start() - base);
+                builder.push_unit(*ch, start, u32::from(range.len()));
+            }
+        }
+    }
+    Some(builder.finish())
+}
+
+/// Appends the active text of one string literal to `builder`, its positions
+/// relative to `base`. `false` when the node holds no string.
+fn push_literal_text(
+    builder: &mut TornLiteralBuilder,
+    literal: &SyntaxNode,
+    base: TextSize,
+) -> bool {
+    let relative = |offset: TextSize| u32::from(offset - base);
     let mut started = false;
     let mut line_break_start = None;
 
@@ -399,6 +458,12 @@ pub fn extract_torn_literal(literal: &SyntaxNode) -> Option<(String, LiteralText
         };
         let start = relative(token.text_range().start());
         match token.kind() {
+            SyntaxKind::STRING if !started => {
+                let text = token.text();
+                let content = text[1..].strip_suffix('"').unwrap_or(&text[1..]);
+                builder.push_content(content, start + 1);
+                return true;
+            }
             SyntaxKind::STRING_START if !started => {
                 started = true;
                 builder.push_content(&token.text()[1..], start + 1);
@@ -425,7 +490,7 @@ pub fn extract_torn_literal(literal: &SyntaxNode) -> Option<(String, LiteralText
         }
     }
 
-    started.then(|| builder.finish())
+    started
 }
 
 #[derive(Default)]

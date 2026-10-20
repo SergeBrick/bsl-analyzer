@@ -114,7 +114,7 @@ pub fn apply_default_run_mode_to_db(
     project: Option<&project_model::Project>,
 ) {
     let mode = project.and_then(project_model::Project::default_run_mode);
-    let value = mode.as_deref().is_some_and(|mode| mode != "OrdinaryApplication");
+    let value = matches!(mode.as_deref(), Some("ManagedApplication" | "Auto"));
     let mut options = db.env_options();
     if options.managed_run_mode != value {
         tracing::info!(managed_run_mode = value, default_run_mode = ?mode, "updated run mode");
@@ -517,6 +517,8 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
         assert!(run_mode_of(Some("Auto"), ""));
         assert!(!run_mode_of(Some("OrdinaryApplication"), ""));
         assert!(!run_mode_of(None, ""), "no main configuration");
+        assert!(!run_mode_of(Some("Managed"), ""), "an unknown mode is not known");
+        assert!(!run_mode_of(Some("managedapplication"), ""), "the values are case-sensitive");
         assert!(
             run_mode_of(Some("ManagedApplication"), "[diagnostics]\nordinaryAppSupport = true\n"),
             "the setting does not change the run mode"

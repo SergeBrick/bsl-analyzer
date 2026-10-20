@@ -224,6 +224,19 @@ impl LoweringContext<'_> {
         }
 
         let root_expr = self.lower_expr(&root_node);
+        let more_roots: Vec<ExprHir> = children.map(|n| self.lower_expr(&n)).collect();
+        if !more_roots.is_empty() {
+            // Several roots: membership in any of their hierarchies, as `В` is in any value.
+            let mut roots = vec![root_expr];
+            roots.extend(more_roots);
+            return ExprHir::In {
+                expr: Box::new(expr),
+                negated,
+                values: InValues::List(roots),
+                ty: SdblType::Boolean,
+                range: node.text_range(),
+            };
+        }
         let membership = ExprHir::BinaryOp {
             lhs: Box::new(expr),
             op: crate::hir::BinaryOp::Eq,

@@ -534,7 +534,42 @@ fn paren_or_subquery_expr(p: &mut Parser) {
             m.complete(p, NodeKind::SdblTupleExpr);
         } else {
             p.expect(T![RParen]);
+            // `(ВЫБОР ... КОНЕЦ).Поле`: the platform dereferences a parenthesized expression
+            // as it does a field (8.3.17 and 8.3.27).
+            member_path(p);
             m.complete(p, NodeKind::SdblParenExpr);
+        }
+    }
+}
+
+/// The names after `.` that dereference a value: `ВЫРАЗИТЬ(...).Поле`, `(...).Поле.Подполе`.
+fn member_path(p: &mut Parser) {
+    while super::eat_qualifying_dot(p) {
+        p.check_iteration_limit();
+        let crossed_newline = p.a_line_break_precedes();
+
+        if at_connective_after_dangling_dot(p) {
+            let err = p.start();
+            p.error_custom_at_marker(err, "ожидалось имя поля, встречена логическая связка");
+            break;
+        }
+
+        if at_property_name(p) {
+            // Same-line keyword after a dot is a member name; across a newline a
+            // clause keyword is a dangling-dot recovery point. See the column-ref
+            // dot loop.
+            if crossed_newline
+                && (super::select::is_clause_keyword(p) || super::at_query_boundary(p))
+            {
+                let err = p.start();
+                p.error_custom_at_marker(err, "ожидалось имя поля, встречено ключевое слово");
+                break;
+            }
+
+            p.bump();
+        } else {
+            p.error_expected(T![Ident]);
+            break;
         }
     }
 }
@@ -566,7 +601,15 @@ fn predicate_expr(p: &mut Parser) {
             if p.at_keyword("SELECT") || p.at_keyword("ВЫБРАТЬ") {
                 super::select::subquery(p);
             } else {
-                expression(p);
+                // A list, as after `В`: the platform takes `В ИЕРАРХИИ (&Группа1, &Группа2)`
+                // (8.3.17 and 8.3.27).
+                parse_delimited_list(
+                    p,
+                    T![Comma],
+                    &super::LIST_RECOVERY,
+                    is_expression_start,
+                    expression,
+                );
             }
 
             p.expect(T![RParen]);
@@ -838,34 +881,7 @@ fn column_or_function(p: &mut Parser) {
             p.expect(T![RParen]);
         }
 
-        while super::eat_qualifying_dot(p) {
-            p.check_iteration_limit();
-            let crossed_newline = p.a_line_break_precedes();
-
-            if at_connective_after_dangling_dot(p) {
-                let err = p.start();
-                p.error_custom_at_marker(err, "ожидалось имя поля, встречена логическая связка");
-                break;
-            }
-
-            if at_property_name(p) {
-                // Same-line keyword after a dot is a member name; across a newline a
-                // clause keyword is a dangling-dot recovery point. See the column-ref
-                // dot loop above.
-                if crossed_newline
-                    && (super::select::is_clause_keyword(p) || super::at_query_boundary(p))
-                {
-                    let err = p.start();
-                    p.error_custom_at_marker(err, "ожидалось имя поля, встречено ключевое слово");
-                    break;
-                }
-
-                p.bump();
-            } else {
-                p.error_expected(T![Ident]);
-                break;
-            }
-        }
+        member_path(p);
 
         m.complete(p, NodeKind::SdblFunctionCall);
     } else {

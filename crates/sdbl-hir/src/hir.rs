@@ -792,6 +792,26 @@ impl ExprHir {
         }
     }
 
+    /// The same expression typed `new_ty`; a tuple and a missing expression carry no type.
+    pub fn with_type(mut self, new_ty: SdblType) -> Self {
+        match &mut self {
+            Self::ColumnRef { ty, .. }
+            | Self::Literal { ty, .. }
+            | Self::BinaryOp { ty, .. }
+            | Self::UnaryOp { ty, .. }
+            | Self::FunctionCall { ty, .. }
+            | Self::Case { ty, .. }
+            | Self::Subquery { ty, .. }
+            | Self::Parameter { ty, .. }
+            | Self::In { ty, .. }
+            | Self::Between { ty, .. }
+            | Self::Like { ty, .. }
+            | Self::IsNull { ty, .. } => *ty = new_ty,
+            Self::Tuple { .. } | Self::Missing { .. } => {}
+        }
+        self
+    }
+
     pub fn range(&self) -> TextRange {
         match self {
             Self::ColumnRef { range, .. } => *range,

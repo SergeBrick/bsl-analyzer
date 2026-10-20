@@ -173,6 +173,18 @@ impl PreprocCondition {
     /// chain, including `#Иначе` (which receives whatever is left in
     /// `remaining`).
     pub fn narrow_branch(&self, remaining: &mut EnvFlags) -> EnvFlags {
+        let mut undecided = EnvFlags::EMPTY;
+        self.narrow_branch_tracking(remaining, &mut undecided)
+    }
+
+    /// [`Self::narrow_branch`] that also adds the environments it could not
+    /// decide to `undecided`: an empty mask means "compiled nowhere" only
+    /// while the chain has decided every environment it started with.
+    pub fn narrow_branch_tracking(
+        &self,
+        remaining: &mut EnvFlags,
+        undecided: &mut EnvFlags,
+    ) -> EnvFlags {
         let mut mask = EnvFlags::EMPTY;
         for env in remaining.iter() {
             match self.eval(env) {
@@ -183,6 +195,7 @@ impl PreprocCondition {
                 Some(false) => {}
                 None => {
                     *remaining = remaining.without(env);
+                    *undecided = *undecided | env;
                 }
             }
         }

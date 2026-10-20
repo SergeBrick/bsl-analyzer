@@ -106,6 +106,70 @@ mod tests {
         assert!(client.is_empty(), "a server module never compiles this branch: {client:?}");
     }
 
+    /// A branch the condition cannot decide may be compiled, so its calls are
+    /// judged: `Линукс` is no symbol of the help, and an `#Иначе` after such a
+    /// branch is no more decided than the branch itself.
+    #[test]
+    fn an_undecided_branch_is_judged() {
+        let module = |call_site: &str| {
+            in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            ))
+        };
+        const CALL: &str = "    Сложение(1);\n";
+
+        let then_branch = module(&format!("#Если Линукс Тогда\n{CALL}#КонецЕсли\n"));
+        assert_eq!(then_branch.len(), 1, "the condition is undecided: {then_branch:?}");
+        let else_branch = module(&format!("#Если Линукс Тогда\n#Иначе\n{CALL}#КонецЕсли\n"));
+        assert_eq!(else_branch.len(), 1, "the chain is undecided: {else_branch:?}");
+        let after_taken = module(&format!("#Если Сервер Тогда\n#Иначе\n{CALL}#КонецЕсли\n"));
+        assert!(after_taken.is_empty(), "the server takes the first branch: {after_taken:?}");
+    }
+
+    /// A module of unknown environment may compile any of its branches.
+    #[test]
+    fn a_branch_of_a_module_of_unknown_environment_is_judged() {
+        let fixture = r#"
+//- /test.bsl
+Процедура Сложение(Левый, Правый) Экспорт
+КонецПроцедуры
+
+Процедура Тест()
+#Если Сервер Тогда
+    Сложение(1);
+#КонецЕсли
+КонецПроцедуры
+"#;
+        let diags = check_hir_diagnostic_with_fixtures(fixture);
+        let mismatched: Vec<_> =
+            diags.iter().filter(|d| d.code == DiagnosticCode::MismatchedArgCount).collect();
+        assert_eq!(mismatched.len(), 1, "expected one MismatchedArgCount, got: {diags:?}");
+    }
+
+    /// A method declared in a module-level branch no environment compiles is
+    /// dropped with the branch; one under an undecided region may be compiled.
+    #[test]
+    fn a_method_in_a_module_level_branch_no_environment_compiles_is_not_judged() {
+        let module = |condition: &str| {
+            in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 #Если {condition} Тогда\n\
+                 Процедура Тест() Экспорт\n    Сложение(1);\nКонецПроцедуры\n\
+                 #КонецЕсли\n"
+            ))
+        };
+
+        let dead = module("Сервер И Не Сервер");
+        assert!(dead.is_empty(), "no environment compiles the method: {dead:?}");
+        let client = module("ТолстыйКлиентОбычноеПриложение");
+        assert!(client.is_empty(), "a server module never compiles the method: {client:?}");
+        let compiled = module("Сервер");
+        assert_eq!(compiled.len(), 1, "the server compiles the method: {compiled:?}");
+        let undecided = module("Линукс");
+        assert_eq!(undecided.len(), 1, "the region is undecided: {undecided:?}");
+    }
+
     #[test]
     fn does_not_fire_when_optional_args_are_omitted() {
         let fixture = r#"

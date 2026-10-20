@@ -119,7 +119,7 @@ fn body_arg_diagnostics(
         // A branch no environment of this body compiles never reaches the
         // platform's argument check, so neither arity nor types are judged
         // there — `#Если Сервер И Не Сервер Тогда` typing hints are the common shape.
-        if binding.in_uncompiled_branch {
+        if binding.in_dead_branch {
             continue;
         }
         if narrowing_enabled && narrow.is_none() {

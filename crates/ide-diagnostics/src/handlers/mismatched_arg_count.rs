@@ -127,6 +127,38 @@ mod tests {
         assert!(after_taken.is_empty(), "the server takes the first branch: {after_taken:?}");
     }
 
+    /// The session module runs on the server and in the external connection, where
+    /// `Сервер` is undecided: a branch nested under `#Если Сервер` may still be
+    /// compiled there, while a contradiction is false whatever `Сервер` holds.
+    #[test]
+    fn a_branch_is_dead_only_when_every_environment_rules_it_out() {
+        let module = |call_site: &str| {
+            let fixture = format!(
+                "//- /Ext/SessionModule.bsl\n\
+                 Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            );
+            check_hir_diagnostic_with_fixtures(&fixture)
+                .into_iter()
+                .filter(|diag| diag.code == DiagnosticCode::MismatchedArgCount)
+                .map(|diag| diag.message)
+                .collect::<Vec<_>>()
+        };
+        const CALL: &str = "    Сложение(1);\n";
+
+        let plain = module(CALL);
+        assert_eq!(plain.len(), 1, "the session module compiles the plain call: {plain:?}");
+        let nested = module(&format!(
+            "#Если Сервер Тогда\n#Если Не Сервер Тогда\n{CALL}#КонецЕсли\n#КонецЕсли\n"
+        ));
+        assert_eq!(nested.len(), 1, "the external connection may compile it: {nested:?}");
+
+        let contradiction = module(&format!("#Если Сервер И Не Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(contradiction.is_empty(), "no environment compiles this branch: {contradiction:?}");
+        let client = module(&format!("#Если ТонкийКлиент Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(client.is_empty(), "neither environment is a thin client: {client:?}");
+    }
+
     /// A module of unknown environment may compile any of its branches.
     #[test]
     fn a_branch_of_a_module_of_unknown_environment_is_judged() {

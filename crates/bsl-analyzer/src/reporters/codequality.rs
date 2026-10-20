@@ -57,9 +57,9 @@ impl Serialize for CodeQualitySeq<'_> {
             // path+code+occurrence only.
             let fallback_lines: Option<Vec<String>> =
                 if file.line_snippets.is_empty() && !file.diagnostics.is_empty() {
-                    std::fs::read_to_string(&file.path)
-                        .ok()
-                        .map(|text| text.lines().map(normalize_diagnostic_snippet).collect())
+                    std::fs::read_to_string(&file.path).ok().map(|text| {
+                        line_index::split_lines(&text).map(normalize_diagnostic_snippet).collect()
+                    })
                 } else {
                     None
                 };

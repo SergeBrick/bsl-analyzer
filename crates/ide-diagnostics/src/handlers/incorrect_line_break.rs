@@ -34,7 +34,7 @@ pub fn check_block(ctx: &AnalysisContext, block: &Block) -> Vec<Diagnostic<Local
     }
 
     let text = block.text;
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = line_index::split_lines(text).collect();
 
     let mut diagnostics = Vec::new();
 

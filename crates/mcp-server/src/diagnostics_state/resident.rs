@@ -840,7 +840,7 @@ impl DiagnosticsResident {
                                     .unwrap_or(Path::new(path))
                                     .to_string_lossy()
                                     .replace(std::path::MAIN_SEPARATOR, "/");
-                                let source_lines: Vec<_> = text.lines().collect();
+                                let source_lines: Vec<_> = line_index::split_lines(&text).collect();
                                 diagnostics
                                     .into_iter()
                                     .map(|d| {

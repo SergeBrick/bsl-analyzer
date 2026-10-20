@@ -68,6 +68,23 @@ pub(crate) struct TypePropertyCorrection {
     pub(crate) property_types: Option<Vec<String>>,
 }
 
+/// A correction to the return type of a method the extract already carries.
+/// The help page of a method with several call variants documents one return
+/// type for all of them, and the extract keeps it: `ФабрикаXDTO.Создать`
+/// returns an `ОбъектXDTO` for an object type and a `ЗначениеXDTO` for a value
+/// type, while the record says `ЗначениеXDTO` alone. Like
+/// [`TypePropertyCorrection`] it never declares a method: a corpus that lacks
+/// the target is left alone.
+#[derive(Debug)]
+pub(crate) struct MethodReturnTypeCorrection {
+    /// The owning type, by its Russian or English spelling.
+    pub(crate) type_name: String,
+    /// The method, by its Russian or English spelling.
+    pub(crate) method_name: String,
+    /// Replaces the whole extracted return-type list.
+    pub(crate) return_types: Vec<String>,
+}
+
 /// A platform type whose extracted member surface — every method and property —
 /// is attested as complete for the named platform release. A miss on such a
 /// receiver is a defect of the checked code rather than a gap in the extract,
@@ -89,6 +106,7 @@ const OVERLAY_ROOT_FIELDS: &[&str] = &[
     "global_function_parameter_overrides",
     "type_property_additions",
     "type_property_corrections",
+    "method_return_type_corrections",
     "type_member_surface_attestations",
 ];
 
@@ -210,6 +228,44 @@ pub(crate) fn parse_property_corrections(
     Ok(corrections)
 }
 
+/// Parses the optional `method_return_type_corrections` section. An absent
+/// section yields no corrections; the root schema is validated the same way as
+/// [`parse_overrides`].
+pub(crate) fn parse_method_return_type_corrections(
+    overlay_source: &str,
+) -> Result<Vec<MethodReturnTypeCorrection>, OverlayError> {
+    let root: Value = serde_json::from_str(overlay_source)
+        .map_err(|error| OverlayError(format!("malformed overlay JSON: {error}")))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| OverlayError("overlay root must be an object".to_owned()))?;
+    require_only_fields(object, OVERLAY_ROOT_FIELDS, "overlay root")?;
+    validate_schema_version(object)?;
+    let entries = match object.get("method_return_type_corrections") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(value) => value.as_array().ok_or_else(|| {
+            OverlayError("overlay method_return_type_corrections must be an array".to_owned())
+        })?,
+    };
+
+    let corrections: Vec<MethodReturnTypeCorrection> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| parse_method_return_type_correction(index, entry))
+        .collect::<Result<_, _>>()?;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for correction in &corrections {
+        let key = (correction.type_name.to_lowercase(), correction.method_name.to_lowercase());
+        if !seen.insert(key) {
+            return Err(OverlayError(format!(
+                "duplicate method return type correction for {}.{}",
+                correction.type_name, correction.method_name
+            )));
+        }
+    }
+    Ok(corrections)
+}
+
 /// Parses the optional `type_member_surface_attestations` section. An absent
 /// section yields no attestations; the root schema is validated the same way as
 /// [`parse_overrides`].
@@ -309,6 +365,44 @@ fn parse_property_correction(
     required_string(object, "rationale", index)?;
 
     Ok(TypePropertyCorrection { type_name, property_name, is_readonly, property_types })
+}
+
+fn parse_method_return_type_correction(
+    index: usize,
+    entry: &Value,
+) -> Result<MethodReturnTypeCorrection, OverlayError> {
+    let context = format!("method return type correction {index}");
+    let object =
+        entry.as_object().ok_or_else(|| OverlayError(format!("{context} must be an object")))?;
+    require_only_fields(
+        object,
+        &["type", "name", "return_types", "evidence_source", "rationale"],
+        &context,
+    )?;
+    let type_name = required_string(object, "type", index)?;
+    let method_name = required_string(object, "name", index)?;
+    let return_types = object
+        .get("return_types")
+        .and_then(Value::as_array)
+        .ok_or_else(|| OverlayError(format!("{context} return_types must be an array")))?
+        .iter()
+        .map(|value| {
+            value.as_str().filter(|name| !name.trim().is_empty()).map(str::to_owned).ok_or_else(
+                || OverlayError(format!("{context} return_types must contain non-empty strings")),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if return_types.is_empty() {
+        return Err(OverlayError(format!("{context} return_types must not be empty")));
+    }
+    let unique: HashSet<&str> = return_types.iter().map(String::as_str).collect();
+    if unique.len() != return_types.len() {
+        return Err(OverlayError(format!("{context} return_types contains duplicate types")));
+    }
+    required_string(object, "evidence_source", index)?;
+    required_string(object, "rationale", index)?;
+
+    Ok(MethodReturnTypeCorrection { type_name, method_name, return_types })
 }
 
 fn parse_member_surface_attestation(

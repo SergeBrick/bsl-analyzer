@@ -3,9 +3,10 @@ mod overlay_schema;
 
 pub(crate) use overlay_schema::OverlayError;
 use overlay_schema::{
-    parse_global_function_overrides, parse_member_surface_attestations, parse_overrides,
-    parse_property_additions, parse_property_corrections, validate_version_bounds,
-    MethodParameterOverride, TypeMemberSurfaceAttestation, TypePropertyAddition,
+    parse_global_function_overrides, parse_member_surface_attestations,
+    parse_method_return_type_corrections, parse_overrides, parse_property_additions,
+    parse_property_corrections, validate_version_bounds, MethodParameterOverride,
+    TypeMemberSurfaceAttestation, TypePropertyAddition,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -272,6 +273,83 @@ pub(crate) fn apply_type_property_corrections(
     }
 
     Ok(())
+}
+
+/// Corrects the return types of methods the extract carries with a wrong list,
+/// in place. Targets resolve and skip exactly as in
+/// [`apply_type_property_corrections`]: an absent type or method leaves the
+/// corpus alone, and two entries resolving to one method are refused.
+pub(crate) fn apply_method_return_type_corrections(
+    data: &mut Value,
+    overlay_source: &str,
+) -> Result<(), OverlayError> {
+    let corrections = parse_method_return_type_corrections(overlay_source)?;
+    if corrections.is_empty() {
+        return Ok(());
+    }
+
+    let type_keys = extracted_type_keys(data);
+    let mut corrected: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for correction in corrections {
+        let written = format!("{}.{}", correction.type_name, correction.method_name);
+        let folded_type = correction.type_name.fold_lower();
+        let Some(canonical_type) = type_keys.get(folded_type.as_str()).cloned() else {
+            continue;
+        };
+        let Some(index) = unique_method_index(data, &canonical_type, &correction.method_name)
+        else {
+            continue;
+        };
+        if let Some(previous) = corrected.insert(index, written.clone()) {
+            return Err(OverlayError(format!(
+                "method return type corrections {previous} and {written} resolve to the same method of {canonical_type}"
+            )));
+        }
+        let Some(method) = data
+            .get_mut("methods")
+            .and_then(Value::as_array_mut)
+            .and_then(|methods| methods.get_mut(index))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        method.insert("return_type".to_owned(), Value::String(correction.return_types.join(", ")));
+    }
+
+    Ok(())
+}
+
+/// Index of the single method `canonical_type.name` names, by either spelling of
+/// the method; two records of one pair leave the method uncorrected, as
+/// [`unique_property_index`] does for properties.
+fn unique_method_index(data: &Value, canonical_type: &str, method_name: &str) -> Option<usize> {
+    let wanted = method_name.fold_lower();
+    let mut found = None;
+    for (index, method) in
+        data.get("methods").and_then(Value::as_array).into_iter().flatten().enumerate()
+    {
+        let Some(object) = method.as_object() else { continue };
+        if !stdx::case::eq_ignore_case(
+            object.get("type_name").and_then(Value::as_str).unwrap_or(""),
+            canonical_type,
+        ) {
+            continue;
+        }
+        let named = ["name", "english_name"].iter().any(|field| {
+            object
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|existing| existing.fold_lower() == wanted)
+        });
+        if !named {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(index);
+    }
+    found
 }
 
 /// Folded Russian and English spellings of every extracted type → that type's

@@ -865,8 +865,8 @@ fn the_documented_examples_load_as_they_stand() {
     let page = include_str!("../data/OVERLAYS.md");
     let blocks = documented_overlay_blocks(page);
     assert!(
-        blocks.len() >= 5,
-        "the page documents five sections with a loadable example, found {}",
+        blocks.len() >= 6,
+        "the page documents six sections with a loadable example, found {}",
         blocks.len()
     );
 
@@ -881,6 +881,7 @@ fn the_documented_examples_load_as_they_stand() {
             + super::overlay_schema::parse_global_function_overrides(block).unwrap().len()
             + super::overlay_schema::parse_property_additions(block).unwrap().len()
             + super::overlay_schema::parse_property_corrections(block).unwrap().len()
+            + super::overlay_schema::parse_method_return_type_corrections(block).unwrap().len()
             + super::overlay_schema::parse_member_surface_attestations(block).unwrap().len();
         assert!(entries > 0, "an example documents no section entry:\n{block}");
     }
@@ -1168,4 +1169,168 @@ fn a_star_without_a_family_prefix_is_a_plain_name() {
     apply_global_function_parameter_overlays(&mut data, &global_function_overlay(entry)).unwrap();
 
     assert_eq!(data["global_functions"][0]["parameters"][1]["param_type"], "ОбъектМетаданных*");
+}
+
+fn xdto_factory_data() -> Value {
+    json!({
+        "types": [
+            {"name": "ФабрикаXDTO", "english_name": "XDTOFactory"},
+            {"name": "ОбъектXDTO", "english_name": "XDTODataObject"},
+            {"name": "ЗначениеXDTO", "english_name": "XDTODataValue"}
+        ],
+        "methods": [
+            {
+                "id": 2070,
+                "type_name": "XDTOFactory",
+                "name": "Создать",
+                "english_name": "Create",
+                "return_type": "ЗначениеXDTO",
+                "parameters": [{"name": "Тип", "param_type": "ТипОбъектаXDTO"}]
+            },
+            {
+                "id": 2072,
+                "type_name": "XDTOFactory",
+                "name": "ПрочитатьXML",
+                "english_name": "ReadXML",
+                "return_type": "ОбъектXDTO",
+                "parameters": []
+            }
+        ]
+    })
+}
+
+fn return_type_overlay(entries: Value) -> String {
+    json!({
+        "schema_version": 1,
+        "method_parameter_overrides": [],
+        "method_return_type_corrections": entries
+    })
+    .to_string()
+}
+
+fn xdto_create_correction() -> Value {
+    json!({
+        "type": "XDTOFactory",
+        "name": "Создать",
+        "return_types": ["ОбъектXDTO", "ЗначениеXDTO"],
+        "evidence_source": "runtime probe: ТипЗнч of the result for each call variant",
+        "rationale": "the help page documents one return type for every variant"
+    })
+}
+
+#[test]
+fn corrects_a_method_return_type_in_place() {
+    let mut data = xdto_factory_data();
+
+    apply_method_return_type_corrections(
+        &mut data,
+        &return_type_overlay(json!([xdto_create_correction()])),
+    )
+    .unwrap();
+
+    let method = &data["methods"][0];
+    assert_eq!(method["return_type"], "ОбъектXDTO, ЗначениеXDTO");
+    assert_eq!(method["id"], 2070, "a correction keeps the record's identity and docs");
+    assert_eq!(method["parameters"][0]["param_type"], "ТипОбъектаXDTO");
+    assert_eq!(data["methods"][1]["return_type"], "ОбъектXDTO", "a neighbour is not touched");
+}
+
+#[test]
+fn corrects_a_return_type_named_by_its_russian_type_and_english_method() {
+    let mut data = xdto_factory_data();
+    let mut entry = xdto_create_correction();
+    entry["type"] = Value::String("ФабрикаXDTO".to_owned());
+    entry["name"] = Value::String("Create".to_owned());
+
+    apply_method_return_type_corrections(&mut data, &return_type_overlay(json!([entry]))).unwrap();
+
+    assert_eq!(data["methods"][0]["return_type"], "ОбъектXDTO, ЗначениеXDTO");
+}
+
+#[test]
+fn a_return_type_correction_without_a_target_leaves_the_corpus_alone() {
+    let mut absent_type_data = xdto_factory_data();
+    let mut absent_method_data = xdto_factory_data();
+    let mut absent_type = xdto_create_correction();
+    absent_type["type"] = Value::String("СовсемДругойТип".to_owned());
+    let mut absent_method = xdto_create_correction();
+    absent_method["name"] = Value::String("НетТакогоМетода".to_owned());
+
+    apply_method_return_type_corrections(
+        &mut absent_type_data,
+        &return_type_overlay(json!([absent_type])),
+    )
+    .expect("an absent type is not a corpus error");
+    apply_method_return_type_corrections(
+        &mut absent_method_data,
+        &return_type_overlay(json!([absent_method])),
+    )
+    .expect("an absent method is not a corpus error");
+
+    assert_eq!(absent_type_data["methods"][0]["return_type"], "ЗначениеXDTO");
+    assert_eq!(absent_method_data["methods"][0]["return_type"], "ЗначениеXDTO");
+
+    // Control: the same entry with its real target does correct the corpus.
+    let mut control = xdto_factory_data();
+    apply_method_return_type_corrections(
+        &mut control,
+        &return_type_overlay(json!([xdto_create_correction()])),
+    )
+    .unwrap();
+    assert_eq!(control["methods"][0]["return_type"], "ОбъектXDTO, ЗначениеXDTO");
+}
+
+#[test]
+fn two_return_type_corrections_of_one_method_are_rejected() {
+    let mut data = xdto_factory_data();
+    let mut second = xdto_create_correction();
+    second["type"] = Value::String("ФабрикаXDTO".to_owned());
+    second["name"] = Value::String("Create".to_owned());
+
+    let error = apply_method_return_type_corrections(
+        &mut data,
+        &return_type_overlay(json!([xdto_create_correction(), second])),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "method return type corrections XDTOFactory.Создать and ФабрикаXDTO.Create resolve to the same method of XDTOFactory"
+    );
+}
+
+#[test]
+fn a_return_type_correction_needs_a_non_empty_unique_type_list() {
+    for (return_types, message) in [
+        (json!([]), "method return type correction 0 return_types must not be empty"),
+        (
+            json!(["ОбъектXDTO", "ОбъектXDTO"]),
+            "method return type correction 0 return_types contains duplicate types",
+        ),
+        (json!("ОбъектXDTO"), "method return type correction 0 return_types must be an array"),
+    ] {
+        let mut data = xdto_factory_data();
+        let mut entry = xdto_create_correction();
+        entry["return_types"] = return_types;
+
+        let error =
+            apply_method_return_type_corrections(&mut data, &return_type_overlay(json!([entry])))
+                .unwrap_err();
+
+        assert_eq!(error.to_string(), message);
+        assert_eq!(data["methods"][0]["return_type"], "ЗначениеXDTO");
+    }
+}
+
+#[test]
+fn corrects_the_curated_xdto_factory_create() {
+    let mut data = xdto_factory_data();
+
+    apply_method_return_type_corrections(&mut data, include_str!("../data/platform_overlays.json"))
+        .unwrap();
+
+    assert_eq!(
+        data["methods"][0]["return_type"], "ОбъектXDTO, ЗначениеXDTO",
+        "the curated overlay must correct ФабрикаXDTO.Создать"
+    );
 }

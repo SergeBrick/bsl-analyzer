@@ -2,7 +2,7 @@ use bsl_platform::capability::{Category as CapabilityCategory, EntryKind as Capa
 use intern::NormName;
 use stdx::case::CaseExt;
 use syntax::ast_utils::{active_children, active_children_with_tokens, field_tail_name_token};
-use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 use crate::body::{
     Body, BodyDiagnostic, ExternalRef, MagicNumberContext, ManagerType, RedundantAccessKind,
@@ -1321,36 +1321,160 @@ fn has_detail_error_description(arg: &SyntaxNode) -> bool {
         && (text.contains("информацияобошибке") || text.contains("errorinfo"))
 }
 
+/// An assignment made in the `Исключение` branch before the logging call;
+/// target and value are kept as [`normalized_code_text`].
+struct ExceptAssignment {
+    target: String,
+    start: TextSize,
+    value: String,
+}
+
+/// How many assignments may be followed back from the comment argument
+/// (`Текст = Подробно; Сообщение = Заголовок + Текст; ... Сообщение`).
+const MAX_DETAIL_TRACE_DEPTH: u8 = 4;
+
+/// Decides whether the comment of a logging call made in `Исключение` carries
+/// `ПодробноеПредставлениеОшибки(ИнформацияОбОшибке())` through a variable or a
+/// field assigned earlier in the same handler, also when the comment only
+/// concatenates such a variable or passes it through a string function, and
+/// when the error info itself was saved to a variable first.
 fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> Option<bool> {
-    let arg_text = arg.text().to_string();
-    let var_name = arg_text.trim();
-    if var_name.is_empty() || !var_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    let except_clause = call_node.ancestors().find(|n| n.kind() == SyntaxKind::EXCEPT_CLAUSE)?;
+    let call_start = call_node.text_range().start();
+
+    let assignments: Vec<ExceptAssignment> = except_clause
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ASSIGN_STMT && n.text_range().end() <= call_start)
+        .filter_map(|stmt| {
+            let mut nodes = active_children(&stmt);
+            let target = nodes.next()?;
+            let value = nodes.last()?;
+            Some(ExceptAssignment {
+                target: normalized_code_text(&target),
+                start: stmt.text_range().start(),
+                value: normalized_code_text(&value),
+            })
+        })
+        .collect();
+
+    let comment = normalized_code_text(arg);
+    if comment.is_empty() {
         return None;
     }
-    let var_name = var_name.fold_lower();
+    if is_plain_identifier(&comment)
+        && last_assignment_before(&assignments, &comment, call_start).is_none()
+    {
+        // A variable filled outside the handler: its content is not known here.
+        return Some(true);
+    }
 
-    let except_clause = call_node.ancestors().find(|n| n.kind() == SyntaxKind::EXCEPT_CLAUSE)?;
+    Some(carries_detail_error(&comment, call_start, &assignments, MAX_DETAIL_TRACE_DEPTH))
+}
 
-    let stmt_list = active_children(&except_clause).find(|n| n.kind() == SyntaxKind::STMT_LIST)?;
+fn carries_detail_error(
+    text: &str,
+    before: TextSize,
+    assignments: &[ExceptAssignment],
+    depth: u8,
+) -> bool {
+    if detail_call_arguments(text).iter().any(|arg| is_error_info(arg, before, assignments)) {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    assignments.iter().filter(|a| a.start < before && references_path(text, &a.target)).any(|a| {
+        last_assignment_before(assignments, &a.target, before).is_some_and(|last| {
+            carries_detail_error(&last.value, last.start, assignments, depth - 1)
+        })
+    })
+}
 
-    for child in active_children(&stmt_list) {
-        if child.kind() == SyntaxKind::ASSIGN_STMT {
-            let lhs_node = match active_children(&child).next() {
-                Some(n) => n,
-                None => continue,
-            };
-            let lhs_name = lhs_node.text().to_string().trim().fold_lower();
-            if lhs_name == var_name {
-                let rhs_text = child.text().to_string().fold_lower();
-                let has_detail = (rhs_text.contains("подробноепредставлениеошибки")
-                    || rhs_text.contains("detailerrordescription"))
-                    && (rhs_text.contains("информацияобошибке") || rhs_text.contains("errorinfo"));
-                return Some(has_detail);
+fn is_error_info(arg: &str, before: TextSize, assignments: &[ExceptAssignment]) -> bool {
+    let is_error_info_call =
+        |text: &str| text.contains("информацияобошибке") || text.contains("errorinfo");
+    if is_error_info_call(arg) {
+        return true;
+    }
+    is_plain_identifier(arg)
+        && last_assignment_before(assignments, arg, before)
+            .is_some_and(|last| is_error_info_call(&last.value))
+}
+
+/// Arguments of every `ПодробноеПредставлениеОшибки(...)` call in `text`.
+fn detail_call_arguments(text: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    for name in ["подробноепредставлениеошибки(", "detailerrordescription("]
+    {
+        for (pos, _) in text.match_indices(name) {
+            if text[..pos].chars().next_back().is_some_and(is_identifier_char) {
+                continue;
+            }
+            let args_start = pos + name.len();
+            let mut level = 1usize;
+            for (offset, ch) in text[args_start..].char_indices() {
+                match ch {
+                    '(' => level += 1,
+                    ')' => {
+                        level -= 1;
+                        if level == 0 {
+                            result.push(&text[args_start..args_start + offset]);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
+    result
+}
 
-    Some(true)
+fn last_assignment_before<'a>(
+    assignments: &'a [ExceptAssignment],
+    target: &str,
+    before: TextSize,
+) -> Option<&'a ExceptAssignment> {
+    assignments.iter().filter(|a| a.start < before && a.target == target).max_by_key(|a| a.start)
+}
+
+/// `path` occurs in `text` as a whole value: not as a part of a longer name,
+/// not as the receiver of a field, index or call.
+fn references_path(text: &str, path: &str) -> bool {
+    text.match_indices(path).any(|(pos, _)| {
+        let before_ok =
+            !text[..pos].chars().next_back().is_some_and(|c| is_identifier_char(c) || c == '.');
+        let after_ok = !text[pos + path.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| is_identifier_char(c) || matches!(c, '.' | '(' | '['));
+        before_ok && after_ok
+    })
+}
+
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_plain_identifier(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(is_identifier_char)
+}
+
+/// Lower-cased code of `node` without trivia; every string literal piece is
+/// collapsed to `"` so that names inside strings are not taken for code.
+fn normalized_code_text(node: &SyntaxNode) -> String {
+    let mut text = String::new();
+    for token in node.descendants_with_tokens().filter_map(|el| el.into_token()) {
+        match token.kind() {
+            kind if kind.is_trivia() => {}
+            SyntaxKind::STRING
+            | SyntaxKind::STRING_START
+            | SyntaxKind::STRING_PART
+            | SyntaxKind::STRING_TAIL => text.push('"'),
+            _ => text.push_str(&token.text().fold_lower()),
+        }
+    }
+    text
 }
 
 fn extract_type_name_from_first_arg(node: &SyntaxNode) -> Option<String> {

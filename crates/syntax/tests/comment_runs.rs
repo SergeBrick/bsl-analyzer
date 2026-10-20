@@ -86,6 +86,15 @@ fn code_line_breaks_the_run() {
 }
 
 #[test]
+fn code_after_lone_cr_breaks_the_run() {
+    // Одиночный `\r` заканчивает комментарий, и код за ним - отдельная строка
+    // модуля для платформы: серия на нём кончается.
+    assert_eq!(run_lines("// а\rА = 1;\n// б\n// в\n"), vec![(0, 0), (1, 2)]);
+    // Контроль: без `\r` код - текст комментария, серия одна.
+    assert_eq!(run_lines("// а А = 1;\n// б\n// в\n"), vec![(0, 2)]);
+}
+
+#[test]
 fn trailing_comment_is_in_the_run_without_owning_its_line() {
     let code = "А = 1; // хвост\n// своя\n// своя2\n";
 

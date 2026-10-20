@@ -1522,6 +1522,7 @@ pub(super) fn apply_resident_changes(
                 resident.project.compatibility_mode(),
             );
             ide_host_core::apply_ordinary_forms_setting(&mut resident.db, Some(&resident.project));
+            ide_host_core::apply_default_run_mode(&mut resident.db, Some(&resident.project));
             // `<DefaultRunMode>` can decide the diagnostics' `ordinaryAppSupport`; the
             // config is otherwise read once, at the build.
             resident.config.ordinary_app_support =
@@ -1930,6 +1931,40 @@ mod tests {
         );
         assert!(!rebuild, "an edit inside the configuration root is applied in place");
         assert_eq!(setting(&resident), Some(true));
+    }
+
+    /// `<DefaultRunMode>` decides whether the managed thick client compiles object
+    /// modules in the resident as in the CLI and the LSP: read at the build, reread on
+    /// an edit of `Configuration.xml`.
+    #[test]
+    fn the_resident_follows_the_run_mode_of_the_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().canonicalize().unwrap();
+        sample_workspace(root);
+        let xml = |mode: &str| {
+            format!(
+                "<MetaDataObject><Configuration><Properties>\
+                 <DefaultRunMode>{mode}</DefaultRunMode>\
+                 </Properties></Configuration></MetaDataObject>"
+            )
+        };
+        write(root, "Configuration.xml", &xml("ManagedApplication"));
+
+        let mut resident = DiagnosticsState::build_resident_for_test(root);
+        assert!(resident.db.env_options().managed_run_mode);
+
+        write(root, "Configuration.xml", &xml("OrdinaryApplication"));
+        let (rebuild, _) = apply_resident_changes(
+            &mut resident,
+            &[root.join("Configuration.xml")],
+            &[],
+            &[],
+            &[],
+            |_| None,
+            &HashMap::new(),
+        );
+        assert!(!rebuild, "an edit inside the configuration root is applied in place");
+        assert!(!resident.db.env_options().managed_run_mode);
     }
 
     /// The diagnostics `ordinaryAppSupport` derived from `<DefaultRunMode>` follows an

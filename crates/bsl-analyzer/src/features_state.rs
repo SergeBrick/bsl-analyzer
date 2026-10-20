@@ -29,7 +29,7 @@ impl GlobalState {
         apply_compatibility_mode_to_db(db, self.project.as_ref());
         ide_host_core::apply_ordinary_forms_setting(db, self.project.as_ref());
         apply_ordinary_app_support_to_db(db, self.project.as_ref());
-        apply_default_run_mode_to_db(db, self.project.as_ref());
+        ide_host_core::apply_default_run_mode(db, self.project.as_ref());
     }
 }
 
@@ -100,26 +100,6 @@ pub fn apply_compatibility_mode_to_db(
     if db.compatibility_mode().as_deref() != mode.as_deref() {
         tracing::info!(compatibility_mode = ?mode, "updated compatibility mode");
         db.set_compatibility_mode(mode);
-    }
-}
-
-/// `<DefaultRunMode>` of the main configuration of `project` into the environment
-/// options: whether the configuration runs as a managed application
-/// (`ManagedApplication` or `Auto`), so that the thick client of the managed
-/// application compiles its object and manager modules. Applied after
-/// [`apply_project_config_to_db`] and again when `Configuration.xml` changes, like
-/// [`ide_host_core::apply_ordinary_forms_setting`].
-pub fn apply_default_run_mode_to_db(
-    db: &mut RootDatabaseImpl,
-    project: Option<&project_model::Project>,
-) {
-    let mode = project.and_then(project_model::Project::default_run_mode);
-    let value = matches!(mode.as_deref(), Some("ManagedApplication" | "Auto"));
-    let mut options = db.env_options();
-    if options.managed_run_mode != value {
-        tracing::info!(managed_run_mode = value, default_run_mode = ?mode, "updated run mode");
-        options.managed_run_mode = value;
-        db.set_env_options(options);
     }
 }
 
@@ -489,8 +469,6 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
     /// `ordinaryAppSupport` setting changes it.
     #[test]
     fn default_run_mode_reaches_the_execution_model() {
-        use super::apply_default_run_mode_to_db;
-
         fn run_mode_of(configuration: Option<&str>, toml: &str) -> bool {
             let dir = tempdir().unwrap();
             let cf = dir.path().join("src").join("cf");
@@ -509,7 +487,7 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
             let project = Project::new(dir.path()).unwrap();
             let mut db = RootDatabaseImpl::new();
             apply_project_config_to_db(&mut db, &project.config);
-            apply_default_run_mode_to_db(&mut db, Some(&project));
+            ide_host_core::apply_default_run_mode(&mut db, Some(&project));
             db.env_options().managed_run_mode
         }
 

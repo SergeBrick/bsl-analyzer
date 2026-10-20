@@ -552,6 +552,12 @@ pub struct CallArgBinding {
     pub args: Vec<ExprId>,
 
     pub candidate: CandidateCallBinding,
+
+    /// The call sits in a `#Если` branch nothing proves compiled
+    /// (`InferenceContext::in_uncompiled_branch`). The binding still answers
+    /// resolution readers; the argument judgement leaves it alone, because the
+    /// platform drops such a branch before it could check a single argument.
+    pub in_uncompiled_branch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1899,6 +1905,7 @@ impl<'db> InferenceContext<'db> {
                 call_expr,
                 args: args.to_vec(),
                 candidate: projection.semantic,
+                in_uncompiled_branch: self.in_uncompiled_branch,
             });
         }
         return_ty
@@ -3183,6 +3190,7 @@ impl<'db> InferenceContext<'db> {
                                     call_expr: expr_id,
                                     args: arg_ids,
                                     candidate: projection.semantic,
+                                    in_uncompiled_branch: self.in_uncompiled_branch,
                                 });
                             }
                         }

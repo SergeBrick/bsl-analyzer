@@ -1372,6 +1372,7 @@ mod tests {
                 ctx.thin_client && ctx.thick_client,
                 "{name} runs in the thin and thick client"
             );
+            assert!(ctx.mobile_client, "the 8.3.17 help lists the mobile client: {name}");
             assert!(ctx.server && ctx.external_connection, "{name} keeps its server contexts");
             assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
         }

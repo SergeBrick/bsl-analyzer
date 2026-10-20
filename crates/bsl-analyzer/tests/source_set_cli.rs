@@ -50,12 +50,11 @@ fn diagnostics_rules_stdio_reuses_config_until_real_reload_and_preserves_ranges(
         }
     };
     assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
-    assert!(
-        test_utils::wait::poll_until(HANG_WATCHDOG, Duration::from_millis(20), || {
-            session.stderr.retained().contains(diagnostic_rules::WARNING)
-        }),
-        "the load-time warning reaches stderr"
-    );
+    let deadline = Instant::now() + HANG_WATCHDOG;
+    while !session.stderr.retained().contains(diagnostic_rules::WARNING) {
+        assert!(Instant::now() < deadline, "the load-time warning never reached stderr");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let initial = diagnostic_rules::warning_count(&session.stderr.retained());
     assert!(initial > 0);
     for _ in 0..2 {

@@ -30,55 +30,98 @@ mod diagnostic_rules;
 
 #[test]
 fn diagnostics_rules_stdio_reuses_config_until_real_reload_and_preserves_ranges() {
+    use diagnostic_rules::{Finding, PULLS_PER_LOAD_BOUND};
+
     let dir = tempfile::tempdir().unwrap();
+    // Outside the project root, which the server watches: a log inside it would turn every
+    // log line into a file change.
+    let logs = tempfile::tempdir().unwrap();
     let source = diagnostic_rules::project(dir.path());
-    let mut session = McpSession::start(dir.path(), &[]);
-    let findings = |session: &mut McpSession| {
-        let deadline = Instant::now() + HANG_WATCHDOG;
-        loop {
+    let mut session =
+        McpSession::start_with_log(dir.path(), &[], &diagnostic_rules::log_template(logs.path()));
+    let step = Duration::from_millis(20);
+    let log = || diagnostic_rules::session_log(logs.path());
+    // The resident revision and findings of the first answer `accept` takes. The revision is
+    // what tells an answer computed after a reload from one computed before it: a rebuild
+    // raises it, and nothing lowers it.
+    let answer = |session: &mut McpSession, accept: &dyn Fn(u64, &[Finding]) -> bool| {
+        let mut last = Value::Null;
+        let mut taken = None;
+        let accepted = test_utils::wait::poll_until(HANG_WATCHDOG, step, || {
             let response = session.diagnostics(serde_json::json!({
                 "action":"file", "path":"src/Module.bsl", "min_severity":"hint"
             }));
-            let body = &response["result"]["structuredContent"];
-            if body["status"] != "loading" {
-                return diagnostic_rules::legacy_ranges(
-                    body["result"]["findings"].as_array().expect("findings"),
-                );
+            last = response["result"]["structuredContent"].clone();
+            if last["status"] == "loading" {
+                return false;
             }
-            assert!(Instant::now() < deadline, "MCP diagnostics never became ready: {response}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+            let revision = last["revision"].as_u64().expect("revision");
+            let findings = diagnostic_rules::legacy_ranges(
+                last["result"]["findings"].as_array().expect("findings"),
+            );
+            let accepted = accept(revision, &findings);
+            taken = Some((revision, findings));
+            accepted
+        });
+        assert!(
+            accepted,
+            "the awaited MCP diagnostics answer never arrived; last answer: {last}; \
+             stderr tail: {}",
+            session.stderr.snapshot()
+        );
+        taken.expect("an accepted answer")
     };
-    assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
-    let deadline = Instant::now() + HANG_WATCHDOG;
-    while !session.stderr.retained().contains(diagnostic_rules::WARNING) {
-        assert!(Instant::now() < deadline, "the load-time warning never reached stderr");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let initial = diagnostic_rules::warning_count(&session.stderr.retained());
-    assert!(initial > 0);
-    for _ in 0..2 {
-        assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, true));
-    }
-    assert_eq!(diagnostic_rules::warning_count(&session.stderr.retained()), initial);
+    let typos = diagnostic_rules::expected(&source, false, true);
+    let no_typos = diagnostic_rules::expected(&source, false, false);
 
-    diagnostic_rules::replace_config(dir.path(), 7);
-    let deadline = Instant::now() + HANG_WATCHDOG;
-    loop {
-        if findings(&mut session) == diagnostic_rules::expected(&source, false, false)
-            && diagnostic_rules::warning_count(&session.stderr.retained()) > initial
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "MCP config reload did not change the Typo result");
-        std::thread::sleep(Duration::from_millis(20));
+    let (first_revision, findings) = answer(&mut session, &|_, _| true);
+    assert_eq!(findings, typos);
+    assert!(
+        test_utils::wait::poll_until(HANG_WATCHDOG, step, || log()
+            .contains(diagnostic_rules::WARNING)),
+        "the load-time warning never reached the log"
+    );
+    let startup_log = log();
+    assert!(!startup_log.contains(diagnostic_rules::RELOAD_WARNING));
+    let startup_warnings = diagnostic_rules::warning_count(&startup_log);
+    assert!(startup_warnings > 0);
+
+    // Requests against an unchanged config must not reload it. A load per request raises the
+    // revision and the warning count by at least one each, which outgrows the rebuilds a
+    // starting server may still make; neither count has a stable value to compare exactly.
+    let mut revision = first_revision;
+    for _ in 0..PULLS_PER_LOAD_BOUND {
+        let (now, findings) = answer(&mut session, &|_, _| true);
+        assert_eq!(findings, typos);
+        revision = now;
     }
-    let reloaded = diagnostic_rules::warning_count(&session.stderr.retained());
-    assert!(reloaded > initial);
-    for _ in 0..2 {
-        assert_eq!(findings(&mut session), diagnostic_rules::expected(&source, false, false));
+    let grown = revision - first_revision;
+    assert!(grown < PULLS_PER_LOAD_BOUND as u64, "requests reloaded the startup config: {grown}");
+    let grown = diagnostic_rules::warning_count(&log()) - startup_warnings;
+    assert!(grown < PULLS_PER_LOAD_BOUND, "requests logged the startup config again: {grown}");
+
+    diagnostic_rules::replace_config_marked(dir.path(), 7);
+    let (reloaded_revision, _) =
+        answer(&mut session, &|now, findings| now > revision && findings == no_typos);
+    assert!(
+        test_utils::wait::poll_until(HANG_WATCHDOG, step, || log()
+            .contains(diagnostic_rules::RELOAD_WARNING)),
+        "the reloaded config's load-time warning never reached the log"
+    );
+    let reloaded_log = log();
+    assert!(diagnostic_rules::warning_count(&reloaded_log) > startup_warnings);
+    let reload_warnings = reloaded_log.matches(diagnostic_rules::RELOAD_WARNING).count();
+
+    let mut revision = reloaded_revision;
+    for _ in 0..PULLS_PER_LOAD_BOUND {
+        let (now, findings) = answer(&mut session, &|_, _| true);
+        assert_eq!(findings, no_typos);
+        revision = now;
     }
-    assert_eq!(diagnostic_rules::warning_count(&session.stderr.retained()), reloaded);
+    let grown = revision - reloaded_revision;
+    assert!(grown < PULLS_PER_LOAD_BOUND as u64, "requests reloaded the changed config: {grown}");
+    let grown = log().matches(diagnostic_rules::RELOAD_WARNING).count() - reload_warnings;
+    assert!(grown < PULLS_PER_LOAD_BOUND, "requests logged the changed config again: {grown}");
     assert!(session.shutdown().unwrap().success());
 }
 
@@ -106,18 +149,11 @@ const STDERR_TAIL_LIMIT: usize = 64 * 1024;
 /// latency measure.
 const HANG_WATCHDOG: Duration = test_utils::wait::hang_guard(Duration::from_secs(60));
 
-/// Stderr lines a test counts or searches for over the child's whole life. The bounded tail
-/// cannot answer that: the volume logged between two such lines grows with the time the
-/// child takes, so on a slow run the earlier line has already been trimmed away.
-const RETAINED_STDERR: [&str; 2] = [diagnostic_rules::WARNING, diagnostic_rules::PRIVATE_VALUE];
-
-/// Drains child stderr continuously while retaining a bounded tail, plus every line
-/// naming one of [`RETAINED_STDERR`]. This keeps native startup diagnostics available
-/// without allowing a verbose child to block on a full stderr pipe; the fixture's memory
-/// grows only with those named lines, never with the rest of the output.
+/// Drains child stderr continuously while retaining only a bounded tail. This
+/// keeps native startup diagnostics available without allowing a verbose child
+/// to block on a full stderr pipe or grow the fixture's memory without bound.
 struct StderrCapture {
     tail: Arc<Mutex<String>>,
-    retained: Arc<Mutex<String>>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -127,26 +163,13 @@ impl StderrCapture {
 
         let tail = Arc::new(Mutex::new(String::new()));
         let reader_tail = Arc::clone(&tail);
-        let retained = Arc::new(Mutex::new(String::new()));
-        let reader_retained = Arc::clone(&retained);
         let reader = std::thread::spawn(move || {
             let mut stderr = stderr;
             let mut buffer = [0_u8; 4096];
-            let mut line = Vec::new();
-            let mut named = false;
             loop {
                 match stderr.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(read) => {
-                        for &byte in &buffer[..read] {
-                            line.push(byte);
-                            if byte == b'\n' {
-                                Self::retain_line(&reader_retained, &mut line, &mut named, true);
-                            } else if line.len() >= STDERR_TAIL_LIMIT {
-                                // Output without newlines must not grow the fixture's memory.
-                                Self::retain_line(&reader_retained, &mut line, &mut named, false);
-                            }
-                        }
                         let text = String::from_utf8_lossy(&buffer[..read]);
                         let mut tail = reader_tail.lock().expect("stderr capture mutex");
                         tail.push_str(&text);
@@ -160,40 +183,12 @@ impl StderrCapture {
                     }
                 }
             }
-            Self::retain_line(&reader_retained, &mut line, &mut named, true);
         });
-        Self { tail, retained, reader: Some(reader) }
-    }
-
-    /// Hands the buffered part of a line over: to `retained` once the line has named a
-    /// [`RETAINED_STDERR`] needle, otherwise away. `named` carries that across the parts
-    /// of one overlong line. An unnamed part that is not the line's `end` keeps its last
-    /// bytes, so a needle cut by the split is still found whole in the next part.
-    fn retain_line(retained: &Mutex<String>, line: &mut Vec<u8>, named: &mut bool, end: bool) {
-        let text = String::from_utf8_lossy(line).into_owned();
-        *named |= RETAINED_STDERR.iter().any(|needle| text.contains(needle));
-        if *named {
-            retained.lock().expect("stderr capture mutex").push_str(&text);
-            line.clear();
-        } else if end {
-            line.clear();
-        } else {
-            let longest = RETAINED_STDERR.iter().map(|needle| needle.len()).max().unwrap_or(0);
-            line.drain(..line.len().saturating_sub(longest.saturating_sub(1)));
-        }
-        if end {
-            *named = false;
-        }
+        Self { tail, reader: Some(reader) }
     }
 
     fn snapshot(&self) -> String {
         self.tail.lock().expect("stderr capture mutex").clone()
-    }
-
-    /// Every [`RETAINED_STDERR`] line written so far. A line longer than the tail limit
-    /// keeps only its last part from just before the needle on.
-    fn retained(&self) -> String {
-        self.retained.lock().expect("stderr capture mutex").clone()
     }
 
     #[cfg(unix)]
@@ -219,6 +214,7 @@ impl StderrCapture {
         }
     }
 
+    #[cfg(unix)]
     fn wait_for_text(&self, needle: &str, timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -3046,6 +3042,7 @@ fn workspace_cache_scope_daemon_broker_and_broker_required_share_only_the_leaf()
         None,
         root.path(),
         Some(&daemon_log),
+        None,
     );
     let graph_broker = graph_overview(&mut broker);
     assert_eq!(graph_broker, graph_required, "broker proxy starts from the warm daemon cache");
@@ -4057,6 +4054,30 @@ impl McpSession {
         session
     }
 
+    /// [`Self::start`] with the server's log in `log_file` (a `BSL_LOG_FILE` value, which may
+    /// name `{pid}`) instead of stderr, whose captured tail drops what it has already shown.
+    fn start_with_log(workspace: &Path, flags: &[&str], log_file: &Path) -> Self {
+        let paths = tempfile::tempdir().unwrap();
+        let cache = paths.path().join("cache");
+        let state = paths.path().join("state");
+        let mut session = Self::start_transport_with_cwd_and_log(
+            workspace,
+            flags,
+            "stdio",
+            Some(&cache),
+            None,
+            Some(&state),
+            None,
+            Some("0"),
+            None,
+            workspace,
+            None,
+            Some(log_file),
+        );
+        session._temporary_paths = Some(paths);
+        session
+    }
+
     fn start_with_cache(
         workspace: &Path,
         flags: &[&str],
@@ -4102,6 +4123,7 @@ impl McpSession {
             backend_pid,
             workspace,
             None,
+            None,
         )
     }
 
@@ -4133,6 +4155,7 @@ impl McpSession {
             backend_pid,
             child_cwd,
             None,
+            None,
         )
     }
 
@@ -4150,6 +4173,7 @@ impl McpSession {
         backend_pid: Option<u32>,
         child_cwd: &Path,
         daemon_log_path: Option<&Path>,
+        log_file: Option<&Path>,
     ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bsl-analyzer-app"));
         command
@@ -4184,6 +4208,9 @@ impl McpSession {
         }
         if let Some(path) = daemon_log_path {
             command.env("BSL_MCP_DAEMON_LOG", path);
+        }
+        if let Some(path) = log_file {
+            command.env("BSL_LOG_FILE", path);
         }
         if mode == "broker" || mode == "daemon" {
             // A fixture-owned broker backend must not inherit the production

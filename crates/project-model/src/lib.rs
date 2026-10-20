@@ -574,6 +574,13 @@ impl Project {
         configuration_ordinary_forms_in_managed_app(self.configuration_path()?)
     }
 
+    /// `<DefaultRunMode>` of the main configuration ([`configuration_default_run_mode`]),
+    /// as written there. Unlike [`Self::ordinary_app_support`] no setting overrides
+    /// it. `None` when the project has no main configuration or it states nothing.
+    pub fn default_run_mode(&self) -> Option<String> {
+        configuration_default_run_mode(self.configuration_path()?)
+    }
+
     /// Whether the ordinary application (legacy thick client) is part of the
     /// project's runtime surface, with where the answer came from: an explicit
     /// `[diagnostics] ordinaryAppSupport` first, then `<DefaultRunMode>` of the main

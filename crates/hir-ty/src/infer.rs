@@ -1705,7 +1705,7 @@ impl<'db> InferenceContext<'db> {
     /// Accessibility of a cross-module call to `callee_module` (a common
     /// module): every environment this body runs in must either be one the
     /// callee is compiled for, or — for `ВызовСервера` modules — a client
-    /// environment making a remote server call.
+    /// environment or the external connection making a remote server call.
     /// `module_name` is the name as written at the call site; `None` (a bare
     /// call to a global module's export) falls back to the module's metadata
     /// name.
@@ -1743,7 +1743,7 @@ impl<'db> InferenceContext<'db> {
             }
             let mut missing = self.body_env.without(env) & self.checked_env;
             if server_call {
-                missing = missing.without(EnvFlags::ALL_CLIENTS);
+                missing = missing.without(EnvFlags::SERVER_CALL_CALLERS);
             }
             missing
         };

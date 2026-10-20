@@ -54,10 +54,15 @@ impl EnvFlags {
             | Self::MOBILE_CLIENT.0,
     );
     /// Every interactive client environment, including the legacy thick
-    /// client — the set a `ВызовСервера` common module may be invoked from
-    /// without being compiled into it.
+    /// client.
     pub const ALL_CLIENTS: EnvFlags =
         EnvFlags(Self::MANAGED_CLIENTS.0 | Self::THICK_CLIENT_ORDINARY.0);
+    /// Environments a `ВызовСервера` common module may be invoked from without
+    /// being compiled into them: every interactive client, and the external
+    /// connection, which reaches such a module in the client-server variant too
+    /// (checked live on 8.3.17 and 8.3.27).
+    pub const SERVER_CALL_CALLERS: EnvFlags =
+        EnvFlags(Self::ALL_CLIENTS.0 | Self::EXTERNAL_CONNECTION.0);
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -300,6 +305,16 @@ impl EnvOptions {
     fn server_envs(&self) -> EnvFlags {
         EnvFlags::SERVER_SIDE
     }
+
+    /// Whether the external connection is among the checked environments. Its
+    /// verdicts follow the client-server variant, where the external connection is
+    /// a client of the server: a common module that is only `Server` is not visible
+    /// there, and neither is a `&НаСервере` method of an object-family module (see
+    /// [`directive_env`]). In the file variant the platform compiles server code in
+    /// the external connection's own process and sees both.
+    pub fn external_connection_checked(&self) -> bool {
+        self.checked_environments.contains(EnvFlags::EXTERNAL_CONNECTION)
+    }
 }
 
 /// Environments a module's code can execute in, before any per-method
@@ -391,6 +406,13 @@ pub fn common_module_env(cm: &bsl_metadata::CommonModule, opts: &EnvOptions) -> 
 /// Environments a compilation directive selects, as a mask to intersect with
 /// the module's base set. `None` in a form/command module means the platform
 /// default `&НаСервере`; elsewhere the module alone decides.
+///
+/// `&НаСервере` in an object-family module selects the server alone when the
+/// external connection is checked: in the client-server variant that connection
+/// does not compile such a method, and a call to it from code without a directive
+/// fails there with "Процедура или функция с указанным именем не определена"
+/// (checked live on 8.3.17 and 8.3.27). Without the external connection checked the
+/// file variant's view is kept, where the method is compiled in that process too.
 pub fn directive_env(
     kind: Option<AnnotationKind>,
     module_type: ModuleType,
@@ -398,6 +420,11 @@ pub fn directive_env(
 ) -> EnvFlags {
     match kind {
         Some(AnnotationKind::AtClient) => opts.client_envs(),
+        Some(AnnotationKind::AtServer | AnnotationKind::AtServerNoContext)
+            if opts.external_connection_checked() && is_object_family(module_type) =>
+        {
+            EnvFlags::SERVER
+        }
         Some(AnnotationKind::AtServer | AnnotationKind::AtServerNoContext) => opts.server_envs(),
         Some(AnnotationKind::AtClientAtServer | AnnotationKind::AtClientAtServerNoContext) => {
             opts.client_envs() | opts.server_envs()
@@ -422,7 +449,12 @@ pub fn directive_env(
 /// an object, manager, record set or value manager module: there a `&НаСервере`
 /// method is simply not compiled in a client (checked live on 8.3.17 and 8.3.27).
 pub fn local_server_call_is_remote(module_type: ModuleType) -> bool {
-    !matches!(
+    !is_object_family(module_type)
+}
+
+/// An object, manager, record set or value manager module.
+fn is_object_family(module_type: ModuleType) -> bool {
+    matches!(
         module_type,
         ModuleType::ObjectModule
             | ModuleType::ManagerModule
@@ -858,6 +890,46 @@ mod tests {
         for ty in [ModuleType::FormModule, ModuleType::CommandModule, ModuleType::CommonModule] {
             assert!(local_server_call_is_remote(ty), "{ty:?}");
         }
+    }
+
+    /// With the external connection checked, it is judged as in the client-server
+    /// variant: a `&НаСервере` method of an object-family module leaves it, and a
+    /// `ВызовСервера` common module is reachable from it.
+    #[test]
+    fn external_connection_is_judged_as_in_the_client_server_variant() {
+        let checked = EnvOptions {
+            checked_environments: EnvOptions::default().checked_environments
+                | EnvFlags::EXTERNAL_CONNECTION,
+            ..EnvOptions::default()
+        };
+        assert!(checked.external_connection_checked());
+        assert!(!EnvOptions::default().external_connection_checked());
+        for ty in [
+            ModuleType::ObjectModule,
+            ModuleType::ManagerModule,
+            ModuleType::RecordSetModule,
+            ModuleType::ValueManagerModule,
+        ] {
+            let md = ModuleMetadata::unknown(ty);
+            for directive in [AnnotationKind::AtServer, AnnotationKind::AtServerNoContext] {
+                assert_eq!(body_env(&md, &[directive], &checked), EnvFlags::SERVER, "{ty:?}");
+                assert_eq!(
+                    body_env(&md, &[directive], &EnvOptions::default()),
+                    EnvFlags::SERVER_SIDE,
+                    "{ty:?}: unchanged without the external connection checked"
+                );
+            }
+            assert_eq!(body_env(&md, &[], &checked), EnvFlags::SERVER_SIDE, "{ty:?}");
+        }
+        // A form keeps `&НаСервере` on the server side as before.
+        let form = ModuleMetadata::unknown(ModuleType::FormModule);
+        assert_eq!(
+            directive_env(Some(AnnotationKind::AtServer), form.module_type, &checked),
+            EnvFlags::SERVER_SIDE
+        );
+        assert!(EnvFlags::SERVER_CALL_CALLERS.contains(EnvFlags::ALL_CLIENTS));
+        assert!(EnvFlags::SERVER_CALL_CALLERS.contains(EnvFlags::EXTERNAL_CONNECTION));
+        assert!(!EnvFlags::SERVER_CALL_CALLERS.intersects(EnvFlags::SERVER));
     }
 
     #[test]

@@ -14,6 +14,8 @@ An ordinary form module runs only in a thick client: the ordinary application's,
 
 Object, manager, record set and value manager modules run on the server and in the external connection, and — when the main configuration's `DefaultRunMode` is `ManagedApplication` or `Auto` — also in the managed thick client. That client is judged as in the client-server variant: there a common module flagged only "Server" is not visible (one with "Server call" or "Client (managed application)" is) and an `&AtServer` method of the module is not compiled. In the file variant the platform compiles server code in the client process and sees such modules, so a finding there names code that will not compile against a client-server infobase. In an `OrdinaryApplication` configuration and without a main configuration the managed thick client is not added: the platform also compiles these modules there, but such a configuration is normally not run in that client.
 
+The external connection, when listed in `checked_environments`, is judged as in the client-server variant too: `&AtServer` and `&AtServerNoContext` methods of object, manager, record set and value manager modules are not compiled there, so their bodies are checked against the server alone, and calling them from code without a directive is a `ModuleAccessibility` finding for the external connection.
+
 Current limitations (deliberately conservative):
 
 - extension modules (interceptors `&Instead`/`&Before`/`&After`, `&ChangeAndValidate`) are not checked;

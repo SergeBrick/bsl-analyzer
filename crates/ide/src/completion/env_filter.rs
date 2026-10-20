@@ -71,7 +71,8 @@ impl EnvFilter {
 
     /// Whether the common module `name` is callable from the cursor's
     /// environments — the completion mirror of `ModuleAccessibility`:
-    /// `ВызовСервера` modules stay visible to every client environment.
+    /// `ВызовСервера` modules stay visible to every client environment and to
+    /// the external connection.
     /// Judged on the caller-visible flags; an extension that NARROWS an
     /// adopted module hides it here while the diagnostic tolerates that
     /// corner as a miss — the caller-visible model is what completion sells.
@@ -94,7 +95,7 @@ impl EnvFilter {
         }
         let mut missing = self.body_env.without(module_env) & self.checked_env;
         if module.is_server_call() {
-            missing = missing.without(EnvFlags::ALL_CLIENTS);
+            missing = missing.without(EnvFlags::SERVER_CALL_CALLERS);
         }
         missing.is_empty()
     }

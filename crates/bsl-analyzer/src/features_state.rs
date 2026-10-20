@@ -22,8 +22,8 @@ impl GlobalState {
 
     /// Reads the settings the main configuration's `Configuration.xml` states into the
     /// database: the compatibility mode, whether ordinary forms run in the managed
-    /// thick client, the ordinary-application support its default run mode implies and
-    /// whether that run mode is the managed application.
+    /// thick client, the ordinary-application support its default run mode implies
+    /// and whether that run mode is the managed application.
     pub(crate) fn apply_configuration_xml_settings(&mut self) {
         let db = self.analysis_host.raw_database_mut();
         apply_compatibility_mode_to_db(db, self.project.as_ref());
@@ -495,7 +495,8 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
         assert!(run_mode_of(Some("Auto"), ""));
         assert!(!run_mode_of(Some("OrdinaryApplication"), ""));
         assert!(!run_mode_of(None, ""), "no main configuration");
-        assert!(!run_mode_of(Some("Foo"), ""), "an unknown mode");
+        assert!(!run_mode_of(Some("Managed"), ""), "an unknown mode is not known");
+        assert!(!run_mode_of(Some("managedapplication"), ""), "the values are case-sensitive");
         assert!(
             run_mode_of(Some("ManagedApplication"), "[diagnostics]\nordinaryAppSupport = true\n"),
             "the setting does not change the run mode"

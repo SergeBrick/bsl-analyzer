@@ -1933,11 +1933,11 @@ mod tests {
         assert_eq!(setting(&resident), Some(true));
     }
 
-    /// `<DefaultRunMode>` decides whether object modules are judged in the managed thick
-    /// client in the resident as in the CLI and the LSP: read at the build, reread on an
-    /// edit of `Configuration.xml`.
+    /// `<DefaultRunMode>` decides whether the managed thick client compiles object
+    /// modules in the resident as in the CLI and the LSP: read at the build, reread on
+    /// an edit of `Configuration.xml`.
     #[test]
-    fn the_resident_follows_the_default_run_mode_of_the_configuration() {
+    fn the_resident_follows_the_run_mode_of_the_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let root = &dir.path().canonicalize().unwrap();
         sample_workspace(root);
@@ -1949,10 +1949,9 @@ mod tests {
             )
         };
         write(root, "Configuration.xml", &xml("ManagedApplication"));
-        let managed = |resident: &DiagnosticsResident| resident.db.env_options().managed_run_mode;
 
         let mut resident = DiagnosticsState::build_resident_for_test(root);
-        assert!(managed(&resident), "read at the build");
+        assert!(resident.db.env_options().managed_run_mode);
 
         write(root, "Configuration.xml", &xml("OrdinaryApplication"));
         let (rebuild, _) = apply_resident_changes(
@@ -1965,7 +1964,7 @@ mod tests {
             &HashMap::new(),
         );
         assert!(!rebuild, "an edit inside the configuration root is applied in place");
-        assert!(!managed(&resident), "reread on the edit");
+        assert!(!resident.db.env_options().managed_run_mode);
     }
 
     /// The diagnostics `ordinaryAppSupport` derived from `<DefaultRunMode>` follows an

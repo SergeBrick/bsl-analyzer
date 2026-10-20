@@ -577,7 +577,6 @@ impl Store {
         Ok(store)
     }
 
-    /// Apply every schema/open mutation as atomic groups under a cooperative fence.
     /// Shorten this connection's contention budget, for a test that holds the writer itself
     /// and has steps of its own to take meanwhile: under the default budget each of them would
     /// wait the whole budget out before carrying on. It lasts until the connection's next point

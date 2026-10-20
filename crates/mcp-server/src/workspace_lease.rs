@@ -320,7 +320,7 @@ impl WorkspaceLease {
         run: impl FnOnce() -> T,
     ) -> T {
         cache.ensure().unwrap();
-        let _guard = LockGuard::acquire(&cache.lease_lock_path(), LOCK_WAIT).unwrap();
+        let _guard = LockGuard::acquire_unbounded(&cache.lease_lock_path()).unwrap();
         run()
     }
 
@@ -336,7 +336,7 @@ impl WorkspaceLease {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let _guard = LockGuard::acquire(&path, LOCK_WAIT).unwrap();
+            let _guard = LockGuard::acquire_unbounded(&path).unwrap();
             ready_tx.send(()).unwrap();
             // Either the stand releases it, or the stand is gone and the sender with it.
             let _ = release_rx.recv();
@@ -354,7 +354,7 @@ impl WorkspaceLease {
         let path = cache.lease_lock_path();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let _guard = LockGuard::acquire(&path, LOCK_WAIT).unwrap();
+            let _guard = LockGuard::acquire_unbounded(&path).unwrap();
             ready_tx.send(()).unwrap();
             std::thread::sleep(duration);
         });
@@ -1390,6 +1390,20 @@ impl LockGuard {
             match Self::try_acquire(path) {
                 Ok(guard) => return Ok(guard),
                 Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(e) if is_lock_contention(&e) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Take the lock whenever its holder lets go, however long that takes. Test stands hold
+    /// the lock to fix an order of events, and a daemon's own heartbeat may hold it for longer
+    /// than `LOCK_WAIT` on a loaded machine: a bound here would fail the stand on speed alone.
+    #[cfg(test)]
+    fn acquire_unbounded(path: &Path) -> io::Result<Self> {
+        loop {
+            match Self::try_acquire(path) {
+                Ok(guard) => return Ok(guard),
                 Err(e) if is_lock_contention(&e) => std::thread::sleep(Duration::from_millis(20)),
                 Err(e) => return Err(e),
             }

@@ -40,6 +40,23 @@ pub fn apply_ordinary_forms_setting(
     }
 }
 
+/// `<DefaultRunMode>` of the main configuration of `project` into the environment
+/// options: whether the configuration runs as a managed application
+/// (`ManagedApplication` or `Auto`), so that the thick client of the managed
+/// application compiles its object and manager modules. Applied after the options
+/// are built from the settings, and again when `Configuration.xml` changes, like
+/// [`apply_ordinary_forms_setting`].
+pub fn apply_default_run_mode(db: &mut RootDatabaseImpl, project: Option<&project_model::Project>) {
+    let mode = project.and_then(project_model::Project::default_run_mode);
+    let value = matches!(mode.as_deref(), Some("ManagedApplication" | "Auto"));
+    let mut options = db.env_options();
+    if options.managed_run_mode != value {
+        tracing::info!(managed_run_mode = value, default_run_mode = ?mode, "updated run mode");
+        options.managed_run_mode = value;
+        db.set_env_options(options);
+    }
+}
+
 /// The `ordinaryAppSupport` the diagnostics rules of `project` end up with: the
 /// `[diagnostics]` setting, else the value derived from `<DefaultRunMode>`
 /// ([`project_model::Project::diagnostics_rules_json`]). A section the diagnostics

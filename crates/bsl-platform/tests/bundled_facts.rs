@@ -278,6 +278,28 @@ fn the_curated_overlays_reach_the_built_in_facts() {
     assert!(data.get_method("JSONWriter", "ЗаписатьНачалоТаблицы").is_none());
 }
 
+/// The curated return-type correction reaches the built-in facts under both
+/// spellings of its target, keeps the record's identity, and leaves the
+/// neighbouring factory methods as extracted.
+#[test]
+fn the_curated_return_type_correction_reaches_the_built_in_facts() {
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+
+    let create = data
+        .get_method("ФабрикаXDTO", "Создать")
+        .expect("the correction's target must exist in the built-in facts");
+    assert_eq!(create.id, 2070);
+    assert_eq!(create.return_type.as_deref(), Some("ОбъектXDTO, ЗначениеXDTO"));
+    assert_eq!(data.get_method("XDTOFactory", "Create").map(|m| m.id), Some(2070));
+
+    assert_eq!(
+        data.get_method("XDTOFactory", "ПрочитатьXML").and_then(|m| m.return_type.as_deref()),
+        Some("ОбъектXDTO"),
+        "only the named method moved"
+    );
+}
+
 /// The curating rule of an attestation, held by a test rather than by prose in
 /// `OVERLAYS.md`: a type whose extract had to be patched has no surface the
 /// extract may call complete, and neither has a type a configuration extends.

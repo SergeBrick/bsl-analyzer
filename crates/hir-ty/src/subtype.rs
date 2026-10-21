@@ -484,11 +484,11 @@ fn is_binary_data(kind: &TypeKind) -> bool {
         if platform_name_eq_ci(&facet.name, "ДвоичныеДанные", "BinaryData"))
 }
 
-/// The slot itself, or one member of a documented union, is a form item kind.
+/// The slot itself, or one member of a documented union, admits a form item.
 fn slot_admits_form_item(db: &dyn TypeKernelDb, to: TypeId) -> bool {
     match db.lookup_type(to) {
-        TypeKind::Union(parts) => parts.iter().any(|p| is_form_item_kind(db.lookup_type(*p))),
-        kind => is_form_item_kind(kind),
+        TypeKind::Union(parts) => parts.iter().any(|p| slot_admits_form_item(db, *p)),
+        kind => is_form_item_kind(kind) || is_unknown_kind_form_item(kind),
     }
 }
 
@@ -1329,6 +1329,11 @@ mod tests {
         {
             assert!(is_coercible_to(&db, unknown, parent_slot), "{:?}", db.lookup_type(unknown));
             assert!(is_coercible_to(&db, unknown, item("ДекорацияФормы")));
+            for base in [item("ЭлементФормы"), item("FormControl")] {
+                assert!(is_coercible_to(&db, unknown, base));
+                let optional_base = db.union(vec![base, db.undefined()]);
+                assert!(is_coercible_to(&db, unknown, optional_base));
+            }
             assert!(
                 !is_assignable(&db, unknown, parent_slot),
                 "the lattice keeps the base type wider than each kind"

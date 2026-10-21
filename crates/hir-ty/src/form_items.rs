@@ -84,9 +84,27 @@ pub(crate) fn ordinary_controls_closed(db: &dyn HirDatabase, resolver: &Resolver
     if ordinary_form_with_known_dialog(db, resolver).is_none() {
         return false;
     }
-    let bodies = db.module_bodies(module_id);
-    let mut all = bodies.method_bodies().map(|(_, body, _)| body).chain(bodies.module_code());
-    !all.any(body_may_change_controls)
+    let source_root = db.file_source_root_input(module_id.file_id).source_root_id(db);
+    let index = db.module_index(source_root);
+    // An extension can add controls that the base dialog does not describe, even
+    // while inference uses the base file as its metadata context.
+    let unchanged = |bodies: &hir_def::ModuleBodies| {
+        let mut all = bodies.method_bodies().map(|(_, body, _)| body).chain(bodies.module_code());
+        !all.any(body_may_change_controls)
+    };
+    std::iter::once(module_id.file_id).chain(index.sibling_bodies(module_id.file_id)).all(|file| {
+        if !unchanged(&db.module_bodies(hir_def::ModuleId::new(file))) {
+            return false;
+        }
+        if file == module_id.file_id {
+            return true;
+        }
+        // Inserted statements are opaque in a standalone extension body; only
+        // the assembled body lowers them as executable expressions.
+        let effective =
+            hir_def::effective_module::EffectiveModuleId::new(db, module_id.file_id, file);
+        unchanged(&hir_def::effective_module::module_bodies_effective(db, effective))
+    })
 }
 
 fn body_may_change_controls(body: &hir_def::Body) -> bool {
@@ -97,16 +115,24 @@ fn body_may_change_controls(body: &hir_def::Body) -> bool {
     let is_controls = |expr: &Expr| match expr {
         Expr::Path(name) => is_ordinary_controls_name(name),
         Expr::Field { field, .. } => is_ordinary_controls_name(field),
-        Expr::Index { index, .. } => matches!(
-            body.expr_idx(*index),
-            Expr::Literal(Literal::String(text)) if is_ordinary_controls_name(&Name::new(text))
-        ),
+        Expr::Index { base, index } => match body.expr_idx(*index) {
+            Expr::Literal(Literal::String(text)) => is_ordinary_controls_name(&Name::new(text)),
+            Expr::Literal(_) => false,
+            // A computed property of this form may be its controls collection.
+            _ => matches!(body.expr_idx(*base), Expr::Path(name) if is_form_self_name(name)),
+        },
         _ => false,
     };
     let is_add = |method: &Name| {
         ["Добавить", "Add", "ДобавитьActiveX", "AddActiveX"]
             .iter()
             .any(|add| method.eq_ignore_case(&Name::new(add)))
+    };
+    // Table-box columns also become named form controls. The receiver may be a
+    // local alias, so a syntactic scan cannot restrict this to a literal field path.
+    let creates_columns = |method: &Name| {
+        method.eq_ignore_case(&Name::new("СоздатьКолонки"))
+            || method.eq_ignore_case(&Name::new("CreateColumns"))
     };
     let is_eval = |name: &Name| {
         name.eq_ignore_case(&Name::new("Вычислить")) || name.eq_ignore_case(&Name::new("Eval"))
@@ -141,10 +167,12 @@ fn body_may_change_controls(body: &hir_def::Body) -> bool {
         match expr {
             Expr::Path(name) if is_form_self_name(name) => escapes(),
             Expr::MethodCall { receiver, method, .. } => {
-                is_add(method) && is_controls(body.expr_idx(*receiver))
+                creates_columns(method) || (is_add(method) && is_controls(body.expr_idx(*receiver)))
             }
             Expr::Call { callee, .. } => match body.expr_idx(*callee) {
-                Expr::Field { base, field } => is_add(field) && is_controls(body.expr_idx(*base)),
+                Expr::Field { base, field } => {
+                    creates_columns(field) || (is_add(field) && is_controls(body.expr_idx(*base)))
+                }
                 Expr::Path(name) => is_eval(name),
                 _ => false,
             },

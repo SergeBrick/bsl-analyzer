@@ -2,7 +2,28 @@ use std::path::Path;
 
 pub const SOURCE_EXTENSIONS: &[&str] = &[bsl_conventions::BSL_EXTENSION];
 
-pub const METADATA_WATCHED_EXTENSIONS: &[&str] = &[bsl_conventions::XML_EXTENSION];
+/// The ordinary-form sidecar (`Ext/Form/Form.json`) is JSON, so JSON is watched too -
+/// but only that file counts as metadata (see [`is_form_sidecar_path`]); any other
+/// JSON under a source root is ignored.
+pub const FORM_SIDECAR_EXTENSION: &str = "json";
+
+pub const METADATA_WATCHED_EXTENSIONS: &[&str] =
+    &[bsl_conventions::XML_EXTENSION, FORM_SIDECAR_EXTENSION];
+
+/// Whether `path` is an ordinary form's dialog sidecar - `.../Ext/Form/Form.json`
+/// next to the module. The analyzer reads the form's controls, attributes and
+/// bindings from it, so a change is a metadata change of that form module.
+pub fn is_form_sidecar_path(path: &Path) -> bool {
+    use bsl_conventions::{conventional_of, ConventionalName};
+    let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if conventional_of(file) != Some(ConventionalName::FormJson) {
+        return false;
+    }
+    let form_dir = path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str());
+    form_dir.is_some_and(|d| conventional_of(d) == Some(ConventionalName::Form))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileRole {
@@ -17,6 +38,12 @@ pub fn file_role(path: &Path) -> FileRole {
     };
     if SOURCE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
         FileRole::Source
+    } else if ext.eq_ignore_ascii_case(FORM_SIDECAR_EXTENSION) {
+        if is_form_sidecar_path(path) {
+            FileRole::MetadataWatched
+        } else {
+            FileRole::Ignored
+        }
     } else if METADATA_WATCHED_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
         FileRole::MetadataWatched
     } else {
@@ -77,6 +104,17 @@ fn substrate_listed_family(path: &Path) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_ordinary_form_sidecar_json_is_metadata() {
+        let sidecar = Path::new("cf/Catalogs/Справочник/Forms/Ф/Ext/Form/Form.json");
+        assert_eq!(file_role(sidecar), FileRole::MetadataWatched);
+        assert!(is_form_sidecar_path(sidecar));
+        assert!(is_form_sidecar_path(Path::new("x/Forms/Ф/ext/form/FORM.JSON")));
+        assert_eq!(file_role(Path::new("cf/package.json")), FileRole::Ignored);
+        assert_eq!(file_role(Path::new("cf/Catalogs/Справочник/Form.json")), FileRole::Ignored);
+        assert!(!is_form_sidecar_path(Path::new("cf/Catalogs/Справочник/Forms/Ф/Ext/Form.json")));
+    }
 
     #[test]
     fn a_case_variant_body_is_still_substrate_listed() {

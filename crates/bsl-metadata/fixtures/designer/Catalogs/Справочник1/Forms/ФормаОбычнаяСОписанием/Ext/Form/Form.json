@@ -1,0 +1,18 @@
+{
+  "schema": 2,
+  "form": {
+    "name": "ФормаОбычнаяСОписанием",
+    "handlers": {"ПриОткрытии": "ПриОткрытии"},
+    "boundHandlers": ["ПриОткрытии", "ДействияФормыВыполнить"]
+  },
+  "attributes": [{"id": 1, "name": "Реквизит1"}],
+  "controls": [
+    {"kind": "commandPanel", "id": 1, "name": "ДействияФормы"},
+    {"kind": "panel", "id": 2, "name": "Панель1", "children": [
+      {"kind": "button", "id": 3, "name": "Кнопка1"},
+      {"kind": "input", "id": 4, "name": "Поле1", "dataPath": "Реквизит1",
+       "handlers": {"ПриИзменении": "Поле1ПриИзменении"}}
+    ]},
+    {"kind": "generic", "id": 0}
+  ]
+}

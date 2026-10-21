@@ -533,9 +533,9 @@ pub fn conditional_env(
     conditional_env_where(tree, |node| node.contains_range(range)).0
 }
 
-/// [`conditional_env`] together with the environments the enclosing chains
-/// could not decide (see
-/// [`crate::preproc_condition::PreprocCondition::narrow_branch_tracking`]).
+/// [`conditional_env`] together with the environments still possible but not
+/// decided by every enclosing branch. A known exclusion in any enclosing
+/// branch wins over an undecided condition in another.
 pub fn conditional_env_tracking(
     tree: &crate::conditional_tree::ConditionalTree,
     range: text_size::TextRange,
@@ -575,7 +575,7 @@ fn conditional_env_where(
     }
 
     let mut env = EnvFlags::ALL;
-    let mut undecided = EnvFlags::EMPTY;
+    let mut possible = EnvFlags::ALL;
     let mut cur = node;
     while let Some(idx) = cur {
         let chain_if = match tree.conditional(idx).kind {
@@ -588,26 +588,38 @@ fn conditional_env_where(
         };
 
         let mut remaining = EnvFlags::ALL;
+        let mut possible_remaining = EnvFlags::ALL;
         let mut claimed = EnvFlags::EMPTY;
+        let mut possible_claimed = EnvFlags::EMPTY;
         for branch in tree.all_branches(chain_if) {
             let data = tree.conditional(branch);
-            let branch_env = match data.kind {
-                ConditionalKind::If | ConditionalKind::ElsIf => data
-                    .condition_text
-                    .as_deref()
-                    .map_or(PreprocCondition::Unknown, PreprocCondition::parse)
-                    .narrow_branch_tracking(&mut remaining, &mut undecided),
-                ConditionalKind::Else => std::mem::take(&mut remaining),
+            let (branch_env, branch_possible) = match data.kind {
+                ConditionalKind::If | ConditionalKind::ElsIf => {
+                    let condition = data
+                        .condition_text
+                        .as_deref()
+                        .map_or(PreprocCondition::Unknown, PreprocCondition::parse);
+                    let mut undecided = EnvFlags::EMPTY;
+                    let taken =
+                        condition.narrow_branch_tracking(&mut possible_remaining, &mut undecided);
+                    // Unknown conditions may fall through, but a later known
+                    // condition must still be able to exclude the environment.
+                    possible_remaining = possible_remaining | undecided;
+                    (condition.narrow_branch(&mut remaining), taken | undecided)
+                }
+                ConditionalKind::Else => (remaining, possible_remaining),
             };
             if branch == idx {
                 claimed = branch_env;
+                possible_claimed = branch_possible;
                 break;
             }
         }
         env = env & claimed;
+        possible = possible & possible_claimed;
         cur = tree.parent(chain_if);
     }
-    (env, undecided)
+    (env, possible.without(env))
 }
 
 fn is_compilation_directive(kind: &AnnotationKind) -> bool {

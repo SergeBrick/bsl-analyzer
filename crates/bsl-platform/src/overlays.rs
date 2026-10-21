@@ -193,11 +193,18 @@ pub(crate) fn apply_type_property_additions(
                 )));
             }
         }
-        if property_exists(data, &addition) {
-            return Err(OverlayError(format!(
-                "type property addition {}.{} already exists in the extracted data",
-                addition.canonical_type, addition.english_name
-            )));
+        match existing_property(data, &addition) {
+            ExistingProperty::Absent => {}
+            // A newer archive files the property itself (8.5 has
+            // ClientApplicationForm.РежимОткрытияОкна on the form); its record
+            // carries documentation the synthetic one lacks, so it stays.
+            ExistingProperty::AlreadyPresent => continue,
+            ExistingProperty::Collides => {
+                return Err(OverlayError(format!(
+                    "type property addition {}.{} already exists in the extracted data",
+                    addition.canonical_type, addition.english_name
+                )))
+            }
         }
 
         let property = build_property_value(base_id + offset as u64, &addition);
@@ -402,27 +409,58 @@ pub(crate) fn parse_resolved_member_surface_attestations(
     Ok(resolved)
 }
 
-fn property_exists(data: &Value, addition: &TypePropertyAddition) -> bool {
-    data.get("properties").and_then(Value::as_array).is_some_and(|properties| {
-        properties.iter().any(|prop| {
-            let Some(object) = prop.as_object() else {
-                return false;
-            };
-            if object.get("type_name").and_then(Value::as_str) != Some(&addition.canonical_type) {
-                return false;
-            }
-            // The runtime name index keys both the RU and EN alias of every
-            // property into one namespace, so a collision on *either* alias
-            // silently shadows the existing entry. Compare both of the
-            // addition's names against both of the existing property's names.
-            let addition_names = [&addition.russian_name, &addition.english_name];
-            ["name", "english_name"].iter().any(|field| {
-                object.get(*field).and_then(Value::as_str).is_some_and(|existing| {
-                    addition_names.iter().any(|name| name.to_lowercase() == existing.to_lowercase())
-                })
-            })
-        })
-    })
+enum ExistingProperty {
+    Absent,
+    /// Exactly one property of the type carries both of the addition's names
+    /// and no other property shares either.
+    AlreadyPresent,
+    /// An ambiguous or conflicting match: a property shares only one of the
+    /// addition's names, or several properties carry both.
+    Collides,
+}
+
+fn existing_property(data: &Value, addition: &TypePropertyAddition) -> ExistingProperty {
+    let same_name = |object: &Map<String, Value>, field: &str, name: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|existing| existing.to_lowercase() == name.to_lowercase())
+    };
+    let properties = data
+        .get("properties")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter(|object| {
+            object.get("type_name").and_then(Value::as_str) == Some(&addition.canonical_type)
+        });
+
+    let mut full_matches = 0;
+    for object in properties {
+        if same_name(object, "name", &addition.russian_name)
+            && same_name(object, "english_name", &addition.english_name)
+        {
+            full_matches += 1;
+            continue;
+        }
+        // The runtime name index keys both the RU and EN alias of every
+        // property into one namespace, so a collision on *either* alias
+        // silently shadows the existing entry. Compare both of the
+        // addition's names against both of the existing property's names.
+        let addition_names = [&addition.russian_name, &addition.english_name];
+        if ["name", "english_name"]
+            .iter()
+            .any(|field| addition_names.iter().any(|name| same_name(object, field, name)))
+        {
+            return ExistingProperty::Collides;
+        }
+    }
+    match full_matches {
+        0 => ExistingProperty::Absent,
+        1 => ExistingProperty::AlreadyPresent,
+        _ => ExistingProperty::Collides,
+    }
 }
 
 fn build_property_value(id: u64, addition: &TypePropertyAddition) -> Value {

@@ -8,11 +8,8 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[bsl_conventions::BSL_EXTENSION];
 pub const FORM_SIDECAR_EXTENSION: &str = "json";
 
 // The binary dialog's mtime determines whether its JSON description is usable.
-pub const METADATA_WATCHED_EXTENSIONS: &[&str] = &[
-    bsl_conventions::XML_EXTENSION,
-    FORM_SIDECAR_EXTENSION,
-    bsl_conventions::BIN_EXTENSION,
-];
+pub const METADATA_WATCHED_EXTENSIONS: &[&str] =
+    &[bsl_conventions::XML_EXTENSION, FORM_SIDECAR_EXTENSION, bsl_conventions::BIN_EXTENSION];
 
 /// Whether `path` is an ordinary form's dialog sidecar - `.../Ext/Form/Form.json`
 /// next to the module. The analyzer reads the form's controls, attributes and

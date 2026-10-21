@@ -8,8 +8,11 @@ pub const SOURCE_EXTENSIONS: &[&str] = &[bsl_conventions::BSL_EXTENSION];
 pub const FORM_SIDECAR_EXTENSION: &str = "json";
 
 // The binary dialog's mtime determines whether its JSON description is usable.
-pub const METADATA_WATCHED_EXTENSIONS: &[&str] =
-    &[bsl_conventions::XML_EXTENSION, FORM_SIDECAR_EXTENSION, "bin"];
+pub const METADATA_WATCHED_EXTENSIONS: &[&str] = &[
+    bsl_conventions::XML_EXTENSION,
+    FORM_SIDECAR_EXTENSION,
+    bsl_conventions::BIN_EXTENSION,
+];
 
 /// Whether `path` is an ordinary form's dialog sidecar - `.../Ext/Form/Form.json`
 /// next to the module. The analyzer reads the form's controls, attributes and
@@ -48,7 +51,7 @@ pub fn file_role(path: &Path) -> FileRole {
         } else {
             FileRole::Ignored
         }
-    } else if ext.eq_ignore_ascii_case("bin") {
+    } else if ext.eq_ignore_ascii_case(bsl_conventions::BIN_EXTENSION) {
         use bsl_conventions::{conventional_of, ConventionalName};
         let file = path.file_name().and_then(|n| n.to_str());
         let parent = path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str());

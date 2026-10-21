@@ -306,9 +306,10 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
     )
     .unwrap_or_else(|| forms_dir.join(format!("{}.xml", form_name)));
 
-    let metadata = std::fs::read_to_string(&metadata_xml_path)
-        .ok()
-        .and_then(|xml| parse_form_metadata_xml(&xml).ok());
+    let metadata_xml = std::fs::read_to_string(&metadata_xml_path);
+    let descriptor_absent =
+        matches!(&metadata_xml, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+    let metadata = metadata_xml.ok().and_then(|xml| parse_form_metadata_xml(&xml).ok());
 
     let mut form = match std::fs::read_to_string(&ext_form_xml_path) {
         Ok(ext_form_xml) => parse_form_xml(&ext_form_xml)?,
@@ -318,8 +319,8 @@ pub fn parse_form_from_bsl_path(bsl_path: &std::path::Path) -> Result<Form> {
         // own descriptor still says `<FormType>Ordinary`, which is enough to stop
         // analyzing the module as a managed one.
         Err(read_error) => {
-            let may_be_ordinary =
-                metadata.as_ref().is_none_or(|m| m.form_type == FormType::Ordinary);
+            let may_be_ordinary = descriptor_absent
+                || metadata.as_ref().is_some_and(|m| m.form_type == FormType::Ordinary);
             let sidecar = bsl_path
                 .parent()
                 .filter(|_| may_be_ordinary)
@@ -1073,6 +1074,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sidecar_does_not_mask_an_invalid_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = ordinary_form_on_disk(dir.path());
+        let descriptor = dir.path().join("Catalogs/Справочник/Forms/Ф.xml");
+        std::fs::write(&descriptor, "<broken").unwrap();
+        std::fs::write(module.with_file_name("Form.json"), sidecar_json(2)).unwrap();
+        assert!(parse_form_from_bsl_path(&module).is_err());
+
+        std::fs::remove_file(&descriptor).unwrap();
+        assert!(reads_dialog(&parse_form_from_bsl_path(&module).unwrap()));
+
+        std::fs::create_dir(&descriptor).unwrap();
+        assert!(parse_form_from_bsl_path(&module).is_err());
+    }
+
+    #[test]
     fn a_sidecar_older_than_form_bin_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let module = ordinary_form_on_disk(dir.path());
@@ -1100,7 +1117,7 @@ mod tests {
         let module = ordinary_form_on_disk(dir.path());
         let sidecar = module.with_file_name("Form.json");
 
-        for invalid in ["0", "-1", "1.5", "\"2\""] {
+        for invalid in ["0", "-1", "1.5", "\"2\"", "null", "true", "{}", "[]"] {
             std::fs::write(&sidecar, sidecar_json(invalid)).unwrap();
             let form = parse_form_from_bsl_path(&module).unwrap();
             assert!(is_descriptor_only(&form), "{invalid}: {form:?}");

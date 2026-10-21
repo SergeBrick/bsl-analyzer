@@ -13,8 +13,10 @@
 //! needs a different file name), so any valid version is read. What the reader will
 //! not do is guess: an invalid version, an unparsable file, or one older than
 //! `Form.bin` is left unread, and the form falls back to what its descriptor alone
-//! says (see [`Form::ordinary_without_dialog`]). A verdict is never drawn from a
-//! dialog description that may no longer match the form.
+//! says (see [`Form::ordinary_without_dialog`]). Freshness is judged by modification
+//! times alone, since the format carries no fingerprint of the dialog: a `Form.bin`
+//! replaced by a copy that keeps an older time (an unpacked archive, `cp -p`) is not
+//! recognised, and the producer has to rewrite the sidecar after such a copy.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -62,10 +64,21 @@ impl std::fmt::Display for SidecarRejection {
 struct Sidecar {
     /// Version of the format; absent = 1. Kept raw so that an invalid value is
     /// reported as such rather than as malformed JSON.
+    #[serde(deserialize_with = "deserialize_schema")]
     schema: Option<serde_json::Value>,
     form: SidecarForm,
     attributes: Vec<SidecarAttribute>,
     controls: Vec<SidecarControl>,
+}
+
+// A present null is an invalid version, not the absent version's default.
+fn deserialize_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize, Default)]
@@ -383,7 +396,7 @@ mod tests {
 
     #[test]
     fn invalid_versions_are_rejected() {
-        for schema in ["0", "-1", "1.5", "\"2\""] {
+        for schema in ["0", "-1", "1.5", "\"2\"", "null", "true", "{}", "[]"] {
             let json = format!(r#"{{"schema": {schema}, "form": {{"name": "Ф"}}}}"#);
             assert_eq!(
                 parse_sidecar(&json, "Ф").unwrap_err(),

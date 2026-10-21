@@ -2522,6 +2522,8 @@ dependencies = [
  "blake3",
  "bsl-conventions",
  "bsl-metadata",
+ "bsl-platform",
+ "hir",
  "ide",
  "ide-db",
  "project-model",

@@ -1567,9 +1567,11 @@ impl DiagnosticsState {
         // model the LSP server and CLI `analyze` use.
         let crate::graph::input::BatchLoad { mut db, unread } =
             db_for_files_lazy(&source_root, &shared_files, &configs, None);
-        super::resident::apply_project_compatibility_mode(&mut db, project.compatibility_mode());
-        ide_host_core::apply_ordinary_forms_setting(&mut db, Some(&project));
-        ide_host_core::apply_default_run_mode(&mut db, Some(&project));
+        // The same project-level semantic inputs CLI `analyze` and the LSP apply:
+        // without them `[features]` (checked environments, type narrowing), the
+        // platform target/floor and the execution model derived from them silently
+        // fall back to defaults here.
+        ide_host_core::apply_project_to_db(&mut db, &project);
         // A file whose bytes could not be read is NOT served: it is held out of
         // `by_path` and answered as "known but unreadable", and the retry list
         // re-reads it every window. Its baseline fingerprint stays — the scan did

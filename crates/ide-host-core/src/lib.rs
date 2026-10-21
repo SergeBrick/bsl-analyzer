@@ -8,6 +8,7 @@
 pub mod diagnostics_baseline;
 mod load;
 mod metadata;
+mod project_config;
 mod workspace;
 
 pub use load::{
@@ -15,6 +16,10 @@ pub use load::{
     BatchTextSource, FileTextSource, SourceBatchChange, SourceBatchEffects,
 };
 pub use metadata::{bootstrap_metadata_substrate, refresh_metadata_substrate, VfsWrite};
+pub use project_config::{
+    apply_compatibility_mode_to_db, apply_configuration_xml_settings_to_db, apply_features_to_db,
+    apply_ordinary_app_support_to_db, apply_project_config_to_db, apply_project_to_db,
+};
 pub use workspace::{
     CatalogFile, CatchUp, DiskFileState, EditorView, PublishedChange, SnapshotFile,
     SnapshotSourceRoot, WorkspaceBackend, WorkspaceCatalog, WorkspaceSnapshot,

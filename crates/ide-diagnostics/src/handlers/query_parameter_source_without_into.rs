@@ -379,6 +379,32 @@ mod tests {
         );
     }
 
+    const OVERWRITTEN_UNDER_THE_OTHER_SPELLING: &str = r#"
+Процедура ДругоеНаписание()
+    Данные = Новый ТаблицаЗначений;
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Данные.Ключ КАК Ключ ИЗ &Данные КАК Данные";
+    Запрос.Text = "ВЫБРАТЬ 1 КАК Ключ";
+    Запрос.УстановитьПараметр("Данные", Данные);
+    Запрос.Выполнить();
+КонецПроцедуры
+"#;
+
+    /// `Текст` and `Text` are one property, so the later write replaces the earlier one; the
+    /// text at the execution is then unknown and the replaced literal must not be reported.
+    #[test]
+    fn silent_when_the_text_is_overwritten_under_the_other_spelling() {
+        let code = format!("{CONTROL}{OVERWRITTEN_UNDER_THE_OTHER_SPELLING}");
+        check_diagnostics_snapshot_for(
+            &code,
+            DiagnosticCode::QueryParameterSourceWithoutInto,
+            expect![[r#"
+                QueryParameterSourceWithoutInto @ 5:53..5:60
+                  message: Параметр &Данные указан источником запроса без ПОМЕСТИТЬ: платформа выбирает его содержимое только во временную таблицу. Поместите данные во временную таблицу отдельным запросом пакета и читайте её в следующем запросе
+                  severity: Critical"#]],
+        );
+    }
+
     #[test]
     fn silent_when_the_text_is_passed_to_a_call() {
         let code = format!("{CONTROL}{PASSED_TO_CALL}");

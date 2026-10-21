@@ -312,6 +312,29 @@ mod tests {
 КонецПроцедуры
 "#;
 
+    const BOUND_AFTER_THE_EXECUTION: &str = r#"
+Процедура ПослеВыполнения()
+    Запрос = Новый Запрос;
+    Запрос.Текст = "ВЫБРАТЬ Д.К КАК К ПОМЕСТИТЬ ВТ ИЗ &Данные КАК Д ИТОГИ СУММА(К) ПО К";
+    Запрос.Выполнить();
+    Запрос.УстановитьПараметр("Данные", Новый ТаблицаЗначений);
+КонецПроцедуры
+"#;
+
+    /// A binding written after the execution does not bind the parameter it executes with.
+    #[test]
+    fn silent_when_the_value_table_is_bound_after_the_execution() {
+        let code = format!("{CONTROL_TOTALS}{BOUND_AFTER_THE_EXECUTION}");
+        check_diagnostics_snapshot_for(
+            &code,
+            DiagnosticCode::QueryTotalsInValueTableInto,
+            expect![[r#"
+                QueryTotalsInValueTableInto @ 12:10..12:15
+                  message: ИТОГИ нельзя использовать в запросе, который помещает во временную таблицу таблицу значений &Данные: вычислите итоги отдельным запросом пакета, читающим эту временную таблицу
+                  severity: Critical"#]],
+        );
+    }
+
     #[test]
     fn fires_on_english_query_syntax() {
         let code = ENGLISH_QUERY.to_string();

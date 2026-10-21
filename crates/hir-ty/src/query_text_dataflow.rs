@@ -3,7 +3,7 @@ use stdx::case::CaseExt;
 
 use bsl_types::kind::Projection;
 use dataflow::reaching_defs::DefSite;
-use hir_def::body::Body;
+use hir_def::body::{Body, BodySourceMap};
 use hir_def::hir::{Expr, ExprIdx, Literal, Stmt};
 use hir_def::{DefWithBodyId, ExprId, IdConversion, MethodId, MethodIdInput, Name, StmtId};
 use rustc_hash::FxHashSet;
@@ -27,7 +27,7 @@ pub(crate) fn refine_query_at_use_site(
     };
 
     let dispatch_stmt_id = body.enclosing_stmt(use_expr_id)?;
-    let literals = literal_text_defs(db, file_id, local_id, body, dispatch_stmt_id, name)?;
+    let literals = literal_text_defs(db, file_id, local_id, body, dispatch_stmt_id, name)?.literals;
 
     let mut candidate: Option<Arc<[Option<Arc<Projection>>]>> = None;
     for literal in literals {
@@ -41,6 +41,14 @@ pub(crate) fn refine_query_at_use_site(
     candidate
 }
 
+struct LiteralTextDefs {
+    literals: Vec<ExprId>,
+    /// Definitions under both `Текст` and `Text` reach the statement. Reaching definitions
+    /// keep the two spellings apart, so a write under one does not kill a write under the
+    /// other, and the literals then include texts already replaced.
+    both_spellings: bool,
+}
+
 /// The string literals assigned to `<receiver>.Текст` / `.Text` by every definition reaching
 /// `stmt`. `None` when nothing reaches it or some definition is not such an assignment.
 fn literal_text_defs(
@@ -50,7 +58,7 @@ fn literal_text_defs(
     body: &Body,
     stmt: StmtId,
     receiver: &Name,
-) -> Option<Vec<ExprId>> {
+) -> Option<LiteralTextDefs> {
     let receiver_lower = receiver.as_str().fold_lower();
     let composite_ru = format!("{receiver_lower}.текст");
     let composite_en = format!("{receiver_lower}.text");
@@ -61,14 +69,17 @@ fn literal_text_defs(
     ))?;
 
     let mut defs = method_defs.defs_for_var_at_stmt(&composite_ru, stmt).unwrap_or_default();
+    let ru_count = defs.len();
     if let Some(en_defs) = method_defs.defs_for_var_at_stmt(&composite_en, stmt) {
         defs.extend(en_defs);
     }
     if defs.is_empty() {
         return None;
     }
+    let both_spellings = ru_count > 0 && defs.len() > ru_count;
 
-    defs.into_iter()
+    let literals = defs
+        .into_iter()
         .map(|def| {
             let DefSite::Assignment(stmt_raw) = def.def_site else {
                 return None;
@@ -79,7 +90,8 @@ fn literal_text_defs(
             let value_id = ExprId::from_idx(*value);
             matches!(body.expr(value_id), Expr::Literal(Literal::String(_))).then_some(value_id)
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    Some(LiteralTextDefs { literals, both_spellings })
 }
 
 fn projections_eq_ignoring_provenance(
@@ -131,6 +143,8 @@ pub struct ExecutedQueryText {
 pub fn executed_query_texts(db: &dyn HirDatabase, method: MethodId) -> Vec<ExecutedQueryText> {
     let body = db.method_body_ref(MethodIdInput::new(db, method));
     let infer = db.infer_method(MethodIdInput::new(db, method));
+    let lower = db.method_lower(MethodIdInput::new(db, method));
+    let source_map = lower.as_deref().map(|lower| &lower.source_map);
 
     let mut texts: Vec<ExecutedQueryText> = Vec::new();
     for (call_id, expr) in body.exprs_iter() {
@@ -154,17 +168,20 @@ pub fn executed_query_texts(db: &dyn HirDatabase, method: MethodId) -> Vec<Execu
         let Some(stmt) = body.enclosing_stmt(call_id) else {
             continue;
         };
-        let Some(literals) =
+        let Some(LiteralTextDefs { literals, both_spellings }) =
             literal_text_defs(db, method.module.file_id, method.local_id, body, stmt, query)
         else {
             continue;
         };
-        if is_shared(body, query) || is_rebound_after_text(db, method, body, query, &literals, stmt)
+        if both_spellings
+            || is_shared(body, query)
+            || is_rebound_after_text(db, method, body, query, &literals, stmt)
         {
             continue;
         }
 
-        let value_table_parameters = value_table_parameters(db, body, &infer, query);
+        let value_table_parameters =
+            value_table_parameters(db, body, &infer, source_map, query, call_id);
         for literal in literals {
             if texts.iter().all(|text| text.literal != literal) {
                 texts.push(ExecutedQueryText {
@@ -253,16 +270,28 @@ fn is_rebound_after_text(
 }
 
 /// Parameter names that every `query.УстановитьПараметр("<Name>", Value)` of the body binds to
-/// a value table. Empty when the body binds the parameters of `query` in another way: through
-/// `Параметры` or with a name that is not a string literal.
+/// a value table, at least one of them written before `execution`. Empty when the body binds
+/// the parameters of `query` in another way: through `Параметры` or with a name that is not a
+/// string literal.
 fn value_table_parameters(
     db: &dyn HirDatabase,
     body: &Body,
     infer: &BodyInferenceResult,
+    source_map: Option<&BodySourceMap>,
     query: &Name,
+    execution: ExprId,
 ) -> Vec<Name> {
-    let mut bindings: Vec<(Name, bool)> = Vec::new();
-    for (_, expr) in body.exprs_iter() {
+    let execution_start =
+        source_map.and_then(|map| map.expr_range(execution)).map(|range| range.start());
+    // A binding written only after the call leaves the parameter unset at it. Text order is
+    // not control flow, so a binding before the call is required, not proven to reach it.
+    let precedes_execution = |binding: ExprId| {
+        let binding_start =
+            source_map.and_then(|map| map.expr_range(binding)).map(|range| range.start());
+        matches!((binding_start, execution_start), (Some(b), Some(e)) if b < e)
+    };
+    let mut bindings: Vec<(Name, bool, bool)> = Vec::new();
+    for (binding_id, expr) in body.exprs_iter() {
         if let Expr::Field { base, field } = expr {
             if is_path_named(body, *base, query) && is_any_of(field, &["Параметры", "Parameters"])
             {
@@ -291,17 +320,21 @@ fn value_table_parameters(
             .expr_types
             .get(&ExprId::from_idx(value_arg))
             .is_some_and(|&ty| is_value_table_arm_id(db, ty));
+        let precedes = precedes_execution(binding_id);
         match bindings
             .iter_mut()
-            .find(|(bound, _)| stdx::case::eq_ignore_case(bound.as_str(), name))
+            .find(|(bound, _, _)| stdx::case::eq_ignore_case(bound.as_str(), name))
         {
-            Some((_, all_value_tables)) => *all_value_tables &= is_value_table,
-            None => bindings.push((Name::from(name.as_str()), is_value_table)),
+            Some((_, all_value_tables, any_precedes)) => {
+                *all_value_tables &= is_value_table;
+                *any_precedes |= precedes;
+            }
+            None => bindings.push((Name::from(name.as_str()), is_value_table, precedes)),
         }
     }
     bindings
         .into_iter()
-        .filter(|(_, all_value_tables)| *all_value_tables)
-        .map(|(name, _)| name)
+        .filter(|(_, all_value_tables, any_precedes)| *all_value_tables && *any_precedes)
+        .map(|(name, _, _)| name)
         .collect()
 }

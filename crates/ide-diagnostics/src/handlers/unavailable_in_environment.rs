@@ -767,11 +767,9 @@ EndProcedure
 "#;
         let diags = env_diags(fixture);
         assert_eq!(diags.len(), 1, "only the thin-client control may be flagged, got: {diags:?}");
-        assert!(
-            (diags[0].0.contains("GetUsers") || diags[0].0.contains("ПолучитьПользователей"))
-                && diags[0].0.ends_with("[Тонкий клиент]"),
-            "the control must still be flagged on the thin client only: {}",
-            diags[0].0
+        assert_eq!(
+            diags[0].0, "Метод 'GetUsers' недоступен [Тонкий клиент]",
+            "the control must still be flagged on the thin client only"
         );
     }
 

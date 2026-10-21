@@ -205,16 +205,17 @@ impl VarDef {
     /// `Перем А Экспорт, Б;` the platform exports `А` alone, and in
     /// `Перем А, Б Экспорт;` — `Б` alone.
     pub fn names_with_export(&self) -> Vec<(SyntaxToken, bool)> {
-        let mut names: Vec<(SyntaxToken, bool)> = Vec::new();
-        for token in self.0.children_with_tokens().filter_map(|it| it.into_token()) {
-            match token.kind() {
-                SyntaxKind::IDENT => names.push((token, false)),
-                SyntaxKind::KW_EXPORT => {
-                    if let Some(last) = names.last_mut() {
-                        last.1 = true;
-                    }
-                }
-                _ => {}
+        let mut names = Vec::new();
+        let mut tokens = self
+            .0
+            .children_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|it| !it.kind().is_trivia())
+            .peekable();
+        while let Some(token) = tokens.next() {
+            if token.kind() == SyntaxKind::IDENT {
+                let is_export = tokens.peek().is_some_and(|it| it.kind() == SyntaxKind::KW_EXPORT);
+                names.push((token, is_export));
             }
         }
         names

@@ -813,6 +813,15 @@ EndFunction
         }
     }
     #[test]
+    fn export_after_missing_name_does_not_export_previous_variable() {
+        let tree = lower("Перем А,, Экспорт;");
+        let [ModItem::Variable(idx)] = tree.top_level_items() else {
+            panic!("expected one variable");
+        };
+        assert!(!tree.variable(*idx).is_export);
+    }
+
+    #[test]
     fn module_comma_var_decl_under_pre_if_lowers_each_name() {
         let input = r#"
 #Если Сервер Тогда

@@ -420,8 +420,10 @@ pub fn form_element_type<DB: hir_ty::db::HirDatabase>(
     hir_ty::lower_form_element_for_file(db, file_id, form, element)
 }
 
-/// Lowercased ru/en names of the module's implicit context fields, for
-/// consumers that only need name membership (e.g. unused-variable analysis).
+/// Ru/en names of the module's implicit context fields as
+/// [`stdx::case::fold_lower_per_char`] keys, for consumers that only need name
+/// membership (e.g. unused-variable analysis): a caller folds the looked-up name
+/// the same way.
 pub fn module_implicit_field_names(
     db: &dyn hir_ty::db::HirDatabase,
     file_id: FileId,
@@ -429,9 +431,9 @@ pub fn module_implicit_field_names(
     hir_ty::module_implicit_fields(db, file_id)
         .into_iter()
         .flat_map(|info| {
-            let mut names = vec![info.name.as_str().fold_lower()];
+            let mut names = vec![stdx::case::fold_lower_per_char(info.name.as_str())];
             if let Some(en) = &info.name_en {
-                names.push(en.as_str().fold_lower());
+                names.push(stdx::case::fold_lower_per_char(en.as_str()));
             }
             names
         })

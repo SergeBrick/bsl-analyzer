@@ -710,6 +710,9 @@ pub struct InferenceContext<'db> {
     /// Statements walked while [`Self::in_uncompiled_branch`] held.
     uncompiled_stmts: Vec<StmtId>,
 
+    /// Statements walked while [`Self::in_dead_branch`] held.
+    dead_stmts: Vec<StmtId>,
+
     /// The project's `min_platform_version`, parsed once per body; `None` turns
     /// the min-platform check off entirely.
     min_platform: Option<bsl_platform::PlatformVersion>,
@@ -766,6 +769,11 @@ pub struct BodyInferenceResult {
     /// `InferenceContext::in_uncompiled_branch`): the syntax-level checks that
     /// must stay silent there read it.
     pub uncompiled_stmts: Vec<StmtId>,
+    /// Statements walked inside a `#Если` branch, or a method under a module-level
+    /// one, that every environment of a known body decidably skips (see
+    /// `InferenceContext::in_dead_branch`): the argument checks of syntax-level
+    /// call diagnostics read it.
+    pub dead_stmts: Vec<StmtId>,
 
     pub(crate) return_expr_ids: Vec<ExprId>,
 }
@@ -781,6 +789,7 @@ impl BodyInferenceResult {
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
+            dead_stmts: Vec::new(),
             return_expr_ids: Vec::new(),
         }
     }
@@ -797,6 +806,8 @@ pub struct ModuleCodeInferenceResult {
     pub call_arg_bindings: Vec<CallArgBinding>,
     /// See [`BodyInferenceResult::uncompiled_stmts`].
     pub uncompiled_stmts: Vec<StmtId>,
+    /// See [`BodyInferenceResult::dead_stmts`].
+    pub dead_stmts: Vec<StmtId>,
 }
 
 impl Default for ModuleCodeInferenceResult {
@@ -810,6 +821,7 @@ impl Default for ModuleCodeInferenceResult {
             diagnostics: Vec::new(),
             call_arg_bindings: Vec::new(),
             uncompiled_stmts: Vec::new(),
+            dead_stmts: Vec::new(),
         }
     }
 }
@@ -829,6 +841,7 @@ impl ModuleCodeInferenceResult {
             diagnostics: body.diagnostics,
             call_arg_bindings: body.call_arg_bindings,
             uncompiled_stmts: body.uncompiled_stmts,
+            dead_stmts: body.dead_stmts,
         }
     }
 }
@@ -907,6 +920,13 @@ impl InferOwnerResult {
         match self {
             InferOwnerResult::Method(r) => &r.uncompiled_stmts,
             InferOwnerResult::ModuleCode(r) => &r.uncompiled_stmts,
+        }
+    }
+
+    pub fn dead_stmts(&self) -> &[StmtId] {
+        match self {
+            InferOwnerResult::Method(r) => &r.dead_stmts,
+            InferOwnerResult::ModuleCode(r) => &r.dead_stmts,
         }
     }
 }
@@ -1020,6 +1040,7 @@ impl<'db> InferenceContext<'db> {
             possible_env: possible_env.unwrap_or(hir_def::execution_env::EnvFlags::EMPTY),
             in_dead_branch: possible_env.is_some_and(|env| env.is_empty()),
             uncompiled_stmts: Vec::new(),
+            dead_stmts: Vec::new(),
             min_platform: db
                 .min_platform_version()
                 .and_then(|value| bsl_platform::PlatformVersion::parse_release(&value)),
@@ -1356,6 +1377,18 @@ impl<'db> InferenceContext<'db> {
             InferenceDiagnostic::GuardedCall { expr, .. } => *expr,
         };
         if self.body.is_recovered(key) {
+            return;
+        }
+        // The platform drops a `#Если` branch nothing compiles before it reads a single
+        // argument there, so a parameter left out of such a call misses nothing. An
+        // undecidable condition or an unknown body environment may still compile it.
+        if self.in_dead_branch
+            && matches!(
+                diag,
+                InferenceDiagnostic::MissedRequiredParameterCommonModule { .. }
+                    | InferenceDiagnostic::MissedRequiredParameterManagerModule { .. }
+            )
+        {
             return;
         }
         // A call whose target body could not be read gets no "unresolved" verdict from
@@ -1923,6 +1956,7 @@ impl<'db> InferenceContext<'db> {
             diagnostics: self.diagnostics,
             call_arg_bindings: self.call_arg_bindings,
             uncompiled_stmts: self.uncompiled_stmts,
+            dead_stmts: self.dead_stmts,
             return_expr_ids: self.return_expr_ids,
         }
     }
@@ -2674,6 +2708,9 @@ impl<'db> InferenceContext<'db> {
     fn infer_stmt(&mut self, stmt_idx: StmtIdx) {
         if self.in_uncompiled_branch {
             self.uncompiled_stmts.push(StmtId::from_idx(stmt_idx));
+        }
+        if self.in_dead_branch {
+            self.dead_stmts.push(StmtId::from_idx(stmt_idx));
         }
         let stmt = self.body.stmt_idx(stmt_idx).clone();
         match &stmt {

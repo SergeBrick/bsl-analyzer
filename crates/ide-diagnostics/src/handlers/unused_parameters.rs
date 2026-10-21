@@ -68,6 +68,18 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
             }
         }
     }
+    if let Some(ref web_service) = metadata.web_service {
+        for operation in web_service.operations() {
+            if !operation.is_handler_empty() {
+                fixed_signature_handlers.insert(operation.procedure_name().fold_lower());
+            }
+        }
+    }
+    if let Some(ref integration_service) = metadata.integration_service {
+        for handler in integration_service.receive_handlers() {
+            fixed_signature_handlers.insert(handler.fold_lower());
+        }
+    }
 
     for subscription in ctx.visible_event_subscriptions() {
         if let Some(handler) = subscription.parse_handler() {
@@ -705,6 +717,96 @@ mod tests {
             diagnostics.iter().filter(|d| d.code == DiagnosticCode::UnusedParameters).collect();
 
         assert_eq!(unused.len(), 0);
+    }
+
+    fn unused_parameters_with(metadata: hir::ModuleMetadata, code: &str) -> Vec<String> {
+        crate::test_utils::check_metadata_diagnostic(metadata, code, |_metadata, ctx| {
+            super::check(ctx)
+        })
+        .into_iter()
+        .filter(|d| d.code == DiagnosticCode::UnusedParameters)
+        .map(|d| d.message)
+        .collect()
+    }
+
+    #[test]
+    fn test_web_service_operation_handler_no_diagnostic() {
+        use std::sync::Arc;
+
+        let code = r#"Функция Операция1(Параметр1, Лишний)
+    Возврат Параметр1;
+КонецФункции
+
+Функция НеОперация(Параметр1, Лишний)
+    Возврат Параметр1;
+КонецФункции
+"#;
+
+        let operation = bsl_metadata::WebServiceOperationBuilder::new()
+            .name("Operation1")
+            .procedure_name("Операция1")
+            .build();
+        let web_service = bsl_metadata::WebServiceBuilder::new()
+            .name("TestService")
+            .add_operation(operation)
+            .build();
+        let metadata = hir::ModuleMetadata {
+            module_type: bsl_metadata::ModuleType::WebServiceModule,
+            execution_context: None,
+            common_module: None,
+            mdo: None,
+            register: None,
+            form: None,
+            http_service: None,
+            web_service: Some(Arc::new(web_service)),
+            integration_service: None,
+        };
+
+        // The operation's parameters are dictated by the service's XML contract; the
+        // unbound method of the same shape stays flagged.
+        assert_eq!(
+            unused_parameters_with(metadata, code),
+            vec!["Уберите неиспользуемый параметр \"Лишний\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_integration_service_receive_handler_no_diagnostic() {
+        use std::sync::Arc;
+
+        let code = r#"Процедура ОбработатьСообщение(Сообщение, Отказ)
+    Сообщить(Сообщение);
+КонецПроцедуры
+
+Процедура НеОбработчик(Сообщение, Отказ)
+    Сообщить(Сообщение);
+КонецПроцедуры
+"#;
+
+        let channel = bsl_metadata::IntegrationServiceChannelBuilder::new()
+            .name("input")
+            .receive_message_processing("ОбработатьСообщение")
+            .build();
+        let service = bsl_metadata::IntegrationServiceBuilder::new()
+            .name("ОбменСообщениями")
+            .add_channel(channel)
+            .build();
+        let metadata = hir::ModuleMetadata {
+            module_type: bsl_metadata::ModuleType::IntegrationServiceModule,
+            execution_context: None,
+            common_module: None,
+            mdo: None,
+            register: None,
+            form: None,
+            http_service: None,
+            web_service: None,
+            integration_service: Some(Arc::new(service)),
+        };
+
+        assert_eq!(
+            unused_parameters_with(metadata, code),
+            vec!["Уберите неиспользуемый параметр \"Отказ\"".to_string()]
+        );
     }
 
     #[test]

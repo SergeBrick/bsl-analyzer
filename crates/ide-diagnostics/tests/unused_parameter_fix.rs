@@ -293,3 +293,80 @@ fn method_an_extension_body_mentions_gets_no_fix() {
         "an extension body that does not mention the method must not block"
     );
 }
+
+#[test]
+fn method_defined_in_several_preprocessor_branches_gets_no_fix() {
+    // A call shared by both branches must keep matching both signatures.
+    let source = "#Если Сервер Тогда\nПроцедура Записать(Данные, Лишний)\n    Сообщить(Данные);\nКонецПроцедуры\n\
+                  #Иначе\nПроцедура Записать(Данные, Флаг)\n    Сообщить(Данные + Флаг);\nКонецПроцедуры\n#КонецЕсли\n\n\
+                  Процедура Обработать()\n    Записать(1, 2);\nКонецПроцедуры\n";
+    assert_eq!(fixes(COMMON_MODULE, source), "UnusedParameters @ 2:28 no fix");
+
+    let control = "#Если Сервер Тогда\nПроцедура Записать(Данные, Лишний)\n    Сообщить(Данные);\nКонецПроцедуры\n#КонецЕсли\n\n\
+                   Процедура Обработать()\n    Записать(1, 2);\nКонецПроцедуры\n";
+    assert!(
+        fixes(COMMON_MODULE, control).starts_with(
+            "UnusedParameters @ 2:28 Удалить неиспользуемый параметр \"Лишний\" и его аргумент в вызовах"
+        ),
+        "a single definition inside a branch must be fixed"
+    );
+}
+
+#[test]
+fn last_position_keeps_the_comment_of_the_previous_one() {
+    let source = "Процедура Записать(Данные, // что записать\n    Лишний)\n    Сообщить(Данные);\nКонецПроцедуры\n\n\
+                  Процедура Обработать()\n    Записать(1, // единица\n        2);\nКонецПроцедуры\n";
+    assert_eq!(
+        fixes(COMMON_MODULE, source),
+        "UnusedParameters @ 2:5 Удалить неиспользуемый параметр \"Лишний\" и его аргумент в вызовах [fix_all=false]\n\
+         Процедура Записать(Данные // что записать\n)\n    Сообщить(Данные);\nКонецПроцедуры\n\n\
+         Процедура Обработать()\n    Записать(1 // единица\n);\nКонецПроцедуры\n"
+    );
+}
+
+#[test]
+fn notify_description_with_a_computed_name_blocks_the_fix() {
+    for construction in [
+        "Новый ОписаниеОповещения(\"Запи\" + \"сать\", ЭтотОбъект)",
+        "Новый ОписаниеОповещения(ИмяМетода, ЭтотОбъект)",
+        "Новый NotifyDescription(ИмяМетода, ЭтотОбъект)",
+        "Новый(\"ОписаниеОповещения\", ИмяМетода, ЭтотОбъект)",
+        "Новый ОписаниеОповещения(\"Другой\", ЭтотОбъект, , ИмяОбработкиОшибки, ЭтотОбъект)",
+    ] {
+        let source = with_call("", &format!("Записать(1, 2);\n    Описание = {construction};"));
+        assert_eq!(
+            fixes(OBJECT_MODULE, &source),
+            "UnusedParameters @ 1:28 no fix",
+            "`{construction}`"
+        );
+    }
+
+    for construction in [
+        "Новый ОписаниеОповещения(\"Другой\", ЭтотОбъект)",
+        "Новый(\"ОписаниеОповещения\", \"Другой\", ЭтотОбъект)",
+        "Новый ОписаниеОповещения(\"Другой\", ЭтотОбъект, , \"ДругаяОшибка\", ЭтотОбъект)",
+        "Новый Структура(Ключи)",
+    ] {
+        let source = with_call("", &format!("Записать(1, 2);\n    Описание = {construction};"));
+        assert!(
+            fixes(OBJECT_MODULE, &source).starts_with(CONTROL_FIX),
+            "`{construction}` names no method at run time and must not block"
+        );
+    }
+}
+
+#[test]
+fn default_value_with_an_effect_blocks_the_fix() {
+    let source = "Процедура Записать(Данные, Журнал = ЗаписатьВЖурнал())\n    Сообщить(Данные);\nКонецПроцедуры\n\n\
+                  Процедура Обработать()\n    Записать(1);\nКонецПроцедуры\n";
+    assert_eq!(fixes(COMMON_MODULE, source), "UnusedParameters @ 1:28 no fix");
+
+    let control =
+        "Процедура Записать(Данные, Журнал = -1)\n    Сообщить(Данные);\nКонецПроцедуры\n\n\
+                   Процедура Обработать()\n    Записать(1);\nКонецПроцедуры\n";
+    assert!(
+        fixes(COMMON_MODULE, control)
+            .starts_with("UnusedParameters @ 1:28 Удалить неиспользуемый параметр \"Журнал\""),
+        "a constant default must not block"
+    );
+}

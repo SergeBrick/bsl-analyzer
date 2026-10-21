@@ -9,16 +9,17 @@
 //!
 //! - the method is not `Экспорт`: an exported method has callers in other modules;
 //! - no body of the module (neither this one nor an extension's) runs `Выполнить` or
-//!   `Вычислить`, no string literal of them names the method, and no extension body
+//!   `Вычислить` or builds an `ОписаниеОповещения` from a handler name that is not one
+//!   string literal, no string literal of them names the method, and no extension body
 //!   mentions it at all: those callers are out of reach of a file-local edit;
 //! - every mention of the method in the file is a call, bare (`Имя(…)`) or through
 //!   `ЭтотОбъект.`/`ЭтаФорма.`; a name read in any other way (a handler handed to
 //!   `ДобавитьОбработчик`, a same-named variable) leaves the method as it is;
 //! - the name of the parameter occurs nowhere else in the method, in any
 //!   preprocessor branch, string or opaque block included;
-//! - the argument a call passes at that position is a literal, a bare name or a
-//!   unary operator over one: dropping a call or a field read would drop what
-//!   evaluating it does (side effects, the exception it raises).
+//! - the argument a call passes at that position, and the parameter's default value,
+//!   is a literal, a bare name or a unary operator over one: dropping a call or a field
+//!   read would drop what evaluating it does (side effects, the exception it raises).
 //!
 //! The fix is manual: it changes a signature, which a reader decides on.
 
@@ -37,6 +38,9 @@ struct ModuleFacts {
     sibling_roots: Vec<SyntaxNode>,
     /// Some body of the module runs code known only at run time.
     runs_dynamic_code: bool,
+    /// Some body of the module hands the platform a callback whose name is known only at
+    /// run time.
+    binds_computed_callback: bool,
 }
 
 /// Why a reported parameter gets no fix.
@@ -46,14 +50,15 @@ enum Declined {
     NotAParameter,
     Exported,
     DynamicCode,
+    ComputedCallback,
     /// The parameter's name occurs in the method besides its declaration.
     ParameterNamed,
     /// A string literal of the module, or an extension body, names the method.
     MethodNamedOutsideCalls,
     /// The method's name is read in the file other than as a call this fix rewrites.
     NotACall,
-    /// A call passes an argument at that position whose evaluation does more than
-    /// produce a value.
+    /// A call passes an argument at that position, or the parameter's default value is
+    /// an expression, whose evaluation does more than produce a value.
     ArgumentWithEffect,
     /// A list holds an extension marker, a preprocessor directive or a parse error.
     UnsupportedList,
@@ -66,11 +71,19 @@ pub(super) fn attach_fixes(ctx: &DiagnosticsContext, diagnostics: &mut [Diagnost
     let root = ctx.parse().syntax_node();
     let sibling_roots = ctx.sibling_body_roots();
     let runs_dynamic_code = runs_dynamic_code(&root) || sibling_roots.iter().any(runs_dynamic_code);
+    let binds_computed_callback =
+        binds_computed_callback(&root) || sibling_roots.iter().any(binds_computed_callback);
     let mut string_literals = string_literal_texts(&root);
     for sibling in &sibling_roots {
         string_literals.extend(string_literal_texts(sibling));
     }
-    let facts = ModuleFacts { root, string_literals, sibling_roots, runs_dynamic_code };
+    let facts = ModuleFacts {
+        root,
+        string_literals,
+        sibling_roots,
+        runs_dynamic_code,
+        binds_computed_callback,
+    };
     for diagnostic in diagnostics.iter_mut() {
         if let Ok(fix) = remove_parameter_fix(&facts, diagnostic.range) {
             diagnostic.fixes.push(fix);
@@ -101,10 +114,18 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
     if facts.runs_dynamic_code {
         return Err(DynamicCode);
     }
+    if facts.binds_computed_callback {
+        return Err(ComputedCallback);
+    }
 
     let param_name = name_token.text().fold_lower();
     if mentioned_elsewhere(&method, &name_token, &param_name) {
         return Err(ParameterNamed);
+    }
+    // A caller omitting the argument evaluates the default value; it goes with the
+    // declaration.
+    if !param.children().all(|default| is_inert(&default)) {
+        return Err(ArgumentWithEffect);
     }
 
     let method_lower = method_name.text().fold_lower();
@@ -119,8 +140,11 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
         .iter()
         .position(|slot| slot.items.iter().any(|item| item.as_node() == Some(&param)))
         .ok_or(UnsupportedList)?;
-    let range = removal_range(&params, index).ok_or(UnsupportedList)?;
-    let mut edits = vec![TextEdit { range, new_text: String::new() }];
+    let mut edits: Vec<TextEdit> = removal_ranges(&params, index)
+        .ok_or(UnsupportedList)?
+        .into_iter()
+        .map(|range| TextEdit { range, new_text: String::new() })
+        .collect();
 
     let mut call_edits = 0usize;
     for call in calls_of(&facts.root, &method_name, &method_lower).ok_or(NotACall)? {
@@ -133,9 +157,11 @@ fn remove_parameter_fix(facts: &ModuleFacts, name_range: TextRange) -> Result<Fi
         if !args[index].items.iter().all(|item| item.as_node().is_some_and(is_inert)) {
             return Err(ArgumentWithEffect);
         }
-        let range = removal_range(&args, index).ok_or(UnsupportedList)?;
-        if !range.is_empty() {
-            edits.push(TextEdit { range, new_text: String::new() });
+        let ranges = removal_ranges(&args, index).ok_or(UnsupportedList)?;
+        if ranges.iter().any(|range| !range.is_empty()) {
+            edits.extend(
+                ranges.into_iter().map(|range| TextEdit { range, new_text: String::new() }),
+            );
             call_edits += 1;
         }
     }
@@ -232,6 +258,72 @@ fn runs_dynamic_code(root: &SyntaxNode) -> bool {
     })
 }
 
+/// `Новый ОписаниеОповещения(Имя, …)` (or `Новый("ОписаниеОповещения", Имя, …)`) whose
+/// handler or error handler name is not one string literal: the platform calls whatever
+/// method the value names, with the arguments the platform passes.
+fn binds_computed_callback(root: &SyntaxNode) -> bool {
+    root.descendants().filter(|node| node.kind() == SyntaxKind::NEW_EXPR).any(|new_expr| {
+        let Some(args) = new_expr.children().find(|node| node.kind() == SyntaxKind::ARG_LIST)
+        else {
+            return false;
+        };
+        let slots = list_slots(&args);
+        let base = match syntax::ast_utils::new_expr_type_name_token(&new_expr) {
+            Some(type_name) if is_notify_description(type_name.text()) => 0,
+            Some(_) => return false,
+            None => match slots.as_ref().and_then(|slots| slots.first()) {
+                Some(first)
+                    if string_literal(first).is_some_and(|name| is_notify_description(&name)) =>
+                {
+                    1
+                }
+                _ => return false,
+            },
+        };
+        let Some(slots) = slots else {
+            return true;
+        };
+        [base, base + 3]
+            .into_iter()
+            .filter_map(|index| slots.get(index))
+            .any(|slot| !slot.items.is_empty() && string_literal(slot).is_none())
+    })
+}
+
+fn is_notify_description(name: &str) -> bool {
+    matches!(name.fold_lower().as_str(), "описаниеоповещения" | "notifydescription")
+}
+
+/// The text of a position holding exactly one single-line string literal, unquoted.
+fn string_literal(slot: &Slot) -> Option<String> {
+    let [SyntaxElement::Node(node)] = slot.items.as_slice() else {
+        return None;
+    };
+    let mut node = node.clone();
+    while matches!(node.kind(), SyntaxKind::EXPR | SyntaxKind::PAREN_EXPR) {
+        let mut children = node.children();
+        let (Some(inner), None) = (children.next(), children.next()) else {
+            return None;
+        };
+        node = inner;
+    }
+    if node.kind() != SyntaxKind::LITERAL {
+        return None;
+    }
+    let mut tokens = node
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !is_trivia(token.kind()));
+    let (Some(token), None) = (tokens.next(), tokens.next()) else {
+        return None;
+    };
+    if token.kind() != SyntaxKind::STRING {
+        return None;
+    }
+    let text = token.text();
+    text.strip_prefix('"').and_then(|text| text.strip_suffix('"')).map(str::to_string)
+}
+
 /// An argument whose evaluation does nothing but produce its value: a literal, a bare
 /// name, an operator over those. A call, a `Новый`, a field or an index read may change
 /// state or raise, which dropping the argument would silently undo.
@@ -255,6 +347,9 @@ struct Slot {
     before: TextRange,
     /// The `,` or `)` after the position.
     after: TextRange,
+    /// Where the line of the position starts when a comment ends the line before it,
+    /// between `before` and the position.
+    line_after_comment: Option<TextSize>,
 }
 
 impl Slot {
@@ -286,6 +381,7 @@ fn list_slots(list: &SyntaxNode) -> Option<Vec<Slot>> {
                     items: std::mem::take(&mut items),
                     before,
                     after: element.text_range(),
+                    line_after_comment: None,
                 });
                 before = element.text_range();
             }
@@ -295,10 +391,29 @@ fn list_slots(list: &SyntaxNode) -> Option<Vec<Slot>> {
             _ => items.push(element.clone()),
         }
     }
-    let last = Slot { items, before, after: close.text_range() };
+    let last = Slot { items, before, after: close.text_range(), line_after_comment: None };
     // `()` holds no position at all.
     if !(slots.is_empty() && last.items.is_empty()) {
         slots.push(last);
+    }
+    let tokens: Vec<SyntaxToken> =
+        list.descendants_with_tokens().filter_map(|element| element.into_token()).collect();
+    for slot in &mut slots {
+        let (from, to) = (slot.before.end(), slot.start());
+        let mut after_comment = false;
+        for token in tokens
+            .iter()
+            .filter(|token| token.text_range().start() >= from && token.text_range().end() <= to)
+        {
+            match token.kind() {
+                SyntaxKind::COMMENT => after_comment = true,
+                SyntaxKind::NEWLINE if after_comment => {
+                    slot.line_after_comment = Some(token.text_range().end());
+                    after_comment = false;
+                }
+                _ => {}
+            }
+        }
     }
     Some(slots)
 }
@@ -347,15 +462,18 @@ fn trimmed(element: &SyntaxElement) -> TextRange {
 
 /// What to delete to take position `index` out of the list. A position before the last
 /// goes with the comma after it and the spacing up to the next one, so a comment on the
-/// line of the previous position stays; the last goes with the comma before it.
-fn removal_range(slots: &[Slot], index: usize) -> Option<TextRange> {
+/// line of the previous position stays; the last goes with the comma before it, and a
+/// comment between that comma and the position stays on its line.
+fn removal_ranges(slots: &[Slot], index: usize) -> Option<Vec<TextRange>> {
     let slot = slots.get(index)?;
     if slots.len() == 1 {
-        return Some(TextRange::new(slot.start(), slot.end()));
+        return Some(vec![TextRange::new(slot.start(), slot.end())]);
     }
     if let Some(next) = slots.get(index + 1) {
-        Some(TextRange::new(slot.start(), next.start()))
-    } else {
-        Some(TextRange::new(slot.before.start(), slot.end()))
+        return Some(vec![TextRange::new(slot.start(), next.start())]);
     }
+    Some(match slot.line_after_comment {
+        Some(line_start) => vec![slot.before, TextRange::new(line_start, slot.end())],
+        None => vec![TextRange::new(slot.before.start(), slot.end())],
+    })
 }

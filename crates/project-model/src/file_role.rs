@@ -21,8 +21,14 @@ pub fn is_form_sidecar_path(path: &Path) -> bool {
     if conventional_of(file) != Some(ConventionalName::FormJson) {
         return false;
     }
-    let form_dir = path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str());
-    form_dir.is_some_and(|d| conventional_of(d) == Some(ConventionalName::Form))
+    let dir_is = |dir: Option<&Path>, name: ConventionalName| {
+        dir.and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| conventional_of(n) == Some(name))
+    };
+    let form_dir = path.parent();
+    dir_is(form_dir, ConventionalName::Form)
+        && dir_is(form_dir.and_then(Path::parent), ConventionalName::Ext)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +120,7 @@ mod tests {
         assert_eq!(file_role(Path::new("cf/package.json")), FileRole::Ignored);
         assert_eq!(file_role(Path::new("cf/Catalogs/Справочник/Form.json")), FileRole::Ignored);
         assert!(!is_form_sidecar_path(Path::new("cf/Catalogs/Справочник/Forms/Ф/Ext/Form.json")));
+        assert!(!is_form_sidecar_path(Path::new("cf/CommonModules/Библиотека/Form/Form.json")));
     }
 
     #[test]

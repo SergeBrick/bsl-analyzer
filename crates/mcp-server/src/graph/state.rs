@@ -6146,7 +6146,10 @@ mod tests {
         forced_reload_workspace(root);
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        // Settled, not merely ready: the first build's publish pass ends by deciding the debts
+        // on its own thread, and a forced reload recorded before it gets there is built and
+        // installed by a loader the refusal below does not reach.
+        wait_settled(&graph);
 
         declare_source_root(root, "alias-b");
         // Recorded without deciding: this test drives the builds itself, and a reload spawned

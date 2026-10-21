@@ -1,6 +1,6 @@
 use intern::NormName;
 use rustc_hash::FxHashSet;
-use stdx::case::CaseExt;
+use stdx::case::fold_lower_per_char;
 
 use crate::define_metadata;
 use crate::metadata::*;
@@ -45,19 +45,19 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
             let mut names = FxHashSet::default();
 
             for attr in &mdo.attributes {
-                names.insert(attr.name.fold_lower());
+                names.insert(fold_lower_per_char(&attr.name));
                 if let Some(ref en) = attr.name_en {
-                    names.insert(en.fold_lower());
+                    names.insert(fold_lower_per_char(en));
                 }
             }
             for common in &mdo.common_attributes {
-                names.insert(common.name.fold_lower());
+                names.insert(fold_lower_per_char(&common.name));
             }
 
             for ts in &mdo.tabular_sections {
-                names.insert(ts.name().fold_lower());
+                names.insert(fold_lower_per_char(ts.name()));
                 if let Some(en) = ts.name_en() {
-                    names.insert(en.fold_lower());
+                    names.insert(fold_lower_per_char(en));
                 }
             }
 
@@ -72,22 +72,22 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
             let mut names = FxHashSet::default();
 
             for dim in register.dimensions() {
-                names.insert(dim.name().fold_lower());
+                names.insert(fold_lower_per_char(dim.name()));
             }
             for res in register.resources() {
-                names.insert(res.name().fold_lower());
+                names.insert(fold_lower_per_char(res.name()));
                 if let Some(en) = res.name_en() {
-                    names.insert(en.fold_lower());
+                    names.insert(fold_lower_per_char(en));
                 }
             }
             for attr in register.attributes() {
-                names.insert(attr.name().fold_lower());
+                names.insert(fold_lower_per_char(attr.name()));
                 if let Some(en) = attr.name_en() {
-                    names.insert(en.fold_lower());
+                    names.insert(fold_lower_per_char(en));
                 }
             }
             for common in register.common_attributes() {
-                names.insert(common.name.fold_lower());
+                names.insert(fold_lower_per_char(&common.name));
             }
 
             names
@@ -106,7 +106,9 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
             let mut names: FxHashSet<String> = bsl_platform::PlatformDataInner::instance()
                 .get_type_properties(form_type_name)
                 .into_iter()
-                .flat_map(|prop| [prop.name.fold_lower(), prop.english_name.fold_lower()])
+                .flat_map(|prop| {
+                    [fold_lower_per_char(&prop.name), fold_lower_per_char(&prop.english_name)]
+                })
                 .collect();
 
             // The managed/ordinary base above omits per-MDO form-extension
@@ -125,7 +127,7 @@ fn build_attribute_names_to_skip(ctx: &DiagnosticsContext) -> FxHashSet<String> 
 
             if let Some(form) = &metadata.form {
                 for attr_name in form.attribute_names() {
-                    names.insert(attr_name.fold_lower());
+                    names.insert(fold_lower_per_char(attr_name));
                 }
             }
 
@@ -157,7 +159,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     // not a dead store — its unused-ness (and the export exemption) is owned by
     // check_module_var_declarations, which sees reads across every body.
     for var in module_bodies.module_vars() {
-        skip_attr_names.insert(var.name.fold_lower());
+        skip_attr_names.insert(fold_lower_per_char(&var.name));
     }
 
     for (local_id, body) in module_bodies.iter_bodies() {
@@ -205,7 +207,7 @@ fn collect_read_var_names(body: &hir::Body) -> FxHashSet<String> {
     for (expr_id, expr) in body.exprs_iter() {
         if let hir::Expr::Path(name) = expr {
             if !write_targets.contains(&expr_id) {
-                read_vars.insert(name.as_str().fold_lower());
+                read_vars.insert(fold_lower_per_char(name.as_str()));
             }
         }
     }
@@ -283,7 +285,7 @@ fn check_method(
 
     for param_id in body.params() {
         let binding = body.binding(param_id);
-        declared_vars.insert(binding.name.as_str().fold_lower());
+        declared_vars.insert(fold_lower_per_char(binding.name.as_str()));
     }
 
     // Walk the full statement arena, not just top-level statements: `Перем`
@@ -295,9 +297,9 @@ fn check_method(
             for &binding_id in bindings.iter() {
                 let binding_id_opaque = BindingId::from_idx(binding_id);
                 let binding = body.binding(binding_id_opaque);
-                declared_vars.insert(binding.name.as_str().fold_lower());
+                declared_vars.insert(fold_lower_per_char(binding.name.as_str()));
 
-                if !read_vars.contains(&binding.name.as_str().fold_lower()) {
+                if !read_vars.contains(&fold_lower_per_char(binding.name.as_str())) {
                     if let Some(range) = source_map.binding_range(binding_id_opaque) {
                         diagnostics.push(create_diagnostic(
                             binding.name.as_str(),
@@ -315,9 +317,11 @@ fn check_method(
         if let hir::Stmt::For { var, .. } = stmt {
             let var_opaque = BindingId::from_idx(*var);
             let binding = body.binding(var_opaque);
-            declared_vars.insert(binding.name.as_str().fold_lower());
+            declared_vars.insert(fold_lower_per_char(binding.name.as_str()));
 
-            if analyze_for_counters && !read_vars.contains(&binding.name.as_str().fold_lower()) {
+            if analyze_for_counters
+                && !read_vars.contains(&fold_lower_per_char(binding.name.as_str()))
+            {
                 if let Some(range) = source_map.binding_range(var_opaque) {
                     diagnostics.push(create_diagnostic(binding.name.as_str(), range, code, ctx));
                 }
@@ -329,9 +333,9 @@ fn check_method(
         if let hir::Stmt::ForEach { var, .. } = stmt {
             let var_opaque = BindingId::from_idx(*var);
             let binding = body.binding(var_opaque);
-            declared_vars.insert(binding.name.as_str().fold_lower());
+            declared_vars.insert(fold_lower_per_char(binding.name.as_str()));
 
-            if !read_vars.contains(&binding.name.as_str().fold_lower()) {
+            if !read_vars.contains(&fold_lower_per_char(binding.name.as_str())) {
                 if let Some(range) = source_map.binding_range(var_opaque) {
                     diagnostics.push(create_diagnostic(binding.name.as_str(), range, code, ctx));
                 }
@@ -346,7 +350,7 @@ fn check_method(
         if let hir::Stmt::Assign { target, .. } = stmt {
             let target_opaque = hir::ExprId::from_idx(*target);
             if let hir::Expr::Path(name) = body.expr(target_opaque) {
-                let lowercase_name = name.as_str().fold_lower();
+                let lowercase_name = fold_lower_per_char(name.as_str());
 
                 if declares_a_local(
                     &lowercase_name,
@@ -402,7 +406,7 @@ fn check_module_level_code(
         if let hir::Stmt::Assign { target, .. } = body.stmt(stmt_id) {
             let target_opaque = hir::ExprId::from_idx(*target);
             if let hir::Expr::Path(name) = body.expr(target_opaque) {
-                let lowercase_name = name.as_str().fold_lower();
+                let lowercase_name = fold_lower_per_char(name.as_str());
 
                 if !declares_a_local(
                     &lowercase_name,

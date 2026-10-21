@@ -81,7 +81,7 @@ fn lookup_form_data_tabular_section_field(
 /// An object attribute of type `ТаблицаЗначений` / `ДеревоЗначений` reached through
 /// form data: the form holds it as `ДанныеФормыКоллекция` / `ДанныеФормыДерево`, on
 /// the client and on the server alike, exactly like a form attribute of that type.
-fn lookup_form_data_value_collection_field(
+pub(crate) fn lookup_form_data_value_collection_field(
     db: &dyn TypeKernelDb,
     resolver: &dyn MetadataResolution,
     receiver: TypeId,

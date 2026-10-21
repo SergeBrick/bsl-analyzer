@@ -60,9 +60,30 @@ pub(crate) fn enumerate_fields_inner(
     resolver: &dyn MetadataResolution,
     receiver: TypeId,
 ) -> Vec<FieldInfo> {
-    let projected_form_data = crate::field_lookup::project_form_data_for_fields_id(db, receiver);
-    let receiver = projected_form_data.unwrap_or(receiver);
+    let Some(projected) = crate::field_lookup::project_form_data_for_fields_id(db, receiver) else {
+        return enumerate_projected_fields(db, resolver, receiver);
+    };
+    // The form holds a value-table or value-tree attribute of its object as form
+    // data, so the enumerated type must match what a lookup of that field gives.
+    let mut fields = enumerate_projected_fields(db, resolver, projected);
+    for field in &mut fields {
+        if let Some(form_field) = crate::field_lookup::lookup_form_data_value_collection_field(
+            db,
+            resolver,
+            receiver,
+            &field.name,
+        ) {
+            field.ty = form_field.ty;
+        }
+    }
+    fields
+}
 
+fn enumerate_projected_fields(
+    db: &dyn TypeKernelDb,
+    resolver: &dyn MetadataResolution,
+    receiver: TypeId,
+) -> Vec<FieldInfo> {
     let ty = crate::this_object::coerce_to_metadata_ref_id(db, receiver).unwrap_or(receiver);
 
     if let Some(infos) = enumerate_projection_fields(db, ty) {
@@ -1866,5 +1887,57 @@ mod tests {
             "CalcReg record must NOT expose МоментВремени per HBK 8.3.27 — \
              surfacing one indicates a regression in platform_data or a wrong-prefix lookup",
         );
+    }
+
+    /// Enumeration and lookup agree on the type of an owner attribute reached
+    /// through form data: a value table or tree is the form collection or tree.
+    #[test]
+    fn form_data_structure_enumerates_value_collection_attributes_as_form_data() {
+        use bsl_metadata::PlatformValueType;
+        use bsl_types::facet::FormDataFacet;
+        let mut config = Configuration::new("Test");
+        let mut processor = MetadataObject::new(MdoType::DataProcessor, "Товары");
+        processor.add_attribute(attr(
+            "Таблица",
+            None,
+            AttributeType::Platform(PlatformValueType::ValueTable),
+        ));
+        processor.add_attribute(attr(
+            "Дерево",
+            None,
+            AttributeType::Platform(PlatformValueType::ValueTree),
+        ));
+        processor.add_attribute(attr("Имя", None, AttributeType::String { length: Some(10) }));
+        config.add_metadata_object(processor);
+        let configs = wrap(config);
+
+        let db = InMemoryDb::new();
+        let receiver = db.mk_form_data(
+            FormDataFacet::Structure,
+            Some(MdoRefFacet::new(MdoType::DataProcessor, "Товары".to_string())),
+        );
+        let resolver = ConfigsObjectResolver(&configs);
+        let fields = super::enumerate_fields(&db, &resolver, receiver);
+        for (name, expected) in [
+            ("Таблица", Some(db.mk_form_data(FormDataFacet::Collection, None))),
+            ("Дерево", Some(db.mk_form_data(FormDataFacet::Tree, None))),
+            ("Имя", None),
+        ] {
+            let field = fields
+                .iter()
+                .find(|f| f.name.as_str() == name)
+                .unwrap_or_else(|| panic!("{name} is enumerated"));
+            if let Some(expected) = expected {
+                assert_eq!(
+                    db.lookup_type(field.ty),
+                    db.lookup_type(expected),
+                    "enumerated type of {name}"
+                );
+            }
+            let looked_up =
+                crate::field_lookup::lookup_field(&db, &resolver, receiver, &Name::new(name))
+                    .unwrap_or_else(|| panic!("{name} is looked up"));
+            assert_eq!(field.ty, looked_up.ty, "enumeration and lookup agree on {name}");
+        }
     }
 }

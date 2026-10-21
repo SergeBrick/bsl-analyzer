@@ -4457,8 +4457,10 @@ impl<'db> InferenceContext<'db> {
     /// manager module calls the global function (the manager method's help says
     /// so, and the probe returned the data of the type passed first).
     ///
-    /// Only the `Receiver` surface: a form or a value manager has no method that
-    /// shares a name with a global function. `None` leaves the call to the cascade.
+    /// Only the `Receiver` surface. A value manager has no method that shares a name
+    /// with a global function; a form's (`ПодключитьОбработчикОжидания`,
+    /// `ОтключитьОбработчикОжидания`) take the global's parameters, so the global
+    /// signature judges them alike. `None` leaves the call to the cascade.
     fn resolve_bare_receiver_call_over_global(
         &mut self,
         name: &hir_def::Name,

@@ -3234,8 +3234,10 @@ fn s12_proxy_scope_mismatch_driver() {
     let daemon_log = runtime.join("custom-daemon.log");
     let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     let child_started = quote(&child_started_path);
+    // The proxy may still be spawning a wrapper while the test reads the count, so
+    // the count is replaced by a rename: a reader never sees a truncated file.
     let wrapper = format!(
-        "#!/bin/sh\ncount_file={}\ngate_file={}\nchild_started={}\nn=0\nif [ -f \"$count_file\" ]; then n=$(cat \"$count_file\"); fi\nn=$((n + 1))\nprintf '%s\\n' \"$n\" > \"$count_file\"\nif [ \"$n\" -eq 1 ]; then while [ ! -e \"$gate_file\" ]; do sleep 0.02; done; printf '%s\\n' \"$$\" > \"$child_started\"; exec \"$@\"; fi\nexit 78\n",
+        "#!/bin/sh\ncount_file={}\ngate_file={}\nchild_started={}\nn=0\nif [ -f \"$count_file\" ]; then n=$(cat \"$count_file\"); fi\nn=$((n + 1))\nprintf '%s\\n' \"$n\" > \"$count_file.$$\"\nmv \"$count_file.$$\" \"$count_file\"\nif [ \"$n\" -eq 1 ]; then while [ ! -e \"$gate_file\" ]; do sleep 0.02; done; printf '%s\\n' \"$$\" > \"$child_started\"; exec \"$@\"; fi\nexit 78\n",
         quote(&count_path),
         quote(&gate_path),
         child_started

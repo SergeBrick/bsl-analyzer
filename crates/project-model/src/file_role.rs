@@ -129,6 +129,7 @@ mod tests {
         assert_eq!(file_role(Path::new("cf/package.json")), FileRole::Ignored);
         assert_eq!(file_role(Path::new("cf/Catalogs/Справочник/Form.json")), FileRole::Ignored);
         assert!(!is_form_sidecar_path(Path::new("cf/Catalogs/Справочник/Forms/Ф/Ext/Form.json")));
+        assert!(!is_form_sidecar_path(Path::new("cf/CommonModules/Библиотека/Form/Form.json")));
     }
 
     #[test]

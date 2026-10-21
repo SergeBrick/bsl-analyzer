@@ -13,8 +13,10 @@
 //! needs a different file name), so any valid version is read. What the reader will
 //! not do is guess: an invalid version, an unparsable file, or one older than
 //! `Form.bin` is left unread, and the form falls back to what its descriptor alone
-//! says (see [`Form::ordinary_without_dialog`]). A verdict is never drawn from a
-//! dialog description that may no longer match the form.
+//! says (see [`Form::ordinary_without_dialog`]). Freshness is judged by modification
+//! times alone, since the format carries no fingerprint of the dialog: a `Form.bin`
+//! replaced by a copy that keeps an older time (an unpacked archive, `cp -p`) is not
+//! recognised, and the producer has to rewrite the sidecar after such a copy.
 
 use std::collections::BTreeMap;
 use std::path::Path;

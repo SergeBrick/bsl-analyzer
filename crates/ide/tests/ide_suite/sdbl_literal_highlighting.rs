@@ -11,6 +11,50 @@ use ide_db::base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ide_db::RootDatabaseImpl;
 use vfs::{FileId, FileSet, VfsPath};
 
+#[test]
+fn recovered_fields_and_totals_aliases_keep_exact_literal_ranges() {
+    for newline in ["\n", "\r\n"] {
+        let source = [
+            "Процедура Тест()",
+            "    Запрос = Новый Запрос;",
+            "    Запрос.Текст = \"ВЫБРАТЬ Т.Цена +, Т.Количество *,",
+            "    |Т.Код КАК Артикул",
+            "    |ИЗ Справочник.Товары КАК Т",
+            "    |ГДЕ Т.Код > 0",
+            "    |ИТОГИ КОЛИЧЕСТВО(Артикул) КАК Всего ПО Артикул\";",
+            "КонецПроцедуры",
+        ]
+        .join(newline);
+        let file_id = FileId(0);
+        let mut db = RootDatabaseImpl::new();
+        let mut files = FileSet::default();
+        files.insert(file_id, VfsPath::new("/test.bsl"));
+        db.set_file_text(file_id, &source);
+        db.set_source_root(SourceRootId(0), SourceRoot::new_local(files));
+        db.set_file_source_root(file_id, SourceRootId(0));
+        let highlights = ide::highlight(&db, file_id).highlights;
+        for (context, word, tag) in [
+            ("КАК Артикул", "Артикул", "EnumMember"),
+            ("Справочник.Товары", "Товары", "Type"),
+            ("ГДЕ Т.Код", "ГДЕ", "Keyword"),
+            ("ГДЕ Т.Код", "Код", "Property"),
+            ("КАК Всего", "Всего", "EnumMember"),
+        ] {
+            let start = source.find(context).unwrap() + context.find(word).unwrap();
+            let end = start + word.len();
+            let matches: Vec<_> = highlights
+                .iter()
+                .filter(|hl| {
+                    usize::from(hl.range.start()) == start && usize::from(hl.range.end()) == end
+                })
+                .collect();
+            assert_eq!(matches.len(), 1, "{word}: {highlights:?}");
+            assert_eq!(format!("{:?}", matches[0].tag), tag);
+            assert_eq!(&source[start..end], word);
+        }
+    }
+}
+
 fn highlight_inside_literal(source: &str) -> String {
     let file_id = FileId(0);
     let mut db = RootDatabaseImpl::new();

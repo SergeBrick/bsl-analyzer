@@ -3396,7 +3396,7 @@ fn test_slice8adn_gap_paren_balanced_subquery_arg() {
     assert_eq!(
         errors, 0,
         "Clean IN-subquery `Поле В (ВЫБРАТЬ X ИЗ Y)` as a VT arg must NOT \
-         trigger `recover_to_delimiter_vt` — the subquery's `)` is consumed \
+         trigger `recover_expression_tail` — the subquery's `)` is consumed \
          inside `expression(p)` / `predicate_expr` (Slice 10b territory). \
          Got: {} ERROR direct children of SdblTableRef.",
         errors,
@@ -3416,7 +3416,7 @@ fn test_slice8adn_gap_mid_arg_recovery() {
     let errors: Vec<_> = table_ref.children().filter(|c| c.kind() == SyntaxKind::ERROR).collect();
     assert!(
         !errors.is_empty(),
-        "Mid-arg spurious-token form must trigger `recover_to_delimiter_vt` \
+        "Mid-arg spurious-token form must trigger `recover_expression_tail` \
          and emit an ERROR direct child of SdblTableRef containing the \
          spurious `Q` token (mini-spec §IDE-recovery allowance #5). Got: 0 \
          ERROR direct children. SdblTableRef text: {:?}",
@@ -3426,7 +3426,7 @@ fn test_slice8adn_gap_mid_arg_recovery() {
     assert!(
         absorbed_q,
         "ERROR direct child of SdblTableRef must contain the spurious `Q` \
-         token consumed by `recover_to_delimiter_vt`. ERROR texts: {:?}",
+         token consumed by `recover_expression_tail`. ERROR texts: {:?}",
         errors.iter().map(|e| e.text().to_string()).collect::<Vec<_>>(),
     );
 }
@@ -3446,7 +3446,7 @@ fn test_slice8adn_gap_nested_function_call_arg() {
     assert_eq!(
         errors, 0,
         "Clean nested call `СУММА(A)` as a VT arg must NOT trigger \
-         `recover_to_delimiter_vt` (mini-spec §IDE-recovery allowance #5 \
+         `recover_expression_tail` (mini-spec §IDE-recovery allowance #5 \
          — the helper is a safety net for malformed input only). Got: {} \
          ERROR direct children of SdblTableRef.",
         errors,

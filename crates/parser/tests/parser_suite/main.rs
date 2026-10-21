@@ -11,6 +11,7 @@ mod line_tokens;
 mod parse_stability;
 mod recovery_boundaries;
 mod reparse;
+mod sdbl_expression_boundaries;
 mod sdbl_independent_corpus;
 mod sdbl_keyword_alias;
 mod sdbl_parser_tests;

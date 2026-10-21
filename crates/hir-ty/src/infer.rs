@@ -3271,6 +3271,14 @@ impl<'db> InferenceContext<'db> {
                 };
 
                 if let Some(name) = type_name {
+                    if matches!(
+                        name.as_str().fold_lower().as_str(),
+                        "описаниетипов" | "typedescription"
+                    ) {
+                        let arg_ids: Vec<ExprId> =
+                            args.iter().copied().map(ExprId::from_idx).collect();
+                        self.check_type_description_arguments(&arg_ids);
+                    }
                     let platform = bsl_platform::PlatformDataInner::instance();
                     let platform_type = platform.get_type(name.as_str());
                     let environment = platform_type.map_or(
@@ -4480,6 +4488,33 @@ impl<'db> InferenceContext<'db> {
         let Some(&path_expr) = args.first() else {
             return;
         };
+        if self.bare_module_method_exists(name) || self.is_call_name_shadowed(name) {
+            return;
+        }
+        self.check_metadata_path_literal(function, path_expr);
+    }
+
+    /// String arguments of `Новый ОписаниеТипов(...)`: type names, judged like the
+    /// argument of `Тип` ([`crate::metadata_path`]). Of the two constructor forms —
+    /// `(<Типы>, <Квалификаторы>…)` and `(<Исходное описание>, <Добавляемые типы>,
+    /// <Вычитаемые типы>, <Квалификаторы>…)` — a string in one of the first three
+    /// positions is a list of type names in either: qualifiers are never strings.
+    fn check_type_description_arguments(&mut self, args: &[ExprId]) {
+        for &arg in args.iter().take(3) {
+            self.check_metadata_path_literal(
+                crate::metadata_path::MetadataPathFunction::TypeDescription,
+                arg,
+            );
+        }
+    }
+
+    /// The literal `path_expr` judged as the metadata path `function` takes; silent on
+    /// any other expression.
+    fn check_metadata_path_literal(
+        &mut self,
+        function: crate::metadata_path::MetadataPathFunction,
+        path_expr: ExprId,
+    ) {
         let Expr::Literal(Literal::String(text)) = self.body.expr(path_expr) else {
             return;
         };
@@ -4489,16 +4524,14 @@ impl<'db> InferenceContext<'db> {
             || self.in_uncompiled_branch
             || self.module_compiles_nowhere()
             || !self.db.file_has_visible_config(self.context_file_id)
-            || self.bare_module_method_exists(name)
-            || self.is_call_name_shadowed(name)
         {
             return;
         }
         let resolver = crate::object_resolver::DbObjectResolver::new(self.db, self.context_file_id);
-        let Some(missing) = crate::metadata_path::missing_metadata(function, &text, &resolver)
-        else {
+        let missing = crate::metadata_path::missing_metadata(function, &text, &resolver);
+        if missing.is_empty() {
             return;
-        };
+        }
         // Asked of a miss only: the answer looks for `Configuration.xml` on disk.
         if !self.db.file_in_main_configuration(self.context_file_id) {
             return;
@@ -4508,13 +4541,16 @@ impl<'db> InferenceContext<'db> {
         // extension of the workspace adds is there when the call runs.
         let inventory = self.db.configurations_inventory();
         let workspace = crate::object_resolver::ConfigsObjectResolver(&inventory);
-        if crate::metadata_path::missing_metadata(function, &text, &workspace).is_none() {
-            return;
+        let missing_in_workspace =
+            crate::metadata_path::missing_metadata(function, &text, &workspace);
+        for missing in missing {
+            if missing_in_workspace.contains(&missing) {
+                self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedMetadataPath {
+                    expr: path_expr,
+                    missing,
+                });
+            }
         }
-        self.push_inference_diagnostic(InferenceDiagnostic::UnresolvedMetadataPath {
-            expr: path_expr,
-            missing,
-        });
     }
 
     /// A bare call whose name is both a method of this module's implicit receiver

@@ -8,7 +8,10 @@ Some global context functions take a metadata object as a string rather than as 
 - `ПредопределенноеЗначение("Перечисление.Цвета.Красный")` / `PredefinedValue(...)` —
   a path to a predefined value;
 - `ОткрытьФорму("Справочник.Товары.ФормаСписка")`, `ПолучитьФорму(...)`,
-  `ОткрытьФормуМодально(...)` (`OpenForm`, `GetForm`, `OpenFormModal`) — a form path.
+  `ОткрытьФормуМодально(...)` (`OpenForm`, `GetForm`, `OpenFormModal`) — a form path;
+- `Новый ОписаниеТипов("Строка, СправочникСсылка.Товары")` /
+  `New TypeDescription(...)` — a comma-separated list of type names (the string may be
+  the first, the second or the third argument of the constructor).
 
 The same thing written as code (`Справочники.Товары`, `Перечисления.Цвета.Красный`) is
 checked against the metadata, the string is not. When the object is renamed, removed or
@@ -24,7 +27,13 @@ by the same rules as the code spelling:
   module included);
 - an enum has such a value; a catalog or a chart (of accounts, characteristic types,
   calculation types) has such a predefined item; `ПустаяСсылка` (`EmptyRef`) always
-  exists.
+  exists;
+- a type name in `Тип` and `ОписаниеТипов` is not a bare kind without an object name
+  (`ДокументСсылка`, `СправочникСсылка`, `CatalogRef`) and not `ЛюбаяСсылка` (`AnyRef`):
+  these are type sets (the form XML writes them as `cfg:DocumentRef`), not types.
+  `Тип("ДокументСсылка")` fails with «Тип не определен» ("Type is not defined"),
+  `Новый ОписаниеТипов("ДокументСсылка")` with «Недопустимое значение параметра
+  (параметр номер '1')» ("Invalid parameter value (parameter number '1')").
 
 English spellings (`Type("CatalogRef.Товары")`, `PredefinedValue("Enum.Цвета.Красный")`,
 `OpenForm("Catalog.Товары.ListForm")`) are checked the same way.
@@ -33,6 +42,12 @@ English spellings (`Type("CatalogRef.Товары")`, `PredefinedValue("Enum.Ц�
 
 - the argument is not a string literal: a variable, a concatenation
   (`"Справочник." + Name`);
+- `ОтчетОбъект` (`ReportObject`) without a report name: a type of its own on the
+  server;
+- a type name that does not look like a metadata path (`НетТакогоТипа`), and an empty
+  name in an `ОписаниеТипов` list (`"Строка,"`): platform types depend on the execution
+  context, and an empty name is accepted by some platform versions and rejected by
+  others;
 - the module belongs neither to the main configuration nor to its extension: an
   external data processor or report, a file outside the configuration roots, a project
   without the main configuration (extensions only, external objects only, or a
@@ -63,6 +78,7 @@ enum `Цвета`):
 If TypeOf(Value) = Type("CatalogRef.Услуги") Then
     Color = PredefinedValue("Enum.Цвета.Зеленый");
 EndIf;
+Table.Columns.Add("Document", New TypeDescription("DocumentRef"));
 ```
 
 Correct:
@@ -71,4 +87,5 @@ Correct:
 If TypeOf(Value) = Type("CatalogRef.Товары") Then
     Color = PredefinedValue("Enum.Цвета.Красный");
 EndIf;
+Table.Columns.Add("Document", New TypeDescription("DocumentRef.Продажа"));
 ```

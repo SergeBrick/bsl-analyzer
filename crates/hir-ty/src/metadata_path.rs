@@ -11,10 +11,18 @@
 //! every path), and the predefined value of an enum, a catalog or a chart. A form name
 //! is never judged — the model does not list an object's forms, and the standard ones
 //! (`ФормаСписка`, `ФормаВыбора`, …) exist without being declared.
+//!
+//! A type name is judged the same way where the constructor `Новый ОписаниеТипов` takes
+//! it: a comma-separated list, each name checked on its own. One more miss is common to
+//! `Тип` and `ОписаниеТипов`: the bare kind prefix (`ДокументСсылка`, `ЛюбаяСсылка`) —
+//! a type set of the form XML (`cfg:DocumentRef`), but not a type. `Тип("ДокументСсылка")`
+//! fails with «Тип не определен», `Новый ОписаниеТипов("ДокументСсылка")` with
+//! «Недопустимое значение параметра» (8.3.17 and 8.3.27, server and thin client).
 
 use std::str::FromStr;
 
 use bsl_metadata::MdoType;
+use bsl_types::kind::MetadataKind;
 use stdx::case::CaseExt;
 
 use crate::object_resolver::ObjectResolver;
@@ -28,6 +36,9 @@ pub(crate) enum MetadataPathFunction {
     PredefinedValue,
     /// `ОткрытьФорму`, `ОткрытьФормуМодально`, `ПолучитьФорму`: `<Вид>.<Имя>.<Форма…>`.
     Form,
+    /// A string argument of the constructor `Новый ОписаниеТипов`: type names separated
+    /// by commas. Not a global function, so [`Self::of`] never yields it.
+    TypeDescription,
 }
 
 impl MetadataPathFunction {
@@ -55,13 +66,72 @@ pub enum MissingMetadata {
     Object { kind: MdoType, name: String },
     /// The object exists and lists its predefined values, but not this one.
     PredefinedValue { kind: MdoType, owner: String, value: String },
+    /// A type name that is only a kind prefix (`ДокументСсылка`, `CatalogRef`) or
+    /// `ЛюбаяСсылка`: a set of types, where one type is required.
+    TypeSet { name: String },
 }
 
 /// What `text`, the literal argument of `function`, names that the configuration does
-/// not have. `None` when the path is fine or is not one this check can judge: another
+/// not have — one entry per missing part; a type list of `ОписаниеТипов` may miss
+/// several. Empty when the path is fine or is not one this check can judge: another
 /// shape, a kind outside the configuration (external processors and reports), a part
 /// the model does not list.
 pub(crate) fn missing_metadata(
+    function: MetadataPathFunction,
+    text: &str,
+    resolver: &dyn ObjectResolver,
+) -> Vec<MissingMetadata> {
+    match function {
+        // The platform trims the names and skips an empty one between commas; a
+        // trailing comma or a blank string is accepted by one version and rejected by
+        // another, so an empty name is not judged.
+        MetadataPathFunction::TypeDescription => text
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| missing_type(name, resolver))
+            .collect(),
+        MetadataPathFunction::Type => missing_type(text, resolver).into_iter().collect(),
+        MetadataPathFunction::Form | MetadataPathFunction::PredefinedValue => {
+            missing_object_path(function, text, resolver).into_iter().collect()
+        }
+    }
+}
+
+/// A type name `<Вид><Фасет>.<Имя>`, or a bare `<Вид><Фасет>` that names a type set.
+fn missing_type(text: &str, resolver: &dyn ObjectResolver) -> Option<MissingMetadata> {
+    let segments: Vec<&str> = text.trim().split('.').collect();
+    if !segments.iter().all(|segment| crate::lower::type_string::is_identifier_shaped(segment)) {
+        return None;
+    }
+    match segments[..] {
+        [name] => type_set(name),
+        [prefix, name] => {
+            let kind = crate::lower::metadata_kind_from_prefix(&kind_spelling(prefix))?;
+            let mdo = crate::field_enum::mdo_type_for_kind(kind)
+                .or_else(|| crate::field_enum::register_parent_for_kind(kind))
+                .filter(|mdo| is_configuration_kind(*mdo))?;
+            object_missing(resolver, mdo, name)
+        }
+        _ => None,
+    }
+}
+
+/// A kind prefix written without the object name. `ОтчетОбъект` / `ReportObject` is the
+/// exception: a type of its own on the server (`Тип("ОтчетОбъект")` and
+/// `Новый ОписаниеТипов("ОтчетОбъект")` succeed there and fail on the client), so it is
+/// not judged. The prefix is matched as written: the platform does not read «ё» as «е»
+/// in a bare name (`ОтчётОбъект` fails where `ОтчетОбъект` succeeds).
+fn type_set(name: &str) -> Option<MissingMetadata> {
+    let is_set = matches!(name.fold_lower().as_str(), "любаяссылка" | "anyref")
+        || crate::lower::metadata_kind_from_prefix(name)
+            .is_some_and(|kind| !matches!(kind, MetadataKind::ReportObject));
+    is_set.then(|| MissingMetadata::TypeSet { name: name.to_string() })
+}
+
+/// A path `<Вид>.<Имя>…` of [`MetadataPathFunction::Form`] or
+/// [`MetadataPathFunction::PredefinedValue`].
+fn missing_object_path(
     function: MetadataPathFunction,
     text: &str,
     resolver: &dyn ObjectResolver,
@@ -71,16 +141,7 @@ pub(crate) fn missing_metadata(
         return None;
     }
     match function {
-        MetadataPathFunction::Type => {
-            let [prefix, name] = segments[..] else {
-                return None;
-            };
-            let kind = crate::lower::metadata_kind_from_prefix(&kind_spelling(prefix))?;
-            let mdo = crate::field_enum::mdo_type_for_kind(kind)
-                .or_else(|| crate::field_enum::register_parent_for_kind(kind))
-                .filter(|mdo| is_configuration_kind(*mdo))?;
-            object_missing(resolver, mdo, name)
-        }
+        MetadataPathFunction::Type | MetadataPathFunction::TypeDescription => None,
         MetadataPathFunction::Form => {
             let (mdo, name) = configuration_object(&segments)?;
             object_missing(resolver, mdo, name)

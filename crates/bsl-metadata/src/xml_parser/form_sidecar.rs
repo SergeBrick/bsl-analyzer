@@ -70,7 +70,9 @@ struct Sidecar {
 }
 
 // A present null is an invalid version, not the absent version's default.
-fn deserialize_schema<'de, D>(deserializer: D) -> std::result::Result<Option<serde_json::Value>, D::Error>
+fn deserialize_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

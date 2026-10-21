@@ -84,19 +84,27 @@ fn without_sidecar_controls_are_not_judged() {
 /// may add some), can reach controls the dialog does not list.
 #[test]
 fn a_module_that_may_add_controls_is_not_judged() {
-    for prelude in [
+    let judged = [
         "\tЭлементыФормы.Добавить(Тип(\"Кнопка\"), \"Кнопка2\", Истина);\n",
         "\tПостроитьКнопки(ЭтаФорма);\n",
         "\tПостроитьКнопки(ЭлементыФормы);\n",
         "\tЭтаФорма.ЭлементыФормы.Добавить(Тип(\"Кнопка\"), \"Кнопка2\", Истина);\n",
-    ] {
+        "\tПостроитьКнопки(ЭтаФорма.ЭлементыФормы);\n",
+        "\tПостроитьКнопки(ThisForm.Controls);\n",
+        "\tФ = ЭтаФорма.ЭлементыФормы;\n\tФ.Добавить(Тип(\"Кнопка\"), \"Кнопка2\", Истина);\n",
+        "\tПостроитьКнопки(ЭтаФорма[\"ЭлементыФормы\"]);\n",
+        "\tЭтаФорма[\"ЭлементыФормы\"].Добавить(Тип(\"Кнопка\"), \"Кнопка2\", Истина);\n",
+        "\tВыполнить(\"ЭлементыФормы.Добавить(Тип(\"\"Кнопка\"\"), \"\"Кнопка2\"\", Истина)\");\n",
+        "\tВычислить(\"ЭлементыФормы.Добавить(Тип(\"\"Кнопка\"\"), \"\"Кнопка2\"\", Истина)\");\n",
+    ]
+    .into_iter()
+    .filter(|prelude| {
         let code = format!(
             "Процедура ПриОткрытии()\n{prelude}\tЭлементыФормы.Кнопка2.Доступность = Ложь;\nКонецПроцедуры\n\nПроцедура ПостроитьКнопки(Что)\nКонецПроцедуры\n"
         );
         let found = findings(form_with_sidecar(), &code);
-        assert!(
-            lines_of(&found, DiagnosticCode::UnresolvedField).is_empty(),
-            "{prelude}: {found:?}"
-        );
-    }
+        !lines_of(&found, DiagnosticCode::UnresolvedField).is_empty()
+    })
+    .collect::<Vec<_>>();
+    assert!(judged.is_empty(), "judged although they may add controls: {judged:#?}");
 }

@@ -90,11 +90,17 @@ pub(crate) fn ordinary_controls_closed(db: &dyn HirDatabase, resolver: &Resolver
 }
 
 fn body_may_change_controls(body: &hir_def::Body) -> bool {
-    use hir_def::{Expr, IdConversion};
+    use hir_def::{Expr, IdConversion, Literal, Stmt};
 
+    // The collection however it is spelled: `ЭлементыФормы`, `ЭтаФорма.ЭлементыФормы`,
+    // `ЭтаФорма["ЭлементыФормы"]`.
     let is_controls = |expr: &Expr| match expr {
         Expr::Path(name) => is_ordinary_controls_name(name),
         Expr::Field { field, .. } => is_ordinary_controls_name(field),
+        Expr::Index { index, .. } => matches!(
+            body.expr_idx(*index),
+            Expr::Literal(Literal::String(text)) if is_ordinary_controls_name(&Name::new(text))
+        ),
         _ => false,
     };
     let is_add = |method: &Name| {
@@ -102,9 +108,18 @@ fn body_may_change_controls(body: &hir_def::Body) -> bool {
             .iter()
             .any(|add| method.eq_ignore_case(&Name::new(add)))
     };
+    let is_eval = |name: &Name| {
+        name.eq_ignore_case(&Name::new("Вычислить")) || name.eq_ignore_case(&Name::new("Eval"))
+    };
 
-    // A name read as a receiver (`ЭтаФорма.X`, `ЭлементыФормы.X`, `ЭлементыФормы[...]`)
-    // stays in this module; anywhere else (an argument, an assignment) it escapes.
+    // Code built from a string can do anything to the controls.
+    if body.stmts_iter().any(|(_, stmt)| matches!(stmt, Stmt::Execute { .. })) {
+        return true;
+    }
+
+    // The form or its collection read as a receiver (`ЭтаФорма.X`, `ЭлементыФормы.X`,
+    // `ЭлементыФормы[...]`) stays in this module; anywhere else (an argument, an
+    // assignment) it escapes.
     let mut receivers = rustc_hash::FxHashSet::default();
     for (_, expr) in body.exprs_iter() {
         match expr {
@@ -121,19 +136,20 @@ fn body_may_change_controls(body: &hir_def::Body) -> bool {
         }
     }
 
-    body.exprs_iter().any(|(id, expr)| match expr {
-        Expr::Path(name) => {
-            (is_ordinary_controls_name(name) || is_form_self_name(name))
-                && !receivers.contains(&id.to_idx())
+    body.exprs_iter().any(|(id, expr)| {
+        let escapes = || !receivers.contains(&id.to_idx());
+        match expr {
+            Expr::Path(name) if is_form_self_name(name) => escapes(),
+            Expr::MethodCall { receiver, method, .. } => {
+                is_add(method) && is_controls(body.expr_idx(*receiver))
+            }
+            Expr::Call { callee, .. } => match body.expr_idx(*callee) {
+                Expr::Field { base, field } => is_add(field) && is_controls(body.expr_idx(*base)),
+                Expr::Path(name) => is_eval(name),
+                _ => false,
+            },
+            _ => is_controls(expr) && escapes(),
         }
-        Expr::MethodCall { receiver, method, .. } => {
-            is_add(method) && is_controls(body.expr_idx(*receiver))
-        }
-        Expr::Call { callee, .. } => match body.expr_idx(*callee) {
-            Expr::Field { base, field } => is_add(field) && is_controls(body.expr_idx(*base)),
-            _ => false,
-        },
-        _ => false,
     })
 }
 

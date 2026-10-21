@@ -222,6 +222,24 @@ impl PreprocCondition {
         mask
     }
 
+    /// Environments that may take this branch. Unknown conditions keep an
+    /// environment both here and in `remaining`; a true condition takes it
+    /// out of later branches, and a false condition leaves it only there.
+    pub fn possible_branch(&self, remaining: &mut EnvFlags) -> EnvFlags {
+        let mut mask = EnvFlags::EMPTY;
+        for env in remaining.iter() {
+            match self.eval(env) {
+                Some(true) => {
+                    mask = mask | env;
+                    *remaining = remaining.without(env);
+                }
+                Some(false) => {}
+                None => mask = mask | env,
+            }
+        }
+        mask
+    }
+
     /// Rough heap bytes owned by this node's boxed children. The node
     /// itself is inline in its owner (a `PreprocIfStmt` field, a slice
     /// element, or a parent's `Box`) and is counted there.
@@ -478,6 +496,31 @@ mod tests {
         let mask = PreprocCondition::parse("Линукс").narrow_branch(&mut remaining);
         assert!(mask.is_empty(), "undecidable branch checks nothing");
         assert!(remaining.is_empty(), "undecidable envs leave the chain entirely");
+    }
+
+    #[test]
+    fn possible_branches_filter_unknown_remainders() {
+        let mut remaining = EnvFlags::SERVER | EnvFlags::WEB_CLIENT;
+        assert_eq!(
+            PreprocCondition::parse("Линукс").possible_branch(&mut remaining),
+            EnvFlags::SERVER | EnvFlags::WEB_CLIENT
+        );
+        assert_eq!(remaining, EnvFlags::SERVER | EnvFlags::WEB_CLIENT);
+        assert_eq!(
+            PreprocCondition::parse("ТолстыйКлиентОбычноеПриложение")
+                .possible_branch(&mut remaining),
+            EnvFlags::EMPTY
+        );
+        assert_eq!(remaining, EnvFlags::SERVER | EnvFlags::WEB_CLIENT);
+        assert_eq!(
+            PreprocCondition::parse("Сервер").possible_branch(&mut remaining),
+            EnvFlags::SERVER
+        );
+        assert_eq!(remaining, EnvFlags::WEB_CLIENT);
+        assert_eq!(
+            PreprocCondition::parse("Линукс").possible_branch(&mut remaining),
+            EnvFlags::WEB_CLIENT
+        );
     }
 
     /// `Сервер` is the one symbol undecided by the environment, so a condition

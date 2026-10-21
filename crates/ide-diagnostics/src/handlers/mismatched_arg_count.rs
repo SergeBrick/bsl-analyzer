@@ -203,6 +203,25 @@ mod tests {
     }
 
     #[test]
+    fn nested_module_regions_keep_known_exclusions() {
+        for (outer, inner, expected) in [
+            ("ТолстыйКлиентОбычноеПриложение", "Linux", 0),
+            ("Сервер И Не Сервер", "Линукс", 0),
+            ("Линукс", "ТолстыйКлиентОбычноеПриложение", 0),
+            ("Сервер", "Линукс", 1),
+            ("Линукс", "Сервер", 1),
+        ] {
+            let body = format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\
+                 #Если {outer} Тогда\n#Если {inner} Тогда\n\
+                 Процедура Тест() Экспорт\nСложение(1);\nКонецПроцедуры\n\
+                 #КонецЕсли\n#КонецЕсли\n"
+            );
+            assert_eq!(in_server_module(&body).len(), expected, "{outer} / {inner}");
+        }
+    }
+
+    #[test]
     fn does_not_fire_when_optional_args_are_omitted() {
         let fixture = r#"
 //- /CommonModules/ОбщийМодуль/Ext/Module.bsl

@@ -190,6 +190,7 @@ impl ScopeProvider for DbScopeProvider<'_> {
                     is_virtual_table: false,
                     virtual_table_params: Vec::new(),
                     subquery: Vec::new(),
+                    parameter: None,
                     range: syntax::TextRange::default(),
                 };
                 // Completion has no channel to report a colliding alias through; the diagnostic

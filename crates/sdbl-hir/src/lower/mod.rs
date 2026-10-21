@@ -59,6 +59,7 @@ pub fn lower_sdbl_to_hir_with_resolver(
     let mut ctx = LoweringContext::new(resolver);
 
     let mut sdbl_queries = Vec::new();
+    let mut parameter_sources = Vec::new();
     let mut select_index = 0;
     let mut has_query_item = false;
 
@@ -86,6 +87,7 @@ pub fn lower_sdbl_to_hir_with_resolver(
         };
 
         let has_union_siblings = subquery.union_clauses().next().is_some();
+        let first_member = sdbl_queries.len();
 
         if let Some(main_query) = subquery.main_query() {
             ctx.scope.push_frame();
@@ -209,6 +211,12 @@ pub fn lower_sdbl_to_hir_with_resolver(
             }
         }
 
+        collect_parameter_sources(
+            &select_query,
+            &sdbl_queries[first_member..],
+            &mut parameter_sources,
+        );
+
         select_index += 1;
     }
 
@@ -219,7 +227,36 @@ pub fn lower_sdbl_to_hir_with_resolver(
 
     ctx.source_map.finalize();
 
-    crate::hir::SdblPackage { queries: sdbl_queries, source_map: ctx.source_map }
+    crate::hir::SdblPackage { queries: sdbl_queries, parameter_sources, source_map: ctx.source_map }
+}
+
+/// Records the parameter sources of one batch statement. `INTO` and `TOTALS` belong to the
+/// statement, not to the member naming the source: `INTO` in any `UNION` member puts the whole
+/// statement into a temporary table. Nested queries are not walked.
+fn collect_parameter_sources(
+    select_query: &SdblSelectQuery,
+    members: &[crate::hir::SdblQuery],
+    out: &mut Vec<crate::hir::ParameterSourceUse>,
+) {
+    let statement_has_into = members.iter().any(|q| q.hir.into_table.is_some());
+    let statement_totals = select_query
+        .syntax()
+        .children()
+        .find(|n| n.kind() == syntax::SyntaxKind::SDBL_TOTALS_BY)
+        .and_then(|totals| syntax::ast_utils::significant_tokens(&totals).next())
+        .map(|keyword| keyword.text_range());
+
+    for member in members {
+        for table in member.hir.all_tables() {
+            if let Some(source) = &table.parameter {
+                out.push(crate::hir::ParameterSourceUse {
+                    source: source.clone(),
+                    statement_has_into,
+                    statement_totals,
+                });
+            }
+        }
+    }
 }
 
 impl LoweringContext<'_> {

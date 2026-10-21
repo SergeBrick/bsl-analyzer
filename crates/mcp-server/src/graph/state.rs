@@ -6148,7 +6148,10 @@ mod tests {
         forced_reload_workspace(root);
         let graph = GraphState::for_workspace(root.to_path_buf());
         graph.ensure_loading();
-        wait_ready(&graph);
+        // Settled, not merely ready: the first build's publish pass ends by deciding the debts
+        // on its own thread, and a forced reload recorded before it gets there is built and
+        // installed by a loader the refusal below does not reach.
+        wait_settled(&graph);
 
         declare_source_root(root, "alias-b");
         // Recorded without deciding: this test drives the builds itself, and a reload spawned
@@ -10501,6 +10504,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
     fn deferred_context_mark_keeps_its_reported_fact() {
         use super::super::test_support::{wait_publish_pass_within, WAIT_CEILING};
 

@@ -131,8 +131,10 @@ pub mod procedure_returns_value;
 pub mod protected_module;
 pub mod public_methods_description;
 pub mod query_nested_fields_by_dot;
+pub mod query_parameter_source_without_into;
 pub mod query_parse_error;
 pub mod query_to_missing_metadata;
+pub mod query_totals_in_value_table_into;
 pub mod read_only_property;
 pub mod redundant_access_to_object;
 pub mod ref_overuse;
@@ -417,6 +419,12 @@ pub fn get_metadata(code: DiagnosticCode) -> Option<&'static DiagnosticMetadata>
         DiagnosticCode::QueryNestedFieldsByDot => Some(&query_nested_fields_by_dot::METADATA),
         DiagnosticCode::QueryParseError => Some(&query_parse_error::METADATA),
         DiagnosticCode::QueryToMissingMetadata => Some(&query_to_missing_metadata::METADATA),
+        DiagnosticCode::QueryParameterSourceWithoutInto => {
+            Some(&query_parameter_source_without_into::METADATA)
+        }
+        DiagnosticCode::QueryTotalsInValueTableInto => {
+            Some(&query_totals_in_value_table_into::METADATA)
+        }
         DiagnosticCode::AmbiguousFieldInQuery => Some(&ambiguous_field_in_query::METADATA),
         DiagnosticCode::DuplicateAliasInQuery => Some(&duplicate_alias_in_query::METADATA),
         DiagnosticCode::UnknownFieldInQuery => Some(&unknown_field_in_query::METADATA),

@@ -72,7 +72,9 @@ pub const METADATA_DEPENDENT_CODES: &[DiagnosticCode] = &[
     DiagnosticCode::UnknownFieldInQuery,
 ];
 
-/// Every code a query can be blamed for, whatever the route.
+/// Every code decided by the query text alone, whatever the route. Rules that need the BSL
+/// context executing the query are not here: bare text has no such context and never reports
+/// them.
 ///
 /// Exported because a consumer comparing the two routes has to know the set, and a hand-copied
 /// list is exactly what drifts when a rule is added — as it did the moment this module gained

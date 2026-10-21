@@ -1,5 +1,4 @@
-//! Valid platform calls of a managed form module that `TypeMismatch` rejected
-//! (issue #267).
+//! Type compatibility of configuration access rights and managed form items.
 //!
 //! - `ПравоДоступа(<Право>, Метаданные)`: the rights of the configuration as a
 //!   whole (`Администрирование`, `Вывод`, `ВнешнееСоединение`, …) are asked of
@@ -271,7 +270,8 @@ fn decorations_are_moved_and_serve_as_the_item_before() {
 
 #[test]
 fn a_parent_given_by_name_or_a_field_is_still_a_mismatch() {
-    // The platform rejects both: «Несоответствие типов (параметр номер '3')».
+    // The platform rejects a name with a type mismatch, and a field or decoration
+    // with an invalid-value error: none is a valid parent.
     let (_temp, db, file_id) = setup_form(
         "    ПоИмени = Элементы.Добавить(\"Кнопка1\", Тип(\"КнопкаФормы\"), \"Подменю\");
     ВПоле = Элементы.Добавить(\"Кнопка2\", Тип(\"КнопкаФормы\"), Элементы.Поле);

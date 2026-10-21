@@ -22,12 +22,14 @@ impl GlobalState {
 
     /// Reads the settings the main configuration's `Configuration.xml` states into the
     /// database: the compatibility mode, whether ordinary forms run in the managed
-    /// thick client and the ordinary-application support its default run mode implies.
+    /// thick client, the ordinary-application support its default run mode implies
+    /// and whether that run mode is the managed application.
     pub(crate) fn apply_configuration_xml_settings(&mut self) {
         let db = self.analysis_host.raw_database_mut();
         apply_compatibility_mode_to_db(db, self.project.as_ref());
         ide_host_core::apply_ordinary_forms_setting(db, self.project.as_ref());
         apply_ordinary_app_support_to_db(db, self.project.as_ref());
+        ide_host_core::apply_default_run_mode(db, self.project.as_ref());
     }
 }
 
@@ -460,5 +462,48 @@ checked_environments = ["ТонкийКлиент", "Server", "Неизвест�
             project_with("OrdinaryApplication", "[diagnostics]\ndataflowMaxIterations = \"abc\"\n");
         apply(&mut db, &project);
         assert!(!db.env_options().ordinary_app_support, "a rejected section derives nothing");
+    }
+
+    /// `managed_run_mode` follows `<DefaultRunMode>` alone: `Auto` counts as the
+    /// managed application, `OrdinaryApplication` and an unknown mode do not, and no
+    /// `ordinaryAppSupport` setting changes it.
+    #[test]
+    fn default_run_mode_reaches_the_execution_model() {
+        fn run_mode_of(configuration: Option<&str>, toml: &str) -> bool {
+            let dir = tempdir().unwrap();
+            let cf = dir.path().join("src").join("cf");
+            fs::create_dir_all(&cf).unwrap();
+            if let Some(run_mode) = configuration {
+                fs::write(
+                    cf.join("Configuration.xml"),
+                    format!(
+                        "<MetaDataObject><Configuration><Properties><DefaultRunMode>{run_mode}\
+                         </DefaultRunMode></Properties></Configuration></MetaDataObject>"
+                    ),
+                )
+                .unwrap();
+            }
+            fs::write(dir.path().join("bsl-analyzer.toml"), toml).unwrap();
+            let project = Project::new(dir.path()).unwrap();
+            let mut db = RootDatabaseImpl::new();
+            apply_project_config_to_db(&mut db, &project.config);
+            ide_host_core::apply_default_run_mode(&mut db, Some(&project));
+            db.env_options().managed_run_mode
+        }
+
+        assert!(run_mode_of(Some("ManagedApplication"), ""));
+        assert!(run_mode_of(Some("Auto"), ""));
+        assert!(!run_mode_of(Some("OrdinaryApplication"), ""));
+        assert!(!run_mode_of(None, ""), "no main configuration");
+        assert!(!run_mode_of(Some("Managed"), ""), "an unknown mode is not known");
+        assert!(!run_mode_of(Some("managedapplication"), ""), "the values are case-sensitive");
+        assert!(
+            run_mode_of(Some("ManagedApplication"), "[diagnostics]\nordinaryAppSupport = true\n"),
+            "the setting does not change the run mode"
+        );
+        assert!(!run_mode_of(
+            Some("OrdinaryApplication"),
+            "[diagnostics]\nordinaryAppSupport = false\n"
+        ));
     }
 }

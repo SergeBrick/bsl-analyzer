@@ -232,9 +232,10 @@ pub struct Form {
     /// The dialog carries `<BaseForm>`: a form borrowed by an extension, whose
     /// bindings also name the base form's handlers, which live in the base module.
     pub has_base_form: bool,
-    /// An ORDINARY form whose dialog was read from its `Ext/Form/Form.json` sidecar:
-    /// `elements`, `attributes` and `event_handlers` are then the form's own, not
-    /// stand-ins. Always `false` for a managed form, whose dialog is `Ext/Form.xml`.
+    /// An ORDINARY form whose dialog was read from its `Ext/Form/Form.json` sidecar.
+    /// Elements and attributes come from the sidecar; version 1 without
+    /// `form.handlers` still uses default names for the form's own events.
+    /// Always `false` for a managed form, whose dialog is `Ext/Form.xml`.
     pub ordinary_dialog_known: bool,
 }
 

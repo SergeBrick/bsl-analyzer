@@ -31,6 +31,7 @@ pub struct Parser<'a> {
     open_preproc_ifs: u32,
     crossed_preproc_ifs: Vec<u32>,
     conditionals: std::cell::OnceCell<Vec<torn_if::Conditional>>,
+    closers_ahead: std::cell::OnceCell<Vec<Option<bool>>>,
     /// The torn conditional groups whose branch is being read: where the
     /// branch ends and where the group closes.
     open_torn_ifs: Vec<(usize, usize)>,
@@ -54,6 +55,7 @@ impl<'a> Parser<'a> {
             open_preproc_ifs: 0,
             crossed_preproc_ifs: Vec::new(),
             conditionals: std::cell::OnceCell::new(),
+            closers_ahead: std::cell::OnceCell::new(),
             open_torn_ifs: Vec::new(),
         }
     }
@@ -287,6 +289,83 @@ impl<'a> Parser<'a> {
         }
         closed.sort_unstable();
         closed
+    }
+
+    /// Whether a `)` closes a paren left open before the current token, ahead
+    /// of the next `;`, counting no paren inside an extension's `{…}`.
+    ///
+    /// Decided once for the whole input, as the inserts are: asked at every
+    /// recovery in a long list of broken arguments, a scan to the list's
+    /// closing paren would make the list quadratic.
+    pub(crate) fn closing_paren_ahead(&self) -> bool {
+        let closers = self.closers_ahead.get_or_init(|| self.match_closers());
+        match closers.get(self.pos) {
+            Some(Some(ahead)) => *ahead,
+            // Inside a brace region the scan counts the region's own parens,
+            // which a reading from the start of the statement never does.
+            Some(None) => self.scan_for_closing_paren(),
+            None => false,
+        }
+    }
+
+    /// For each position outside braces: the scan from there meets a depth
+    /// below its own before the statement ends.
+    fn match_closers(&self) -> Vec<Option<bool>> {
+        let len = self.input.len();
+        let mut before = Vec::with_capacity(len);
+        let mut after = Vec::with_capacity(len);
+        let mut outside = Vec::with_capacity(len);
+        let (mut depth, mut braces) = (0i32, 0u32);
+        for pos in 0..len {
+            before.push(depth);
+            outside.push(braces == 0);
+            match self.input.kind(pos) {
+                Some(T![Semicolon]) => (depth, braces) = (0, 0),
+                Some(T![LBrace]) => braces += 1,
+                Some(T![RBrace]) => braces = braces.saturating_sub(1),
+                Some(T![LParen]) if braces == 0 => depth += 1,
+                Some(T![RParen]) if braces == 0 => depth -= 1,
+                _ => {}
+            }
+            after.push(depth);
+        }
+
+        let mut closers = vec![None; len];
+        let mut lowest = i32::MAX;
+        for pos in (0..len).rev() {
+            lowest = if self.input.kind(pos) == Some(T![Semicolon]) {
+                i32::MAX
+            } else {
+                lowest.min(after[pos])
+            };
+            if outside[pos] {
+                closers[pos] = Some(lowest < before[pos]);
+            }
+        }
+        closers
+    }
+
+    fn scan_for_closing_paren(&self) -> bool {
+        let mut parens = 0u32;
+        let mut braces = 0u32;
+        let mut offset = 0;
+        while let Some(kind) = self.nth(offset) {
+            match kind {
+                T![Semicolon] => return false,
+                T![LBrace] => braces += 1,
+                T![RBrace] => braces = braces.saturating_sub(1),
+                T![LParen] if braces == 0 => parens += 1,
+                T![RParen] if braces == 0 => {
+                    if parens == 0 {
+                        return true;
+                    }
+                    parens -= 1;
+                }
+                _ => {}
+            }
+            offset += 1;
+        }
+        false
     }
 
     /// The closed conditional group whose `#Если` stands at `pos`.
@@ -995,5 +1074,39 @@ mod closer_typo_tests {
     fn the_closer_itself_is_not_a_typo() {
         assert!(!is_typo_of("КонецЕсли", "КонецЕсли"));
         assert!(!is_typo_of("конецесли", "КонецЕсли"));
+    }
+}
+
+#[cfg(test)]
+mod closing_paren_tests {
+    use super::Parser;
+
+    /// The table must answer exactly as the scan from each position does,
+    /// on inputs where the two could part: stray closers, parens inside
+    /// braces, unclosed braces and statements cut by `;`.
+    #[test]
+    fn the_table_agrees_with_the_scan_at_every_position() {
+        for input in [
+            "ВЫБРАТЬ F(А мусор, Б мусор, В ИЗ) ИЗ Т",
+            "ВЫБРАТЬ F(А, (Б + В), Г) ИЗ Т; ВЫБРАТЬ (А ИЗ Т",
+            "ВЫБРАТЬ А) Б) ИЗ Т ГДЕ (В",
+            "ВЫБРАТЬ F(А {(Б} В), Г) ИЗ Т",
+            "ВЫБРАТЬ F(А {Б ( В) ИЗ Т; ВЫБРАТЬ } ) (А)",
+            "ВЫБРАТЬ }} (А {{ ) }) Б ; ) ИЗ (Т",
+            "",
+        ] {
+            let tokens = crate::sdbl_token_converter::convert_sdbl_tokens(
+                &lexer::sdbl::tokenize_sdbl(input),
+            );
+            let mut p = Parser::new(&tokens);
+            for pos in 0..=p.input.len() {
+                p.pos = pos;
+                assert_eq!(
+                    p.closing_paren_ahead(),
+                    p.scan_for_closing_paren(),
+                    "{input:?} at significant token {pos}"
+                );
+            }
+        }
     }
 }

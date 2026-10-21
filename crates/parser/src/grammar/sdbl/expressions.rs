@@ -91,35 +91,12 @@ pub(super) fn at_comma(p: &Parser) -> bool {
     p.at(T![Comma])
 }
 
-fn closing_paren_ahead(p: &Parser) -> bool {
-    let mut parens = 0;
-    let mut braces = 0;
-    let mut offset = 0;
-    while let Some(kind) = p.nth(offset) {
-        match kind {
-            T![Semicolon] => return false,
-            T![LBrace] => braces += 1,
-            T![RBrace] => braces = (braces - 1).max(0),
-            T![LParen] if braces == 0 => parens += 1,
-            T![RParen] if braces == 0 => {
-                if parens == 0 {
-                    return true;
-                }
-                parens -= 1;
-            }
-            _ => {}
-        }
-        offset += 1;
-    }
-    false
-}
-
 pub(super) fn recover_to_delimiter(
     p: &mut Parser,
     report: bool,
     at_delimiter: fn(&Parser) -> bool,
 ) {
-    let has_closer = closing_paren_ahead(p);
+    let has_closer = p.closing_paren_ahead();
     let err = p.start();
     let mut consumed_any = false;
     let mut paren_depth = 0i32;

@@ -29,12 +29,134 @@ pub fn is_form_items_collection_ty(db: &dyn HirDatabase, ty: TypeId) -> bool {
         || name.eq_ignore_case(&Name::new(FORM_ITEMS_TYPE_EN))
 }
 
+/// The ordinary form's controls collection. The platform catalog files two types under
+/// the Russian name `ЭлементыФормы` (this one and the managed `FormItems`); the English
+/// alias names this one without ambiguity.
+pub const ORDINARY_CONTROLS_TYPE_EN: &str = "Controls";
+const ORDINARY_CONTROLS_NAME_RU: &str = "ЭлементыФормы";
+
+pub fn is_ordinary_controls_collection_ty(db: &dyn HirDatabase, ty: TypeId) -> bool {
+    let TypeKind::PlatformObject(facet) = db.lookup_type(ty) else { return false };
+    Name::new(facet.name.as_str()).eq_ignore_case(&Name::new(ORDINARY_CONTROLS_TYPE_EN))
+}
+
+fn is_ordinary_controls_name(name: &Name) -> bool {
+    name.eq_ignore_case(&Name::new(ORDINARY_CONTROLS_NAME_RU))
+        || name.eq_ignore_case(&Name::new(ORDINARY_CONTROLS_TYPE_EN))
+}
+
+fn is_form_self_name(name: &Name) -> bool {
+    name.eq_ignore_case(&Name::new("ЭтаФорма")) || name.eq_ignore_case(&Name::new("ThisForm"))
+}
+
+/// The form of this module when it is an ORDINARY form whose dialog was read from its
+/// sidecar - the only case where the module knows its controls.
+fn ordinary_form_with_known_dialog(db: &dyn HirDatabase, resolver: &Resolver) -> Option<Arc<Form>> {
+    let module_id = resolver.module_id()?;
+    let metadata = db.module_metadata(module_id);
+    if metadata.module_type != bsl_metadata::ModuleType::FormModule {
+        return None;
+    }
+    metadata.form.clone().filter(|form| form.is_ordinary() && form.ordinary_dialog_known)
+}
+
+/// The bare `ЭлементыФормы` / `Controls` of an ordinary form module whose dialog is
+/// known: the form's controls collection.
+pub(crate) fn resolve_ordinary_form_controls(
+    db: &dyn HirDatabase,
+    resolver: &Resolver,
+    name: &Name,
+) -> Option<TypeId> {
+    if !is_ordinary_controls_name(name) {
+        return None;
+    }
+    ordinary_form_with_known_dialog(db, resolver)?;
+    Some(db.platform_object(ORDINARY_CONTROLS_TYPE_EN.to_string()))
+}
+
+/// Whether a miss on this ordinary form's controls collection is a real defect: the
+/// dialog is known and the module never changes the set of controls. A module that
+/// calls `ЭлементыФормы.Добавить(...)`, or hands the form or its controls collection
+/// to other code (which may add controls), can reach a control the dialog does not
+/// list, so there a miss proves nothing.
+pub(crate) fn ordinary_controls_closed(db: &dyn HirDatabase, resolver: &Resolver) -> bool {
+    let Some(module_id) = resolver.module_id() else { return false };
+    if ordinary_form_with_known_dialog(db, resolver).is_none() {
+        return false;
+    }
+    let bodies = db.module_bodies(module_id);
+    let mut all = bodies.method_bodies().map(|(_, body, _)| body).chain(bodies.module_code());
+    !all.any(body_may_change_controls)
+}
+
+fn body_may_change_controls(body: &hir_def::Body) -> bool {
+    use hir_def::{Expr, IdConversion};
+
+    let is_controls = |expr: &Expr| match expr {
+        Expr::Path(name) => is_ordinary_controls_name(name),
+        Expr::Field { field, .. } => is_ordinary_controls_name(field),
+        _ => false,
+    };
+    let is_add = |method: &Name| {
+        ["Добавить", "Add", "ДобавитьActiveX", "AddActiveX"]
+            .iter()
+            .any(|add| method.eq_ignore_case(&Name::new(add)))
+    };
+
+    // A name read as a receiver (`ЭтаФорма.X`, `ЭлементыФормы.X`, `ЭлементыФормы[...]`)
+    // stays in this module; anywhere else (an argument, an assignment) it escapes.
+    let mut receivers = rustc_hash::FxHashSet::default();
+    for (_, expr) in body.exprs_iter() {
+        match expr {
+            Expr::Field { base, .. } | Expr::Index { base, .. } => {
+                receivers.insert(*base);
+            }
+            Expr::MethodCall { receiver, .. } => {
+                receivers.insert(*receiver);
+            }
+            Expr::Call { callee, .. } => {
+                receivers.insert(*callee);
+            }
+            _ => {}
+        }
+    }
+
+    body.exprs_iter().any(|(id, expr)| match expr {
+        Expr::Path(name) => {
+            (is_ordinary_controls_name(name) || is_form_self_name(name))
+                && !receivers.contains(&id.to_idx())
+        }
+        Expr::MethodCall { receiver, method, .. } => {
+            is_add(method) && is_controls(body.expr_idx(*receiver))
+        }
+        Expr::Call { callee, .. } => match body.expr_idx(*callee) {
+            Expr::Field { base, field } => is_add(field) && is_controls(body.expr_idx(*base)),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 pub(crate) fn lookup_form_item_field(
     db: &dyn HirDatabase,
     resolver: &Resolver,
     receiver: TypeId,
     field: &Name,
 ) -> Option<FieldInfo> {
+    if is_ordinary_controls_collection_ty(db, receiver) {
+        // The control exists; its own surface (an ordinary input field, table box,
+        // button...) is not modelled, so its type stays open.
+        let form = ordinary_form_with_known_dialog(db, resolver)?;
+        let element = form.find_element(field.as_str())?;
+        return Some(FieldInfo {
+            name: Name::new(&element.name),
+            name_en: None,
+            ty: db.unknown(),
+            value_ty: None,
+            is_readonly: true,
+            origin: FieldOrigin::PlatformProperty { env: hir_def::execution_env::EnvFlags::ALL },
+        });
+    }
     if !is_form_items_collection_ty(db, receiver) {
         return None;
     }

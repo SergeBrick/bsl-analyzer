@@ -55,6 +55,12 @@ pub enum ConventionalName {
     PredefinedXml,
     RightsXml,
     FormXml,
+    /// The optional description of an ORDINARY form's dialog (`Ext/Form/Form.json`):
+    /// the dialog itself is the binary `Ext/Form.bin`, so a tool that can read it may
+    /// leave this JSON next to the module (`docs/configuration/ordinary-form-sidecar.md`).
+    FormJson,
+    /// The binary dialog of an ORDINARY form (`Ext/Form.bin`), next to `Ext/Form/`.
+    FormBin,
 }
 
 impl ConventionalName {
@@ -80,6 +86,8 @@ impl ConventionalName {
         ConventionalName::PredefinedXml,
         ConventionalName::RightsXml,
         ConventionalName::FormXml,
+        ConventionalName::FormJson,
+        ConventionalName::FormBin,
     ];
 
     /// The canonical spelling the configurator writes. Constructing a path or
@@ -108,6 +116,8 @@ impl ConventionalName {
             ConventionalName::PredefinedXml => "Predefined.xml",
             ConventionalName::RightsXml => "Rights.xml",
             ConventionalName::FormXml => "Form.xml",
+            ConventionalName::FormJson => "Form.json",
+            ConventionalName::FormBin => "Form.bin",
         }
     }
 
@@ -205,7 +215,9 @@ mod tests {
             Configuration.xml
             Predefined.xml
             Rights.xml
-            Form.xml"#]]
+            Form.xml
+            Form.json
+            Form.bin"#]]
         .assert_eq(&listing);
     }
 

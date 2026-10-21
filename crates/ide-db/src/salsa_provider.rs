@@ -264,6 +264,10 @@ impl AnalysisProvider for SalsaProvider<'_> {
         HirDatabase::compatibility_mode(self.db)
     }
 
+    fn vendor_support_for_file(&self, file_id: FileId) -> Option<Arc<bsl_metadata::VendorSupport>> {
+        self.db.vendor_support_for_file(file_id)
+    }
+
     fn env_options(&self) -> hir::execution_env::EnvOptions {
         HirDatabase::env_options(self.db)
     }

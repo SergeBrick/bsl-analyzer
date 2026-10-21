@@ -1570,6 +1570,7 @@ impl DiagnosticsState {
         super::resident::apply_project_compatibility_mode(&mut db, project.compatibility_mode());
         ide_host_core::apply_ordinary_forms_setting(&mut db, Some(&project));
         ide_host_core::apply_default_run_mode(&mut db, Some(&project));
+        super::resident::apply_project_vendor_support(&mut db, &project);
         // A file whose bytes could not be read is NOT served: it is held out of
         // `by_path` and answered as "known but unreadable", and the retry list
         // re-reads it every window. Its baseline fingerprint stays — the scan did

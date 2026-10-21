@@ -8531,3 +8531,50 @@ fn borrowed_form_picks_up_a_base_dialog_that_appears_on_disk() {
         "a bump of the base root alone must re-run the extension's form"
     );
 }
+
+/// The vendor support map answers for a file of the MAIN configuration only: an
+/// extension's module is the developer's own whatever uuids its objects carry.
+#[test]
+fn vendor_support_answers_for_main_configuration_files_only() {
+    let root = std::env::temp_dir().join(format!(
+        "bsl_vendor_support_main_only_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let main_root = root.join("cf");
+    let ext_root = root.join("cfe/X");
+    std::fs::create_dir_all(&main_root).unwrap();
+    std::fs::create_dir_all(&ext_root).unwrap();
+
+    let mut db = RootDatabaseImpl::new();
+    let main_file = FileId(0);
+    let ext_file = FileId(1);
+    let mut file_set = FileSet::new();
+    file_set.insert(main_file, VfsPath::new(main_root.join("Модуль1").to_string_lossy().as_ref()));
+    file_set.insert(ext_file, VfsPath::new(ext_root.join("Модуль1").to_string_lossy().as_ref()));
+    db.set_source_root(SourceRootId(0), SourceRoot::new_local(file_set));
+    for file in [main_file, ext_file] {
+        db.set_file_source_root(file, SourceRootId(0));
+        db.set_file_text(file, "");
+    }
+    db.set_all_config_paths(
+        vec![(None, main_root.clone()), (Some("X".to_string()), ext_root.clone())],
+        Some(bsl_metadata::ExtensionScope::InfoBase),
+    );
+
+    assert_eq!(db.vendor_support_for_file(main_file), None, "no map loaded, nothing to answer");
+
+    let support = Arc::new(
+        bsl_metadata::VendorSupport::parse(
+            b"{6,0,1,00000000-0000-4000-8000-0000000000a1,0,00000000-0000-4000-8000-0000000000a2,\
+              \"1.0\",\"V\",\"C\",1,1,0,00000000-0000-4000-8000-000000000001,\
+              00000000-0000-4000-8000-000000000001,0,1}",
+        )
+        .unwrap(),
+    );
+    db.set_vendor_support(Some(Arc::clone(&support)));
+    assert_eq!(db.vendor_support_for_file(main_file), Some(support));
+    assert_eq!(db.vendor_support_for_file(ext_file), None, "an extension is never on support");
+
+    std::fs::remove_dir_all(&root).ok();
+}

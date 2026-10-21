@@ -18,4 +18,9 @@ pub struct FeaturesInput {
     /// source states one. Drives `PlatformMemberHiddenByCompatibilityMode`.
     #[returns(clone)]
     pub compatibility_mode: Option<Arc<str>>,
+    /// The main configuration's vendor support map (`Ext/ParentConfigurations.bin`);
+    /// `None` when not loaded: no diagnostic asked for it, or the configuration was
+    /// never on support.
+    #[returns(clone)]
+    pub vendor_support: Option<Arc<bsl_metadata::VendorSupport>>,
 }

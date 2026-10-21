@@ -36,6 +36,7 @@ crates/bsl-metadata/src/event_subscription.rs	CommonModule	1	вне-класса
 crates/bsl-metadata/src/loader.rs	cannot read Predefined.xml	1	вне-класса: текст лога
 crates/bsl-metadata/src/metadata_object.rs	CommonModule	1	вне-класса: имя XML-тега
 crates/bsl-metadata/src/scheduled_job.rs	CommonModule	1	вне-класса: значение в XML метаданных
+crates/bsl-metadata/src/xml_parser/command.rs	{name}.xml	2	конструкция: кандидат разрешается регистронезависимо, fallback канонического написания
 crates/bsl-metadata/src/xml_parser/form.rs	Commands	1	вне-класса: имя XML-элемента, XML регистрозависим
 crates/bsl-metadata/src/xml_parser/form.rs	Form	4	вне-класса: имя XML-элемента, XML регистрозависим
 crates/bsl-metadata/src/xml_parser/form.rs	{}.xml	1	конструкция: fallback канонического написания

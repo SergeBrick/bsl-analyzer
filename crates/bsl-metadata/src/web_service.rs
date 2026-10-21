@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebService {
     name: String,
+    uuid: Uuid,
     namespace: String,
     operations: Vec<WebServiceOperation>,
     uri: Option<String>,
@@ -10,11 +12,23 @@ pub struct WebService {
 
 impl WebService {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), namespace: String::new(), operations: Vec::new(), uri: None }
+        Self {
+            name: name.into(),
+            uuid: Uuid::nil(),
+            namespace: String::new(),
+            operations: Vec::new(),
+            uri: None,
+        }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The uuid of the metadata object itself: the key the vendor-support map
+    /// knows this service by. A service built without one is unidentified.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
     }
 
     pub fn namespace(&self) -> &str {
@@ -109,6 +123,7 @@ impl WebServiceParameter {
 #[derive(Debug, Default)]
 pub struct WebServiceBuilder {
     name: String,
+    uuid: Uuid,
     namespace: String,
     operations: Vec<WebServiceOperation>,
     uri: Option<String>,
@@ -121,6 +136,11 @@ impl WebServiceBuilder {
 
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    pub fn uuid(mut self, uuid: Uuid) -> Self {
+        self.uuid = uuid;
         self
     }
 
@@ -142,6 +162,7 @@ impl WebServiceBuilder {
     pub fn build(self) -> WebService {
         WebService {
             name: self.name,
+            uuid: self.uuid,
             namespace: self.namespace,
             operations: self.operations,
             uri: self.uri,

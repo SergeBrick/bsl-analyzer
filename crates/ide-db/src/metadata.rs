@@ -2432,6 +2432,7 @@ pub fn build_module_metadata(
     let mut http_service = None;
     let mut web_service = None;
     let mut integration_service = None;
+    let mut command = None;
 
     if let Some(config) = configuration {
         match module_type {
@@ -2475,6 +2476,11 @@ pub fn build_module_metadata(
             bsl_metadata::ModuleType::IntegrationServiceModule => {
                 integration_service = find_integration_service_by_path(config, file_path);
             }
+            // The command itself, never the object it hangs off: a command owns
+            // its support record the way a form does.
+            bsl_metadata::ModuleType::CommandModule => {
+                command = load_command_from_path(file_path);
+            }
             _ => {}
         }
     }
@@ -2493,6 +2499,7 @@ pub fn build_module_metadata(
         http_service,
         web_service,
         integration_service,
+        command,
     }
 }
 
@@ -2565,6 +2572,24 @@ pub(crate) fn find_integration_service_by_path(
     let name = service_object_name(&file_str, ModuleCollection::IntegrationServices)?;
 
     configuration.find_integration_service(name).map(|svc| Arc::new(svc.clone()))
+}
+
+pub(crate) fn load_command_from_path(file_path: &Path) -> Option<Arc<bsl_metadata::Command>> {
+    use bsl_metadata::xml_parser::parse_command_from_bsl_path;
+
+    match parse_command_from_bsl_path(file_path) {
+        Ok(command) => {
+            tracing::debug!(
+                command_name = %command.name(),
+                "Loaded command metadata"
+            );
+            Some(Arc::new(command))
+        }
+        Err(e) => {
+            tracing::debug!(?e, path = %file_path.display(), "Could not load command metadata");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2864,6 +2889,89 @@ mod tests {
             Some(&config),
         );
         assert!(plain.http_service.is_some());
+    }
+
+    /// Владелец командного модуля — сама команда: общая — по своему uuid,
+    /// объектная — по своему; ни та, ни другая не берёт запись родителя, а
+    /// отсутствие или битость uuid оставляет команду неопознанной (nil), не
+    /// теряя её вовсе.
+    #[test]
+    fn command_module_loads_the_command_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let write_command = |collection: &str, name: &str, uuid_attr: &str, element: &str| {
+            let module_dir = root.join(collection).join(name).join("Ext");
+            std::fs::create_dir_all(&module_dir).unwrap();
+            std::fs::write(module_dir.join("CommandModule.bsl"), "").unwrap();
+            let uuid_attr =
+                if uuid_attr.is_empty() { String::new() } else { format!(" uuid=\"{uuid_attr}\"") };
+            std::fs::write(
+                root.join(collection).join(format!("{name}.xml")),
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <{element}{uuid_attr}>
+        <Properties>
+            <Name>{name}</Name>
+        </Properties>
+    </{element}>
+</MetaDataObject>"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write_command(
+            "CommonCommands",
+            "АвтономнаяРабота",
+            "5e0d0000-0000-4000-8000-000000000021",
+            "CommonCommand",
+        );
+        write_command(
+            "Catalogs/Товары/Commands",
+            "ДобавитьРеквизит",
+            "5e0d0000-0000-4000-8000-000000000022",
+            "Command",
+        );
+        write_command("Catalogs/Товары/Commands", "БезUuid", "", "Command");
+        write_command("Catalogs/Товары/Commands", "БитыйUuid", "не-uuid", "Command");
+
+        let config = bsl_metadata::Configuration::new("Test");
+
+        let common = build_module_metadata(
+            &root.join("CommonCommands/АвтономнаяРабота/Ext/CommandModule.bsl"),
+            Some(&config),
+        );
+        assert_eq!(common.module_type, bsl_metadata::ModuleType::CommandModule);
+        let common = common.command.expect("the common command owns its module");
+        assert_eq!(common.name(), "АвтономнаяРабота");
+        assert_eq!(common.uuid().to_string(), "5e0d0000-0000-4000-8000-000000000021");
+
+        let object = build_module_metadata(
+            &root.join("Catalogs/Товары/Commands/ДобавитьРеквизит/Ext/CommandModule.bsl"),
+            Some(&config),
+        );
+        let object = object.command.expect("the object command owns its module");
+        assert_eq!(object.name(), "ДобавитьРеквизит");
+        assert_eq!(object.uuid().to_string(), "5e0d0000-0000-4000-8000-000000000022");
+
+        for name in ["БезUuid", "БитыйUuid"] {
+            let metadata = build_module_metadata(
+                &root.join(format!("Catalogs/Товары/Commands/{name}/Ext/CommandModule.bsl")),
+                Some(&config),
+            );
+            let command = metadata.command.unwrap_or_else(|| panic!("{name}: command kept"));
+            assert!(command.uuid().is_nil(), "{name}: uuid degrades to nil");
+        }
+
+        // Ни общая, ни объектная команда не приписана родительскому объекту:
+        // у модуля команды нет mdo, как у формы нет родителя в цепочке владельца.
+        let common = build_module_metadata(
+            &root.join("CommonCommands/АвтономнаяРабота/Ext/CommandModule.bsl"),
+            Some(&config),
+        );
+        assert!(common.mdo.is_none(), "a command module is not attributed to a parent");
     }
 
     /// Классификация без загрузки владельца бесполезна: диагностики, ради которых

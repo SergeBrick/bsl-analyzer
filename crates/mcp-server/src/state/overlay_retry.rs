@@ -1653,7 +1653,10 @@ mod tests {
         // Marks alone are no work of the driver's; a fresh fact after its failure is.
         retry.fail_for_test();
         retry.kick_fresh();
-        assert!(wait_for(5_000, || mine.is_superseded()), "the fresh check observes takeover");
+        // The pass flags the takeover before it is counted as finished, so the count is read
+        // only once that pass has ended.
+        assert!(wait_for(5_000, || retry.pass_count() > before), "the fresh pass finishes");
+        assert!(mine.is_superseded(), "the fresh check observes takeover");
         assert_eq!(
             retry.pass_count(),
             before + 1,

@@ -199,6 +199,8 @@ pub enum DiagnosticCode {
     QueryNestedFieldsByDot,
     QueryParseError,
     QueryToMissingMetadata,
+    QueryParameterSourceWithoutInto,
+    QueryTotalsInValueTableInto,
     UnknownFieldInQuery,
     UnlimitedLengthStringUsageInQuery,
     RefOveruse,

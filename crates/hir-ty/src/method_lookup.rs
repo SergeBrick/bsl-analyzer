@@ -210,7 +210,7 @@ pub(crate) fn is_platform_name_str(name: &str, ru: &str, en: &str) -> bool {
     stdx::case::eq_ignore_case(name, ru) || stdx::case::eq_ignore_case(name, en)
 }
 
-fn is_value_table_arm_id(db: &dyn TypeKernelDb, id: TypeId) -> bool {
+pub(crate) fn is_value_table_arm_id(db: &dyn TypeKernelDb, id: TypeId) -> bool {
     matches!(db.lookup_type(id), TypeKind::ValueTable(_))
         || matches!(db.lookup_type(id), TypeKind::PlatformObject(f) if is_platform_name_str(&f.name, "ТаблицаЗначений", "ValueTable"))
 }
@@ -240,7 +240,7 @@ pub(crate) fn receiver_needs_refinement_id(db: &dyn TypeKernelDb, id: TypeId) ->
     }
 }
 
-fn projection_of_query_receiver_id(
+pub(crate) fn projection_of_query_receiver_id(
     db: &dyn TypeKernelDb,
     id: TypeId,
 ) -> Option<Option<Arc<Projection>>> {

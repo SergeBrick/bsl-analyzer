@@ -419,3 +419,43 @@ pub fn extract_string_content(node: &SyntaxNode) -> Option<String> {
 
     Some(result)
 }
+
+/// Visits every query literal of the file that its method executes as the whole text of a
+/// `Запрос` object, with that execution's facts and the mapper of the literal. The file's two
+/// query lists are ordered differently, so they are joined by identity, never by position.
+pub(crate) fn for_each_executed_query(
+    ctx: &DiagnosticsContext,
+    mut f: impl FnMut(&hir::ExecutedQueryText, &sdbl_hir::SdblPackage, &SdblPositionMapper<'_>, &str),
+) {
+    let sdbl_hirs = ctx.sdbl_hir_in_file();
+    if sdbl_hirs.is_empty() {
+        return;
+    }
+    let sdbl_queries = ctx.all_sdbl_in_file();
+    let bsl_source = ctx.file_text();
+    let line_starts = build_line_index_shared(&bsl_source);
+
+    let mut executed: rustc_hash::FxHashMap<
+        hir::MethodKey,
+        std::sync::Arc<[hir::ExecutedQueryText]>,
+    > = Default::default();
+    for (sdbl_id, package) in sdbl_hirs.iter() {
+        let hir::DefWithBodyId::Method(local_id) = sdbl_id.owner else {
+            continue;
+        };
+        let texts = executed.entry(local_id).or_insert_with(|| {
+            ctx.executed_query_texts(hir::MethodId {
+                module: hir::ModuleId::new(ctx.file_id),
+                local_id,
+            })
+        });
+        let Some(text) = texts.iter().find(|text| text.literal == sdbl_id.expr_id) else {
+            continue;
+        };
+        let Some((_, query_info)) = sdbl_queries.iter().find(|(id, _)| id == sdbl_id) else {
+            continue;
+        };
+        let mapper = SdblPositionMapper::from_query_info(query_info, &bsl_source, &line_starts);
+        f(text, package, &mapper, &query_info.query_text);
+    }
+}

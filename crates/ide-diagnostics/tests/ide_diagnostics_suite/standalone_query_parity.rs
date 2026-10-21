@@ -35,6 +35,11 @@ fn embedded(query_body: &str) -> Vec<Diagnostic> {
         query_body
     );
 
+    // The wrapper procedure attracts diagnostics of its own; only the query's are comparable.
+    module_diagnostics(&code).into_iter().filter(|d| sdbl_codes().contains(&d.code)).collect()
+}
+
+fn module_diagnostics(code: &str) -> Vec<Diagnostic> {
     let mut db = RootDatabaseImpl::new();
     let workspace_root = PathBuf::from(DESIGNER_FIXTURE);
 
@@ -45,7 +50,7 @@ fn embedded(query_body: &str) -> Vec<Diagnostic> {
     let source_root_id = SourceRootId(0);
     db.set_source_root(source_root_id, SourceRoot::new_local(file_set));
     db.set_file_source_root(file_id, source_root_id);
-    db.set_file_text(file_id, &code);
+    db.set_file_text(file_id, code);
 
     let configuration_path_input = ide_db::metadata::ConfigurationPathInput::new(
         &db,
@@ -57,11 +62,7 @@ fn embedded(query_body: &str) -> Vec<Diagnostic> {
     let config = DiagnosticsConfig::all_enabled();
     let ctx = DiagnosticsContext::new(&config, file_id, &provider);
 
-    // The wrapper procedure attracts diagnostics of its own; only the query's are comparable.
     ide_diagnostics::diagnostics(&ctx)
-        .into_iter()
-        .filter(|d| sdbl_codes().contains(&d.code))
-        .collect()
 }
 
 /// Derived, never hand-copied: a rule added to the SDBL set joins this comparison by itself.
@@ -145,8 +146,9 @@ fn ranges_differ_by_route_and_the_bare_route_stays_inside_the_query() {
 
 /// The two new rules of this change were, at first, absent from the comparison because the
 /// code set was hand-copied. Deriving it removes the drift; this pins that the derived set is
-/// the one the runner actually dispatches, so a rule cannot be reachable in one route and
-/// invisible to the parity check in the other.
+/// the one the runner actually dispatches, so a rule decided by the query text cannot be
+/// reachable in one route and invisible to the parity check in the other. Rules that need the
+/// executing BSL context are module-only and outside this set.
 #[test]
 fn the_parity_set_covers_every_rule_a_query_can_break() {
     let codes = sdbl_codes();
@@ -158,5 +160,42 @@ fn the_parity_set_covers_every_rule_a_query_can_break() {
         ide_diagnostics::DiagnosticCode::QueryParseError,
     ] {
         assert!(codes.contains(&expected), "{expected:?} missing from the parity set: {codes:?}");
+    }
+}
+
+/// Rules that need the BSL context executing the query are module-only: bare text has no
+/// context, so it cannot tell a final text from a template. The control is the module that
+/// executes this very text — it reports the rule, so a bare route that stayed silent because
+/// the rule was broken everywhere would not pass.
+#[test]
+fn bare_query_text_never_reports_execution_rules() {
+    use ide_diagnostics::DiagnosticCode;
+
+    let execution_rules = [
+        DiagnosticCode::QueryParameterSourceWithoutInto,
+        DiagnosticCode::QueryTotalsInValueTableInto,
+    ];
+    let query = "ВЫБРАТЬ Данные.Ключ КАК Ключ ИЗ &Данные КАК Данные";
+
+    let module = module_diagnostics(&format!(
+        "Процедура Тест()\n    Данные = Новый ТаблицаЗначений;\n    Запрос = Новый Запрос;\n    \
+         Запрос.Текст = \"{query}\";\n    Запрос.УстановитьПараметр(\"Данные\", Данные);\n    \
+         Запрос.Выполнить();\nКонецПроцедуры"
+    ));
+    assert!(
+        module.iter().any(|d| d.code == DiagnosticCode::QueryParameterSourceWithoutInto),
+        "the module executing the text must report the rule, got {module:?}",
+    );
+
+    let bare = ide_diagnostics::validate_query_text(&DiagnosticsConfig::all_enabled(), None, query);
+    for rule in execution_rules {
+        assert!(
+            bare.iter().all(|d| d.code != rule),
+            "bare text must not report {rule:?}, got {bare:?}",
+        );
+        assert!(
+            !sdbl_codes().contains(&rule),
+            "{rule:?} needs the executing context and must stay out of the parity set",
+        );
     }
 }

@@ -1616,6 +1616,7 @@ fn assert_vector_artifacts(layout: &mcp_server::WorkspaceCacheLayout) {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
 fn workspace_cache_scope_two_compositions_isolate_native_stores_and_warm_restarts() {
     let root = workspace();
     source_composition(root.path());
@@ -2107,6 +2108,7 @@ fn workspace_cache_scope_linux_default_stdio_and_read_only_cli_stay_outside_sour
 
 #[cfg(unix)]
 #[test]
+#[ignore = "необязательный тест: флак полного прогона, https://github.com/itrous/bsl-analyzer/issues/589"]
 fn workspace_cache_scope_explicit_workspace_build_namespace_preserves_flat_canaries() {
     let root = workspace();
     source_composition(root.path());

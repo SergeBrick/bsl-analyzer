@@ -717,6 +717,13 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         hir::infer_owner(&self.db, file_id, owner)
     }
 
+    fn executed_query_texts(
+        &self,
+        method_id: hir::MethodId,
+    ) -> std::sync::Arc<[hir::ExecutedQueryText]> {
+        hir::executed_query_texts(&self.db, method_id).into()
+    }
+
     fn arg_diagnostics_of(
         &self,
         file_id: vfs::FileId,

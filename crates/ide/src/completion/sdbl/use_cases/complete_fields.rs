@@ -77,6 +77,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: syntax::MODULE_RANGE,
             subquery: Vec::new(),
+            parameter: None,
         };
 
         let _ = scope.add_table(table);
@@ -177,6 +178,7 @@ mod tests {
             virtual_table_params: vec![],
             range: TextRange::default(),
             subquery: Vec::new(),
+            parameter: None,
         };
         let _ = scope.add_table(table);
 
@@ -222,6 +224,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: TextRange::default(),
             subquery: Vec::new(),
+            parameter: None,
         };
 
         let _ = scope.add_table(tabular_table);
@@ -249,6 +252,7 @@ mod tests {
             virtual_table_params: Vec::new(),
             range: TextRange::default(),
             subquery: Vec::new(),
+            parameter: None,
         };
 
         let _ = scope.add_table(document_table);
@@ -341,6 +345,7 @@ mod tests {
             virtual_table_params: vec![],
             range: TextRange::default(),
             subquery: Vec::new(),
+            parameter: None,
         };
         let _ = scope.add_table(temp_table);
 
@@ -418,6 +423,7 @@ mod tests {
             virtual_table_params: vec![],
             range: TextRange::default(),
             subquery: Vec::new(),
+            parameter: None,
         };
         let _ = scope.add_table(temp_table);
 

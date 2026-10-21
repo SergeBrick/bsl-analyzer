@@ -425,7 +425,28 @@ pub struct TableRef {
 
     pub subquery: Vec<Box<SdblHir>>,
 
+    pub parameter: Option<ParameterSource>,
+
     pub range: TextRange,
+}
+
+/// A query parameter `&Name` standing as a data source of a `FROM` list or a join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterSource {
+    /// The parameter name without the leading `&`.
+    pub name: Name,
+    /// The range of the `&Name` token in the query text.
+    pub range: TextRange,
+}
+
+/// A parameter source of one batch statement, with the statement facts its rules need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterSourceUse {
+    pub source: ParameterSource,
+    /// Some member of the statement (the main query or a `UNION` member) has `INTO`.
+    pub statement_has_into: bool,
+    /// The range of the statement's `TOTALS` keyword.
+    pub statement_totals: Option<TextRange>,
 }
 
 impl TableRef {
@@ -438,6 +459,7 @@ impl TableRef {
             is_virtual_table: false,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range,
         }
     }
@@ -995,6 +1017,8 @@ pub struct SdblQuery {
 pub struct SdblPackage {
     pub(crate) queries: Vec<SdblQuery>,
 
+    pub(crate) parameter_sources: Vec<ParameterSourceUse>,
+
     pub source_map: crate::source_map::SdblSourceMap,
 }
 
@@ -1007,6 +1031,10 @@ impl SdblPackage {
         &self.queries
     }
 
+    pub fn parameter_sources(&self) -> &[ParameterSourceUse] {
+        &self.parameter_sources
+    }
+
     /// Approximate live heap bytes for Salsa's `memory_usage` report. Counts the
     /// `queries` vector backbone and the per-query [`SdblSourceMap`], which holds a
     /// `TokenInfo` for every classified token in the query and therefore scales
@@ -1016,6 +1044,7 @@ impl SdblPackage {
     /// factor.
     pub fn estimated_heap(&self) -> usize {
         let mut bytes = self.queries.len() * std::mem::size_of::<SdblQuery>();
+        bytes += self.parameter_sources.len() * std::mem::size_of::<ParameterSourceUse>();
         bytes += self.source_map.estimated_heap();
         bytes
     }
@@ -1151,6 +1180,10 @@ impl SdblPackage {
     }
 
     pub fn empty() -> Self {
-        Self { queries: Vec::new(), source_map: crate::source_map::SdblSourceMap::new() }
+        Self {
+            queries: Vec::new(),
+            parameter_sources: Vec::new(),
+            source_map: crate::source_map::SdblSourceMap::new(),
+        }
     }
 }

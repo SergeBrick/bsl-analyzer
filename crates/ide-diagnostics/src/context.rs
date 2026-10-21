@@ -401,6 +401,10 @@ impl<'a> AnalysisContext<'a> {
         self.query(|p| p.reaching_definitions(method_id))
     }
 
+    pub fn executed_query_texts(&self, method_id: hir::MethodId) -> Arc<[hir::ExecutedQueryText]> {
+        self.query(|p| p.executed_query_texts(method_id))
+    }
+
     pub fn resolve_vfs_path(
         &self,
         source_root_id: base_db::SourceRootId,

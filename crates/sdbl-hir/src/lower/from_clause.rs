@@ -1,5 +1,5 @@
 use crate::diagnostics::SdblDiagnostic;
-use crate::hir::{FieldDef, Name, ResolvedTable, TableRef};
+use crate::hir::{FieldDef, Name, ParameterSource, ResolvedTable, TableRef};
 use crate::standard_fields::{
     is_parameterized_virtual_table, register_has_open_table_set, register_table_kinds,
     register_table_of_path, virtual_table_parameters, ParameterSlot, VirtualTableType,
@@ -124,6 +124,7 @@ impl LoweringContext<'_> {
                 is_virtual_table: false,
                 virtual_table_params: Vec::new(),
                 subquery: all_hirs,
+                parameter: None,
                 range: ds.syntax().text_range(),
             };
         }
@@ -223,6 +224,7 @@ impl LoweringContext<'_> {
                     is_virtual_table: false,
                     virtual_table_params: Vec::new(),
                     subquery: Vec::new(),
+                    parameter: None,
                     range: table_ref.syntax().text_range(),
                 };
                 let own_range = own_table.range;
@@ -324,6 +326,7 @@ impl LoweringContext<'_> {
             is_virtual_table: is_virtual,
             virtual_table_params,
             subquery: Vec::new(),
+            parameter: parameter_source(table_ref),
             range: table_ref.syntax().text_range(),
         }
     }
@@ -1519,4 +1522,19 @@ fn is_condition(argument: &syntax::SyntaxNode) -> bool {
             _ => return false,
         }
     }
+}
+
+/// The parameter a table reference names as its source. Virtual table arguments are
+/// children of the reference too, so only the first significant token tells a
+/// parameter source (`&Name`) from a table name.
+fn parameter_source(table_ref: &syntax::ast::SdblTableRef) -> Option<ParameterSource> {
+    let token = syntax::ast_utils::significant_tokens(table_ref.syntax()).next()?;
+    if token.kind() != syntax::SyntaxKind::AMPERSAND {
+        return None;
+    }
+    let name = token.text().trim_start_matches('&');
+    if name.is_empty() {
+        return None;
+    }
+    Some(ParameterSource { name: Name::from(name), range: token.text_range() })
 }

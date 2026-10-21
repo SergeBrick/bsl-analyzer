@@ -77,6 +77,8 @@ const SDBL_HIR_DIAGNOSTICS: &[DiagnosticCode] = &[
     DiagnosticCode::MultilineStringInQuery,
     DiagnosticCode::QueryNestedFieldsByDot,
     DiagnosticCode::QueryToMissingMetadata,
+    DiagnosticCode::QueryParameterSourceWithoutInto,
+    DiagnosticCode::QueryTotalsInValueTableInto,
     DiagnosticCode::UnknownFieldInQuery,
     DiagnosticCode::UnlimitedLengthStringUsageInQuery,
     DiagnosticCode::RefOveruse,
@@ -331,6 +333,16 @@ pub fn collect_sdbl_hir_diagnostics(ctx: &DiagnosticsContext) -> Vec<Diagnostic>
     let mut diagnostics = Vec::new();
 
     diagnostics.extend(run_diagnostic("QueryParseError", ctx, handlers::query_parse_error::check));
+    diagnostics.extend(run_diagnostic(
+        "QueryParameterSourceWithoutInto",
+        ctx,
+        handlers::query_parameter_source_without_into::check,
+    ));
+    diagnostics.extend(run_diagnostic(
+        "QueryTotalsInValueTableInto",
+        ctx,
+        handlers::query_totals_in_value_table_into::check,
+    ));
 
     diagnostics.extend(collect_sdbl_hir_single_pass(ctx));
 

@@ -253,6 +253,7 @@ impl LoweringContext<'_> {
             is_virtual_table: false,
             virtual_table_params: Vec::new(),
             subquery: Vec::new(),
+            parameter: None,
             range,
         };
         // A fresh frame: there is nothing for the outputs to collide with.

@@ -373,6 +373,10 @@ impl AnalysisProvider for SalsaProvider<'_> {
         hir::infer_owner(self.db, file_id, owner)
     }
 
+    fn executed_query_texts(&self, method_id: MethodId) -> Arc<[hir::ExecutedQueryText]> {
+        hir::executed_query_texts(self.db, method_id).into()
+    }
+
     fn arg_diagnostics_of(
         &self,
         file_id: FileId,

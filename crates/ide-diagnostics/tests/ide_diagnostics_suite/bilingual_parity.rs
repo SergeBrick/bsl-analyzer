@@ -357,6 +357,11 @@ const EXCLUSIONS_DOCUMENTED: &[(DiagnosticCode, &str)] = &[
         "SDBL metadata resolution diagnostic; requires configuration metadata fixture",
     ),
     (
+        DiagnosticCode::QueryParameterSourceWithoutInto,
+        "SDBL parameter-source policy; not BSL identifier parity",
+    ),
+    (DiagnosticCode::QueryTotalsInValueTableInto, "SDBL totals policy; not BSL identifier parity"),
+    (
         DiagnosticCode::UnknownFieldInQuery,
         "SDBL field resolution diagnostic; requires configuration metadata fixture",
     ),

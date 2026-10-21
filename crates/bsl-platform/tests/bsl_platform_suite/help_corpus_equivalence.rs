@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 
 /// Digest of [`observable_dump`] over the pinned corpus with its overlays.
 const CORPUS_OBSERVABLE_DIGEST: &str =
-    "fefcc06b4c09e7b1dd8ff86e72d3737d8c99a13108e1598fbaf878a761437796";
+    "9152d6213c15f47748ba37387605fa785f1922a8b13f2d0311237bc0714be8ec";
 
 fn observable_dump(data: &PlatformData) -> String {
     let mut out = String::new();

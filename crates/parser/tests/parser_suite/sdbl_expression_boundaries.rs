@@ -163,9 +163,9 @@ fn alias_separator_cannot_supply_a_required_operand() {
 
 #[test]
 fn frozen_clean_inputs_have_nonzero_nodes_and_metrics() {
-    let inputs = include_str!("fixtures/sdbl_expression_boundaries.sdbl")
+    let inputs = include_str!("../fixtures/sdbl_expression_boundaries.sdbl")
         .lines()
-        .chain(std::iter::once(include_str!("fixtures/sdbl_independent_package.sdbl")));
+        .chain(std::iter::once(include_str!("../fixtures/sdbl_independent_package.sdbl")));
     for (index, input) in inputs.enumerate() {
         let (root, errors) = checked(input);
         let count = root.descendants().count();

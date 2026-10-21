@@ -187,7 +187,7 @@ fn test_slice8adn_paren_balanced_subquery_arg_ru() {
         count_direct_children_of_kind(&table_ref, SyntaxKind::ERROR),
         0,
         "Clean IN-subquery as VT param must NOT trigger \
-         `recover_to_delimiter_vt` — the subquery's `)` is \
+         `recover_expression_tail` — the subquery's `)` is \
          consumed inside `expression(p)` / `predicate_expr` per \
          Slice 10b",
     );
@@ -229,7 +229,7 @@ fn test_slice8adn_mid_arg_recovery() {
     let errors: Vec<_> = table_ref.children().filter(|c| c.kind() == SyntaxKind::ERROR).collect();
     assert!(
         !errors.is_empty(),
-        "Mid-arg spurious-token form must trigger `recover_to_delimiter_vt`",
+        "Mid-arg spurious-token form must trigger `recover_expression_tail`",
     );
     assert!(
         errors.iter().any(|e| e.text().to_string().contains('Q')),

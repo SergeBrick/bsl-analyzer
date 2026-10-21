@@ -1,6 +1,7 @@
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::fmt;
+use stdx::case::CaseExt;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OverlayError(pub(crate) String);
@@ -395,7 +396,7 @@ fn parse_method_return_type_correction(
     if return_types.is_empty() {
         return Err(OverlayError(format!("{context} return_types must not be empty")));
     }
-    let unique: HashSet<&str> = return_types.iter().map(String::as_str).collect();
+    let unique: HashSet<_> = return_types.iter().map(|name| name.fold_lower()).collect();
     if unique.len() != return_types.len() {
         return Err(OverlayError(format!("{context} return_types contains duplicate types")));
     }

@@ -1390,6 +1390,10 @@ fn a_return_type_correction_needs_a_non_empty_unique_type_list() {
             json!(["ОбъектXDTO", "ОбъектXDTO"]),
             "method return type correction 0 return_types contains duplicate types",
         ),
+        (
+            json!(["ОбъектXDTO", "объектxdto"]),
+            "method return type correction 0 return_types contains duplicate types",
+        ),
         (json!("ОбъектXDTO"), "method return type correction 0 return_types must be an array"),
     ] {
         let mut data = xdto_factory_data();

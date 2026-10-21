@@ -642,7 +642,7 @@ EndProcedure"#,
 #[test]
 fn bilingual_inventory_has_expected_size() {
     let all = all_codes();
-    assert_eq!(all.len(), 202, "update the Track 3 Phase E inventory when DiagnosticCode changes");
+    assert_eq!(all.len(), 204, "update the Track 3 Phase E inventory when DiagnosticCode changes");
 }
 
 #[test]

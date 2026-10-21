@@ -12,7 +12,7 @@ The current implementation validates scheduled jobs declared in metadata and rep
 - the common module is not server-side;
 - the handler method does not exist in that module;
 - the method is not exported;
-- a predefined scheduled job points to a method with parameters;
+- a predefined scheduled job points to a method with required parameters (parameters with default values are allowed);
 - the handler method body is empty;
 - several scheduled jobs point to the same handler.
 
@@ -32,7 +32,7 @@ Incorrect:
 
 ```bsl
 Procedure UpdateRates(StartDate) Export
-    // Parameters are not allowed for predefined scheduled jobs
+    // Required parameters are not allowed for predefined scheduled jobs
 EndProcedure
 ```
 

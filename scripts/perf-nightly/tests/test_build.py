@@ -1,6 +1,7 @@
 """Local build invocation, metadata and reuse of the same SHA/toolchain."""
 
 import contextlib
+import fcntl
 import io
 import os
 import subprocess
@@ -9,7 +10,7 @@ from unittest.mock import patch
 from helpers import Workspace
 
 import perf_nightly
-from common import read_json, sha256_file
+from common import HarnessError, read_json, sha256_file
 
 
 class Build(Workspace):
@@ -47,3 +48,13 @@ class Build(Workspace):
         self.assertEqual(meta["sha"], self.meta["commit"])
         self.assertEqual(meta["rustc"], "rustc test")
         self.assertEqual(meta["sha256"], sha256_file(os.path.join(built[0], "bsl-analyzer-app")))
+
+    def test_a_second_build_on_the_same_data_dir_is_refused(self):
+        os.makedirs(self.data.root, exist_ok=True)
+        args = self.args(remote=self.source, ref="main", label="test")
+        with open(self.data.path("build.lock"), "w") as lock, \
+                patch.object(perf_nightly, "repo_root", return_value=self.source):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(HarnessError, "data_busy"):
+                perf_nightly.cmd_build(args)
+        self.assertFalse(os.path.exists(self.data.path("build")))

@@ -21,9 +21,14 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
+/// `[diagnostics.parameters.CommentedCode] skipSupported`: stay silent in the
+/// modules of objects the vendor still supports.
+const SKIP_SUPPORTED: &str = "skipSupported";
+
 #[derive(Debug, Clone)]
 struct Config {
     exclusion_prefixes: Vec<String>,
+    skip_supported: bool,
 }
 
 impl Config {
@@ -37,8 +42,53 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
-        Self { exclusion_prefixes }
+        let skip_supported = ctx.config_bool(DiagnosticCode::CommentedCode, SKIP_SUPPORTED, false);
+
+        Self { exclusion_prefixes, skip_supported }
     }
+}
+
+/// Whether the raw `[diagnostics]` section asks for the vendor support map: the
+/// map is read from disk only for a project that uses it.
+pub fn vendor_support_requested(diagnostics: &serde_json::Value) -> bool {
+    diagnostics
+        .get("parameters")
+        .and_then(|parameters| parameters.get(DiagnosticCode::CommentedCode.as_str()))
+        .and_then(|parameters| parameters.get(SKIP_SUPPORTED))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether this module belongs to an object the vendor still supports.
+///
+/// Commented-out code in a vendor module is how a vendor fragment is switched off
+/// so that it survives the next update; the finding there cannot be acted on. The
+/// owner is the metadata object the module belongs to: the form itself for a form
+/// module (a form has its own support record, and a form added to a vendor object
+/// is the developer's), the configuration root for the application, session and
+/// external-connection modules. A module whose owner carries no uuid is not
+/// treated as the vendor's.
+fn module_is_vendor_supported(ctx: &AnalysisContext) -> bool {
+    use bsl_metadata::{MdObject, ModuleType};
+
+    let Some(support) = ctx.vendor_support() else { return false };
+    let metadata = ctx.module_metadata();
+    let owner = match metadata.module_type {
+        ModuleType::ApplicationModule
+        | ModuleType::ManagedApplicationModule
+        | ModuleType::OrdinaryApplicationModule
+        | ModuleType::SessionModule
+        | ModuleType::ExternalConnectionModule => support.configuration_root(),
+        _ => metadata
+            .form
+            .as_ref()
+            .map(|form| form.uuid())
+            .filter(|uuid| !uuid.is_nil())
+            .or_else(|| metadata.mdo.as_ref().and_then(|mdo| mdo.uuid().copied()))
+            .or_else(|| metadata.common_module.as_ref().map(|module| *module.uuid()))
+            .or_else(|| metadata.register.as_ref().map(|register| *MdObject::uuid(&**register))),
+    };
+    owner.is_some_and(|uuid| support.is_supported(&uuid))
 }
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
@@ -54,6 +104,9 @@ pub fn check_block(ctx: &AnalysisContext, block: &Block) -> Vec<Diagnostic<Local
 
     let mut diagnostics = Vec::new();
     let config = Config::from_context(ctx);
+    if config.skip_supported && module_is_vendor_supported(ctx) {
+        return Vec::new();
+    }
     let text = block.text;
 
     // Владения строкой диагностика не требует: комментарий за кодом — такой же
@@ -1182,5 +1235,159 @@ mod tests {
             !diagnostics.is_empty(),
             "expected CommentedCode to fire when a group contains a BSL statement"
         );
+    }
+}
+
+/// `skipSupported`: the modules of vendor objects are silent, the developer's own
+/// modules keep the finding, and nothing changes while the setting is off.
+#[cfg(test)]
+mod vendor_support_tests {
+    use super::{check, vendor_support_requested};
+    use crate::test_utils::{check_metadata_diagnostic_with_vendor_support, format_diags};
+    use crate::{DiagnosticCode, DiagnosticsConfig};
+    use bsl_metadata::{Form, FormType, MdoType, MetadataObject, ModuleType, Uuid, VendorSupport};
+
+    const ROOT: &str = "5e0d0000-0000-4000-8000-000000000001";
+    const VENDOR_DOCUMENT: &str = "5e0d0000-0000-4000-8000-000000000002";
+    const VENDOR_FORM: &str = "5e0d0000-0000-4000-8000-000000000003";
+    const REMOVED_DOCUMENT: &str = "5e0d0000-0000-4000-8000-000000000004";
+    const OWN_DOCUMENT: &str = "5e0d0000-0000-4000-8000-000000000101";
+    const OWN_FORM: &str = "5e0d0000-0000-4000-8000-000000000102";
+
+    const CODE: &str = "Процедура ПередЗаписью(Отказ)\n\t// Если Отказ Тогда\n\t// \tВозврат;\n\t// КонецЕсли;\nКонецПроцедуры\n";
+
+    /// The map in the layout the platform writes: records `mode, flag, uuid, uuid`.
+    fn support() -> VendorSupport {
+        let records = [(1, ROOT), (1, VENDOR_DOCUMENT), (2, VENDOR_FORM), (0, REMOVED_DOCUMENT)]
+            .iter()
+            .map(|(mode, uuid)| format!(",{mode},0,{uuid},{uuid}"))
+            .collect::<String>();
+        let text = format!(
+            "\u{feff}{{6,0,1,5e0d0000-0000-4000-8000-0000000000a1,0,\
+             5e0d0000-0000-4000-8000-0000000000a2,\"1.0.0.1\",\"Поставщик1\",\"Конфигурация1\",4{records},\
+             0,0,0,1,0,0,0,1,0,1,0,1,1,1,1}}"
+        );
+        VendorSupport::parse(text.as_bytes()).unwrap().with_configuration_root(uuid(ROOT))
+    }
+
+    fn uuid(text: &str) -> Uuid {
+        Uuid::parse_str(text).unwrap()
+    }
+
+    fn document(owner: &str, module_type: ModuleType, form: Option<&str>) -> hir::ModuleMetadata {
+        let mut mdo = MetadataObject::new(MdoType::Document, "Документ1");
+        mdo.set_uuid(uuid(owner));
+        let mut metadata = crate::test_utils::make_non_common_module_metadata(module_type);
+        metadata.mdo = Some(std::sync::Arc::new(mdo));
+        metadata.form = form.map(|form| {
+            std::sync::Arc::new(Form::new(
+                "ФормаДокумента".to_owned(),
+                FormType::Managed,
+                uuid(form),
+            ))
+        });
+        metadata
+    }
+
+    fn config(skip_supported: Option<bool>) -> DiagnosticsConfig {
+        let mut config = DiagnosticsConfig::all_enabled();
+        if let Some(value) = skip_supported {
+            config
+                .parameters
+                .insert(DiagnosticCode::CommentedCode, serde_json::json!({"skipSupported": value}));
+        }
+        config
+    }
+
+    fn run(metadata: hir::ModuleMetadata, skip_supported: Option<bool>) -> String {
+        let diagnostics = check_metadata_diagnostic_with_vendor_support(
+            metadata,
+            CODE,
+            config(skip_supported),
+            Some(support()),
+            check,
+        );
+        format_diags(CODE, &diagnostics)
+    }
+
+    const REPORTED: &str = "CommentedCode @ 2:2..4:15\n  message: Программные модули не должны иметь закомментированных фрагментов кода\n  severity: Information";
+
+    #[test]
+    fn vendor_object_module_is_silent_with_the_setting_on() {
+        assert_eq!(run(document(VENDOR_DOCUMENT, ModuleType::ObjectModule, None), Some(true)), "");
+    }
+
+    #[test]
+    fn setting_off_or_absent_leaves_vendor_modules_reported() {
+        for setting in [None, Some(false)] {
+            assert_eq!(
+                run(document(VENDOR_DOCUMENT, ModuleType::ObjectModule, None), setting),
+                REPORTED,
+                "{setting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_object_module_is_still_reported() {
+        assert_eq!(
+            run(document(OWN_DOCUMENT, ModuleType::ObjectModule, None), Some(true)),
+            REPORTED
+        );
+    }
+
+    #[test]
+    fn object_removed_from_support_is_reported() {
+        assert_eq!(
+            run(document(REMOVED_DOCUMENT, ModuleType::ObjectModule, None), Some(true)),
+            REPORTED
+        );
+    }
+
+    /// A form has its own support record: the vendor's form of a vendor object is
+    /// silent, a form the developer added to it is not.
+    #[test]
+    fn form_module_is_judged_by_the_form_itself() {
+        let vendor_form = document(VENDOR_DOCUMENT, ModuleType::FormModule, Some(VENDOR_FORM));
+        assert_eq!(run(vendor_form, Some(true)), "");
+        let own_form = document(VENDOR_DOCUMENT, ModuleType::FormModule, Some(OWN_FORM));
+        assert_eq!(run(own_form, Some(true)), REPORTED);
+    }
+
+    /// The application, session and external-connection modules belong to the
+    /// configuration root, whose record the map carries like any object's.
+    #[test]
+    fn application_module_is_judged_by_the_configuration_root() {
+        let metadata = crate::test_utils::make_non_common_module_metadata(
+            ModuleType::ManagedApplicationModule,
+        );
+        assert_eq!(run(metadata.clone(), Some(true)), "");
+        assert_eq!(run(metadata, Some(false)), REPORTED);
+    }
+
+    /// No map (the configuration was never on support): the setting changes nothing.
+    #[test]
+    fn without_a_map_the_setting_changes_nothing() {
+        let diagnostics = check_metadata_diagnostic_with_vendor_support(
+            document(VENDOR_DOCUMENT, ModuleType::ObjectModule, None),
+            CODE,
+            config(Some(true)),
+            None,
+            check,
+        );
+        assert_eq!(format_diags(CODE, &diagnostics), REPORTED);
+    }
+
+    #[test]
+    fn the_map_is_requested_only_by_the_setting() {
+        let section = |value: serde_json::Value| serde_json::json!({ "parameters": value });
+        assert!(vendor_support_requested(&section(
+            serde_json::json!({"CommentedCode": {"skipSupported": true}})
+        )));
+        assert!(!vendor_support_requested(&section(
+            serde_json::json!({"CommentedCode": {"skipSupported": false}})
+        )));
+        assert!(!vendor_support_requested(&section(serde_json::json!({"CommentedCode": false}))));
+        assert!(!vendor_support_requested(&serde_json::Value::Null));
     }
 }

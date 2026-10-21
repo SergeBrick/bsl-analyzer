@@ -101,6 +101,21 @@ pub(super) fn apply_project_compatibility_mode(
     }
 }
 
+/// The main configuration's vendor support map, read only when the project's
+/// `[diagnostics]` asks for it (see [`ide::load_vendor_support`]).
+pub(super) fn apply_project_vendor_support(
+    db: &mut RootDatabaseImpl,
+    project: &project_model::Project,
+) {
+    let support = ide::load_vendor_support(
+        &project.config.diagnostics.rules_json(),
+        project.configuration_path(),
+    );
+    if db.vendor_support() != support {
+        db.set_vendor_support(support);
+    }
+}
+
 /// Re-read every held hole. Returns `(healed, vanished)` by canonical key, so the
 /// caller can move each one's baseline entry and bump what a baseline move obliges.
 ///
@@ -1527,6 +1542,7 @@ pub(super) fn apply_resident_changes(
             // config is otherwise read once, at the build.
             resident.config.ordinary_app_support =
                 ide_host_core::effective_ordinary_app_support(&resident.project);
+            apply_project_vendor_support(&mut resident.db, &resident.project);
             metadata_changed = true;
         }
         moved = true;

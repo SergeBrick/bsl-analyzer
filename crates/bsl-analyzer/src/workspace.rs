@@ -462,6 +462,12 @@ impl GlobalState {
                 });
                 if configuration_xml_changed {
                     self.apply_configuration_xml_settings();
+                    // The support map is not a watched file: it is re-read here, with
+                    // the root, and on a project-config reload.
+                    crate::features_state::apply_vendor_support_to_db(
+                        self.analysis_host.raw_database_mut(),
+                        self.project.as_ref(),
+                    );
                 }
             }
         }

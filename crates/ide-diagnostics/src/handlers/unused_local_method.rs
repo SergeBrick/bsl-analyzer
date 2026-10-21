@@ -339,7 +339,7 @@ fn line_start(token: &SyntaxToken) -> Option<TextSize> {
     Some(start)
 }
 
-fn string_literal_texts(root: &SyntaxNode) -> Vec<String> {
+pub(crate) fn string_literal_texts(root: &SyntaxNode) -> Vec<String> {
     root.descendants_with_tokens()
         .filter_map(|element| element.into_token())
         .filter(|token| {
@@ -356,7 +356,7 @@ fn string_literal_texts(root: &SyntaxNode) -> Vec<String> {
 }
 
 /// `name_lower` occurs in `text` as a whole identifier, not as a part of a longer one.
-fn mentions_identifier(text: &str, name_lower: &str) -> bool {
+pub(crate) fn mentions_identifier(text: &str, name_lower: &str) -> bool {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     text.match_indices(name_lower).any(|(at, found)| {
         let before = text[..at].chars().next_back();

@@ -24,6 +24,8 @@ pub const METADATA: DiagnosticMetadata = define_metadata! {
     lsp_severity_override: "",
 };
 
+mod remove_parameter;
+
 const DEFAULT_ATTACHABLE_PREFIXES: &str = "подключаемый_,attachable_";
 
 pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
@@ -160,6 +162,7 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
         ));
     }
 
+    remove_parameter::attach_fixes(ctx, &mut diagnostics);
     diagnostics
 }
 

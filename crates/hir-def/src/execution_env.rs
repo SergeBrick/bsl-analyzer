@@ -533,9 +533,8 @@ pub fn conditional_env(
     conditional_env_where(tree, |node| node.contains_range(range)).0
 }
 
-/// [`conditional_env`] together with the environments still possible but not
-/// decided by every enclosing branch. A known exclusion in any enclosing
-/// branch wins over an undecided condition in another.
+/// [`conditional_env`] together with the environments that may reach the
+/// range but are not definitely admitted by every enclosing chain.
 pub fn conditional_env_tracking(
     tree: &crate::conditional_tree::ConditionalTree,
     range: text_size::TextRange,
@@ -589,8 +588,6 @@ fn conditional_env_where(
 
         let mut remaining = EnvFlags::ALL;
         let mut possible_remaining = EnvFlags::ALL;
-        let mut claimed = EnvFlags::EMPTY;
-        let mut possible_claimed = EnvFlags::EMPTY;
         for branch in tree.all_branches(chain_if) {
             let data = tree.conditional(branch);
             let (branch_env, branch_possible) = match data.kind {
@@ -599,24 +596,19 @@ fn conditional_env_where(
                         .condition_text
                         .as_deref()
                         .map_or(PreprocCondition::Unknown, PreprocCondition::parse);
-                    let mut undecided = EnvFlags::EMPTY;
-                    let taken =
-                        condition.narrow_branch_tracking(&mut possible_remaining, &mut undecided);
-                    // Unknown conditions may fall through, but a later known
-                    // condition must still be able to exclude the environment.
-                    possible_remaining = possible_remaining | undecided;
-                    (condition.narrow_branch(&mut remaining), taken | undecided)
+                    (
+                        condition.narrow_branch(&mut remaining),
+                        condition.possible_branch(&mut possible_remaining),
+                    )
                 }
                 ConditionalKind::Else => (remaining, possible_remaining),
             };
             if branch == idx {
-                claimed = branch_env;
-                possible_claimed = branch_possible;
+                env = env & branch_env;
+                possible = possible & branch_possible;
                 break;
             }
         }
-        env = env & claimed;
-        possible = possible & possible_claimed;
         cur = tree.parent(chain_if);
     }
     (env, possible.without(env))

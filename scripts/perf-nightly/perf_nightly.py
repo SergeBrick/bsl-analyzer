@@ -37,6 +37,18 @@ TAG_RE = re.compile(r"v\d+\.\d+\.\d+")
 
 def cmd_build(args) -> int:
     data = Data(args.data_dir)
+    # Two builds share one clone: a checkout under a running build would let it
+    # ship another tree under its own label and SHA.
+    os.makedirs(data.root, exist_ok=True)
+    with open(data.path("build.lock"), "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HarnessError("data_busy", "another build holds this data dir") from None
+        return build(args, data)
+
+
+def build(args, data: Data) -> int:
     clone = data.path("build")
     if not os.path.isdir(os.path.join(clone, ".git")):
         origin = args.remote or git("remote", "get-url", "origin", cwd=repo_root())

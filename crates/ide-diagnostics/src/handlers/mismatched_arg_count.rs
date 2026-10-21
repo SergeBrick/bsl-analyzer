@@ -203,6 +203,63 @@ mod tests {
     }
 
     #[test]
+    fn nested_module_regions_keep_known_exclusions() {
+        for (outer, inner, expected) in [
+            ("ТолстыйКлиентОбычноеПриложение", "Linux", 0),
+            ("Сервер И Не Сервер", "Линукс", 0),
+            ("Линукс", "ТолстыйКлиентОбычноеПриложение", 0),
+            ("Сервер", "Линукс", 1),
+            ("Линукс", "Сервер", 1),
+        ] {
+            let body = format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n\
+                 #Если {outer} Тогда\n#Если {inner} Тогда\n\
+                 Процедура Тест() Экспорт\nСложение(1);\nКонецПроцедуры\n\
+                 #КонецЕсли\n#КонецЕсли\n"
+            );
+            assert_eq!(in_server_module(&body).len(), expected, "{outer} / {inner}");
+        }
+    }
+
+    #[test]
+    fn elsif_after_unknown_condition_obeys_its_own_condition() {
+        for module_level in [false, true] {
+            for (condition, then_count, else_count) in [
+                ("ТолстыйКлиентОбычноеПриложение", 0, 1),
+                ("Сервер И Не Сервер", 0, 1),
+                ("Сервер", 1, 0),
+                ("Линукс", 1, 1),
+            ] {
+                for (in_else, expected) in [(false, then_count), (true, else_count)] {
+                    let call = if module_level {
+                        "Процедура Тест() Экспорт\nСложение(1);\nКонецПроцедуры\n"
+                    } else {
+                        "Сложение(1);\n"
+                    };
+                    let (then_body, else_body) = if in_else { ("", call) } else { (call, "") };
+                    let chain = format!(
+                        "#Если Линукс Тогда\n#ИначеЕсли {condition} Тогда\n\
+                         {then_body}#Иначе\n{else_body}#КонецЕсли\n"
+                    );
+                    let body = if module_level {
+                        chain
+                    } else {
+                        format!("Процедура Тест() Экспорт\n{chain}КонецПроцедуры\n")
+                    };
+                    let body = format!(
+                        "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n{body}"
+                    );
+                    assert_eq!(
+                        in_server_module(&body).len(),
+                        expected,
+                        "module_level={module_level}, {condition}, in_else={in_else}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn undecided_module_regions_do_not_revive_excluded_methods() {
         const METHOD: &str = "Процедура Тест() Экспорт\n    Сложение(1);\nКонецПроцедуры\n";
         for (regions, expected) in [

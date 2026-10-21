@@ -141,6 +141,7 @@ mod tests {
             common_module: None,
             mdo: None,
             register: None,
+            command: None,
             form: Some(Arc::new(form)),
             http_service: None,
             web_service: None,

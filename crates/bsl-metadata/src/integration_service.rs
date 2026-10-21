@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// An integration service (`СервисИнтеграции`). Its message channels bind a
 /// receive-message handler procedure that the platform invokes — those handlers
@@ -7,16 +8,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationService {
     name: String,
+    uuid: Uuid,
     channels: Vec<IntegrationServiceChannel>,
 }
 
 impl IntegrationService {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), channels: Vec::new() }
+        Self { name: name.into(), uuid: Uuid::nil(), channels: Vec::new() }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The uuid of the metadata object itself: the key the vendor-support map
+    /// knows this service by. A service built without one is unidentified.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
     }
 
     pub fn channels(&self) -> &[IntegrationServiceChannel] {
@@ -75,6 +83,7 @@ impl IntegrationServiceChannel {
 #[derive(Debug, Default)]
 pub struct IntegrationServiceBuilder {
     name: String,
+    uuid: Uuid,
     channels: Vec<IntegrationServiceChannel>,
 }
 
@@ -88,13 +97,18 @@ impl IntegrationServiceBuilder {
         self
     }
 
+    pub fn uuid(mut self, uuid: Uuid) -> Self {
+        self.uuid = uuid;
+        self
+    }
+
     pub fn add_channel(mut self, channel: IntegrationServiceChannel) -> Self {
         self.channels.push(channel);
         self
     }
 
     pub fn build(self) -> IntegrationService {
-        IntegrationService { name: self.name, channels: self.channels }
+        IntegrationService { name: self.name, uuid: self.uuid, channels: self.channels }
     }
 }
 

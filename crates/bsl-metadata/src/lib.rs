@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+pub mod command;
 pub mod common_attribute;
 pub mod common_module;
 pub mod configuration;
@@ -27,6 +28,7 @@ pub mod vendor_support;
 pub mod web_service;
 pub mod xml_parser;
 
+pub use command::Command;
 pub use common_attribute::{
     kind_takes_common_attributes, CommonAttribute, CommonAttributeField, CommonAttributeSet,
     CommonAttributeUse, ObjectCommonAttributes,

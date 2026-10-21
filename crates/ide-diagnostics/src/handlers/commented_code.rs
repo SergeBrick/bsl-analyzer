@@ -65,7 +65,9 @@ pub fn vendor_support_requested(diagnostics: &serde_json::Value) -> bool {
 /// so that it survives the next update; the finding there cannot be acted on. The
 /// owner is the metadata object the module belongs to: the form itself for a form
 /// module (a form has its own support record, and a form added to a vendor object
-/// is the developer's), the configuration root for the application, session and
+/// is the developer's), the service itself for an HTTP, web or integration
+/// service module, the command itself for a command module, the configuration
+/// root for the application, session and
 /// external-connection modules. A module whose owner carries no uuid is not
 /// treated as the vendor's.
 fn module_is_vendor_supported(ctx: &AnalysisContext) -> bool {
@@ -79,6 +81,26 @@ fn module_is_vendor_supported(ctx: &AnalysisContext) -> bool {
         | ModuleType::OrdinaryApplicationModule
         | ModuleType::SessionModule
         | ModuleType::ExternalConnectionModule => support.configuration_root(),
+        ModuleType::HTTPServiceModule => metadata
+            .http_service
+            .as_ref()
+            .map(|service| service.uuid())
+            .filter(|uuid| !uuid.is_nil()),
+        ModuleType::WebServiceModule => metadata
+            .web_service
+            .as_ref()
+            .map(|service| service.uuid())
+            .filter(|uuid| !uuid.is_nil()),
+        ModuleType::IntegrationServiceModule => metadata
+            .integration_service
+            .as_ref()
+            .map(|service| service.uuid())
+            .filter(|uuid| !uuid.is_nil()),
+        // A command owns its support record the way a form does: the module is
+        // judged by the command, never by the object the command hangs off.
+        ModuleType::CommandModule => {
+            metadata.command.as_ref().map(|command| command.uuid()).filter(|uuid| !uuid.is_nil())
+        }
         _ => metadata
             .form
             .as_ref()
@@ -1251,20 +1273,140 @@ mod vendor_support_tests {
     const VENDOR_DOCUMENT: &str = "5e0d0000-0000-4000-8000-000000000002";
     const VENDOR_FORM: &str = "5e0d0000-0000-4000-8000-000000000003";
     const REMOVED_DOCUMENT: &str = "5e0d0000-0000-4000-8000-000000000004";
+    const VENDOR_HTTP_SERVICE: &str = "5e0d0000-0000-4000-8000-000000000005";
+    const VENDOR_WEB_SERVICE: &str = "5e0d0000-0000-4000-8000-000000000006";
+    const VENDOR_INTEGRATION_SERVICE: &str = "5e0d0000-0000-4000-8000-000000000007";
+    const VENDOR_COMMAND: &str = "5e0d0000-0000-4000-8000-000000000008";
     const OWN_DOCUMENT: &str = "5e0d0000-0000-4000-8000-000000000101";
     const OWN_FORM: &str = "5e0d0000-0000-4000-8000-000000000102";
 
     const CODE: &str = "Процедура ПередЗаписью(Отказ)\n\t// Если Отказ Тогда\n\t// \tВозврат;\n\t// КонецЕсли;\nКонецПроцедуры\n";
 
+    fn http_service(uuid_text: Option<&str>) -> hir::ModuleMetadata {
+        let mut metadata =
+            crate::test_utils::make_non_common_module_metadata(ModuleType::HTTPServiceModule);
+        let service = match uuid_text {
+            Some(text) => {
+                bsl_metadata::HTTPServiceBuilder::new().name("Сервис").uuid(uuid(text)).build()
+            }
+            None => bsl_metadata::HTTPService::new("Сервис"),
+        };
+        metadata.http_service = Some(std::sync::Arc::new(service));
+        metadata
+    }
+
+    fn web_service(uuid_text: Option<&str>) -> hir::ModuleMetadata {
+        let mut metadata =
+            crate::test_utils::make_non_common_module_metadata(ModuleType::WebServiceModule);
+        let service = match uuid_text {
+            Some(text) => {
+                bsl_metadata::WebServiceBuilder::new().name("Сервис").uuid(uuid(text)).build()
+            }
+            None => bsl_metadata::WebService::new("Сервис"),
+        };
+        metadata.web_service = Some(std::sync::Arc::new(service));
+        metadata
+    }
+
+    fn integration_service(uuid_text: Option<&str>) -> hir::ModuleMetadata {
+        let mut metadata = crate::test_utils::make_non_common_module_metadata(
+            ModuleType::IntegrationServiceModule,
+        );
+        let service = match uuid_text {
+            Some(text) => bsl_metadata::IntegrationServiceBuilder::new()
+                .name("Сервис")
+                .uuid(uuid(text))
+                .build(),
+            None => bsl_metadata::IntegrationService::new("Сервис"),
+        };
+        metadata.integration_service = Some(std::sync::Arc::new(service));
+        metadata
+    }
+
+    /// Сервис — самостоятельный объект поддержки: HTTP, web и integration-сервис
+    /// молчат по uuid самого сервиса.
+    #[test]
+    fn service_modules_are_judged_by_the_service_itself() {
+        assert_eq!(run(http_service(Some(VENDOR_HTTP_SERVICE)), Some(true)), "", "HTTP");
+        assert_eq!(run(web_service(Some(VENDOR_WEB_SERVICE)), Some(true)), "", "WEB");
+        assert_eq!(
+            run(integration_service(Some(VENDOR_INTEGRATION_SERVICE)), Some(true)),
+            "",
+            "integration"
+        );
+    }
+
+    /// Сервис вне карты или без uuid (атрибут потерялся) — не глушит находку.
+    #[test]
+    fn unidentified_or_own_service_modules_are_still_reported() {
+        assert_eq!(run(http_service(Some(OWN_DOCUMENT)), Some(true)), REPORTED, "свой HTTP-сервис");
+        assert_eq!(run(http_service(None), Some(true)), REPORTED, "HTTP-сервис без uuid");
+        assert_eq!(run(web_service(None), Some(true)), REPORTED, "web-сервис без uuid");
+        assert_eq!(
+            run(integration_service(None), Some(true)),
+            REPORTED,
+            "integration-сервис без uuid"
+        );
+    }
+
+    fn command(uuid_text: Option<&str>, parent: Option<&str>) -> hir::ModuleMetadata {
+        let mut metadata =
+            crate::test_utils::make_non_common_module_metadata(ModuleType::CommandModule);
+        if let Some(text) = uuid_text {
+            metadata.command =
+                Some(std::sync::Arc::new(bsl_metadata::Command::new("Команда", uuid(text))));
+        }
+        if let Some(owner) = parent {
+            let mut mdo = MetadataObject::new(MdoType::Document, "Документ1");
+            mdo.set_uuid(uuid(owner));
+            metadata.mdo = Some(std::sync::Arc::new(mdo));
+        }
+        metadata
+    }
+
+    /// Команда — самостоятельный объект поддержки: её модуль молчит по uuid
+    /// самой команды.
+    #[test]
+    fn command_modules_are_judged_by_the_command_itself() {
+        assert_eq!(run(command(Some(VENDOR_COMMAND), None), Some(true)), "");
+    }
+
+    /// Команда не приписывается родителю: своя команда у вендорского объекта —
+    /// находка, как и модуль без опознанной команды.
+    #[test]
+    fn a_command_module_is_never_judged_by_its_parent_object() {
+        assert_eq!(
+            run(command(Some(OWN_DOCUMENT), Some(VENDOR_DOCUMENT)), Some(true)),
+            REPORTED,
+            "своя команда у вендорского родителя"
+        );
+        assert_eq!(
+            run(command(None, Some(VENDOR_DOCUMENT)), Some(true)),
+            REPORTED,
+            "команда без метаданных не берёт запись родителя"
+        );
+    }
+
     /// The map in the layout the platform writes: records `mode, flag, uuid, uuid`.
     fn support() -> VendorSupport {
-        let records = [(1, ROOT), (1, VENDOR_DOCUMENT), (2, VENDOR_FORM), (0, REMOVED_DOCUMENT)]
+        let records = [
+            (1, ROOT),
+            (1, VENDOR_DOCUMENT),
+            (2, VENDOR_FORM),
+            (0, REMOVED_DOCUMENT),
+            (1, VENDOR_HTTP_SERVICE),
+            (1, VENDOR_WEB_SERVICE),
+            (1, VENDOR_INTEGRATION_SERVICE),
+            (1, VENDOR_COMMAND),
+        ];
+        let records = records
             .iter()
             .map(|(mode, uuid)| format!(",{mode},0,{uuid},{uuid}"))
             .collect::<String>();
+        let object_count = 8;
         let text = format!(
             "\u{feff}{{6,0,1,5e0d0000-0000-4000-8000-0000000000a1,0,\
-             5e0d0000-0000-4000-8000-0000000000a2,\"1.0.0.1\",\"Поставщик1\",\"Конфигурация1\",4{records},\
+             5e0d0000-0000-4000-8000-0000000000a2,\"1.0.0.1\",\"Поставщик1\",\"Конфигурация1\",{object_count}{records},\
              0,0,0,1,0,0,0,1,0,1,0,1,1,1,1}}"
         );
         VendorSupport::parse(text.as_bytes()).unwrap().with_configuration_root(uuid(ROOT))

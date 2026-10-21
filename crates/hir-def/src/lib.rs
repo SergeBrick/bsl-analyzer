@@ -379,6 +379,10 @@ pub struct ModuleMetadata {
     pub http_service: Option<Arc<bsl_metadata::HTTPService>>,
     pub web_service: Option<Arc<bsl_metadata::WebService>>,
     pub integration_service: Option<Arc<bsl_metadata::IntegrationService>>,
+    /// The command itself for a command module: like a form, a command owns its
+    /// support record, and its module must never be judged by the object the
+    /// command hangs off.
+    pub command: Option<Arc<bsl_metadata::Command>>,
 }
 
 impl ModuleMetadata {
@@ -420,6 +424,7 @@ impl ModuleMetadata {
             http_service: None,
             web_service: None,
             integration_service: None,
+            command: None,
         }
     }
 
@@ -455,6 +460,9 @@ impl ModuleMetadata {
         if let Some(integration_service) = &self.integration_service {
             bytes += std::mem::size_of::<bsl_metadata::IntegrationService>()
                 + integration_service.estimated_heap_size();
+        }
+        if let Some(command) = &self.command {
+            bytes += std::mem::size_of::<bsl_metadata::Command>() + command.estimated_heap_size();
         }
         bytes
     }

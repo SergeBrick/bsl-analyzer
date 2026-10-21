@@ -999,12 +999,17 @@ fn handle_loader_msg(state: &mut GlobalState, msg: vfs::loader::Message) -> Resu
             // A batch the loader produced under the previous configuration can still
             // arrive after a reload; the current exclusions decide.
             let mut resolved = stdx::path_exclusion::ResolvedDirs::default();
+            let baseline_paths = state.diagnostics_baseline.observation_paths();
             let files: Vec<_> = files
                 .into_iter()
                 .filter(|path| !state.is_source_excluded(path.as_ref(), &mut resolved))
+                .filter(|path| {
+                    let path: &std::path::Path = path.as_ref();
+                    project_model::is_metadata_path(path)
+                        || baseline_paths.iter().any(|baseline| baseline == path)
+                })
                 .collect();
             let count = files.len();
-            let baseline_paths = state.diagnostics_baseline.observation_paths();
             for chunk in files.chunks(VFS_WATCH_ONLY_BATCH) {
                 let mut vfs = state.vfs.write();
                 for path in chunk {
@@ -4019,6 +4024,126 @@ mod tests {
             );
             g1_wait_for_task_pool_quiescence(&mut state, &task_receiver);
         });
+    }
+
+    #[test]
+    fn watch_only_refreshes_form_bin_but_ignores_unrelated_json_and_binary_files() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        fn set_modified(path: &std::path::Path, modified: SystemTime) {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+
+        let root = tempfile::tempdir().expect("create form workspace");
+        let root_path = root.path().canonicalize().unwrap();
+        let form_module = root_path.join("Catalogs/Справочник/Forms/Ф/Ext/Form/Module.bsl");
+        std::fs::create_dir_all(form_module.parent().unwrap()).unwrap();
+        std::fs::write(&form_module, "Процедура Форма()\nКонецПроцедуры\n").unwrap();
+        std::fs::write(root_path.join("Configuration.xml"), "<Configuration/>").unwrap();
+        std::fs::write(root_path.join("bsl-analyzer.toml"), "[source]\nroot = \".\"\n").unwrap();
+        std::fs::write(
+            root_path.join("Catalogs/Справочник/Forms/Ф.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <Form uuid="0f0e0d0c-0b0a-4908-8706-050403020103">
+        <Properties><Name>Ф</Name><FormType>Ordinary</FormType></Properties>
+    </Form>
+</MetaDataObject>"#,
+        )
+        .unwrap();
+        let form_json = form_module.with_file_name("Form.json");
+        std::fs::write(
+            &form_json,
+            r#"{"schema":2,"form":{"name":"Ф","handlers":{"ПриОткрытии":"ПриОткрытии"},"boundHandlers":["КнопкаНажатие"]},"attributes":[{"id":1,"name":"Реквизит1"}],"controls":[{"kind":"button","id":2,"name":"Кнопка1"},{"kind":"input","id":3,"name":"Поле1","handlers":{"ПриИзменении":"Поле1ПриИзменении"}}]}"#,
+        )
+        .unwrap();
+        let form_bin = form_module.parent().unwrap().parent().unwrap().join("Form.bin");
+        std::fs::write(&form_bin, b"dialog").unwrap();
+        let initial_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let sidecar_time = initial_time + Duration::from_secs(60);
+        let changed_bin_time = sidecar_time + Duration::from_secs(60);
+        set_modified(&form_bin, initial_time);
+        set_modified(&form_json, sidecar_time);
+
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut state = crate::global_state::GlobalState::new(sender);
+        state.init_empty_source_root();
+        state.set_workspace_root(root_path.clone()).expect("load valid form workspace");
+        let initial_finish = g1_receive_loader_message(&mut state, |message| {
+            matches!(
+                message,
+                vfs::loader::Message::Progress {
+                    n_done: vfs::loader::LoadingProgress::Finished,
+                    ..
+                }
+            )
+        });
+        handle_loader_msg(&mut state, initial_finish).expect("finish initial workspace load");
+        assert!(state.vfs_done);
+
+        let form_file_id = state
+            .vfs
+            .read()
+            .file_id(&vfs::VfsPath::new(form_module.clone()))
+            .expect("initial scan loads ordinary form module");
+        let cached_form = {
+            let db = state.analysis_host.raw_database();
+            ide_db::queries::module_metadata_query(db, base_db::FileIdInput::new(db, form_file_id))
+                .form
+                .clone()
+                .expect("ordinary form metadata is cached")
+        };
+        assert!(cached_form.ordinary_dialog_known);
+        assert!(cached_form.is_handler("КнопкаНажатие"));
+        assert!(cached_form.find_element("Кнопка1").is_some());
+        assert!(cached_form.find_attribute("Реквизит1").is_some());
+
+        set_modified(&form_bin, changed_bin_time);
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::WatchOnly {
+                files: vec![paths::AbsPathBuf::assert_utf8(form_bin.clone())],
+            },
+        )
+        .expect("apply binary form update");
+        let refreshed_form = {
+            let db = state.analysis_host.raw_database();
+            ide_db::queries::module_metadata_query(db, base_db::FileIdInput::new(db, form_file_id))
+                .form
+                .clone()
+                .expect("refreshed ordinary form metadata")
+        };
+        assert!(!refreshed_form.ordinary_dialog_known);
+        assert!(refreshed_form.elements().is_empty());
+        assert!(refreshed_form.attributes().is_empty());
+        assert!(refreshed_form.is_handler("ПередОткрытием"));
+        assert!(!refreshed_form.is_handler("Поле1ПриИзменении"));
+        assert!(!refreshed_form.is_handler("КнопкаНажатие"));
+
+        let unrelated_json = root_path.join("notes.json");
+        let unrelated_bin = root_path.join("payload.bin");
+        let revision_before_unrelated =
+            salsa::plumbing::current_revision(state.analysis_host.raw_database());
+        handle_loader_msg(
+            &mut state,
+            vfs::loader::Message::WatchOnly {
+                files: vec![
+                    paths::AbsPathBuf::assert_utf8(unrelated_json),
+                    paths::AbsPathBuf::assert_utf8(unrelated_bin),
+                ],
+            },
+        )
+        .expect("apply unrelated watch-only paths");
+        assert_eq!(
+            salsa::plumbing::current_revision(state.analysis_host.raw_database()),
+            revision_before_unrelated,
+            "unrelated JSON and BIN paths must not invalidate Salsa inputs"
+        );
     }
 
     #[test]

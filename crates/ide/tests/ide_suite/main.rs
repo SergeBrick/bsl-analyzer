@@ -92,6 +92,7 @@ mod narrow_ternary_guard;
 mod narrow_type_of_expr;
 mod narrow_undefined_branch_receiver;
 mod ordinary_form_module;
+mod ordinary_form_sidecar;
 mod platform_manager_methods;
 mod platform_properties;
 mod query_projection_helper_propagation;

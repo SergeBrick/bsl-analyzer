@@ -260,6 +260,51 @@ mod tests {
     }
 
     #[test]
+    fn undecided_module_regions_do_not_revive_excluded_methods() {
+        const METHOD: &str = "Процедура Тест() Экспорт\n    Сложение(1);\nКонецПроцедуры\n";
+        for (regions, expected) in [
+            (
+                format!("#Если Линукс Тогда\n#ИначеЕсли Сервер И Не Сервер Тогда\n{METHOD}#КонецЕсли\n"),
+                0,
+            ),
+            (
+                format!("#Если Линукс Тогда\n#Если Сервер И Не Сервер Тогда\n{METHOD}#КонецЕсли\n#КонецЕсли\n"),
+                0,
+            ),
+            (
+                format!("#Если ТолстыйКлиентОбычноеПриложение Тогда\n#Если Линукс Тогда\n{METHOD}#КонецЕсли\n#КонецЕсли\n"),
+                0,
+            ),
+            (
+                format!("#Если Линукс Тогда\n#Если Сервер Тогда\n#Иначе\n{METHOD}#КонецЕсли\n#КонецЕсли\n"),
+                0,
+            ),
+            (
+                format!("#Если Линукс Тогда\n#ИначеЕсли Сервер Тогда\n#Иначе\n{METHOD}#КонецЕсли\n"),
+                0,
+            ),
+            (format!("#Если Линукс Тогда\n#Иначе\n{METHOD}#КонецЕсли\n"), 1),
+            (
+                format!("#Если Линукс Тогда\n#ИначеЕсли Сервер Тогда\n{METHOD}#КонецЕсли\n"),
+                1,
+            ),
+            (
+                format!("#Если Линукс Тогда\n#Если Сервер Тогда\n{METHOD}#КонецЕсли\n#КонецЕсли\n"),
+                1,
+            ),
+            (
+                format!("#Если Сервер Тогда\n#Если Линукс Тогда\n{METHOD}#КонецЕсли\n#КонецЕсли\n"),
+                1,
+            ),
+        ] {
+            let messages = in_server_module(&format!(
+                "Процедура Сложение(Левый, Правый) Экспорт\nКонецПроцедуры\n{regions}"
+            ));
+            assert_eq!(messages.len(), expected, "{regions}\n{messages:?}");
+        }
+    }
+
+    #[test]
     fn does_not_fire_when_optional_args_are_omitted() {
         let fixture = r#"
 //- /CommonModules/ОбщийМодуль/Ext/Module.bsl

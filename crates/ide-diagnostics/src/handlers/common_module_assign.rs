@@ -5,7 +5,7 @@ use crate::{Diagnostic, DiagnosticCode};
 use bsl_metadata::traits::MdObject;
 use hir::LocalRange;
 use hir::{AnnotationKind, AssignmentResolution, ExistingBindingKind, MethodId};
-use stdx::case::CaseExt;
+use stdx::case::fold_lower_per_char;
 
 pub const METADATA: DiagnosticMetadata = define_metadata! {
     diagnostic_type: DiagnosticType::Error,
@@ -96,7 +96,7 @@ fn names_a_context_attribute(
     if without_context {
         return false;
     }
-    let key = variable_name.fold_lower();
+    let key = fold_lower_per_char(variable_name);
     ctx.module_implicit_field_names().contains(&key)
 }
 #[cfg(test)]
@@ -221,5 +221,25 @@ mod tests {
             form_assign_diags("&НаСервереБезКонтекста", Some("Модуль")),
             ["Недопустимо присваивание значения общему модулю 'Модуль'"]
         );
+    }
+
+    /// Case folding of the assigned name and the attribute names must not depend on
+    /// where a letter stands: `str::to_lowercase` folds a word-final `Σ` to `ς`, so
+    /// `ΟΔΟΣ` and the attribute `οδοσ` would get different keys though the platform
+    /// treats them as one name.
+    #[test]
+    fn a_form_attribute_shadows_the_common_module_whatever_the_letter_position() {
+        let source = "&НаСервере\nПроцедура Тест()\n    ΟΔΟΣ = 5;\nКонецПроцедуры\n";
+        let module_xml = SERVER_MODULE_XML.replace("<Name>Модуль</Name>", "<Name>ΟΔΟΣ</Name>");
+        let diags: Vec<_> = crate::test_utils::check_form_with_common_modules_and_form_xml(
+            source,
+            &[("ΟΔΟΣ", "Процедура П() Экспорт\nКонецПроцедуры\n", &module_xml)],
+            &form_xml(Some("οδοσ")),
+        )
+        .into_iter()
+        .filter(|d| d.code == DiagnosticCode::CommonModuleAssign)
+        .map(|d| d.message)
+        .collect();
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }

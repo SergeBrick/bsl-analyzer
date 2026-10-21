@@ -388,3 +388,55 @@ fn the_extended_type_marker_check_catches_the_corpus_spellings() {
         assert!(is_extended(name), "{name} must be recognized as a type a configuration extends");
     }
 }
+
+/// Every read-only correction must hit exactly one property of the built-in facts
+/// whose extracted flag it changes: a correction of an absent property is skipped
+/// at load time (older corpora lack newer properties), so a misspelt or stale entry
+/// would otherwise go unnoticed, and an entry restating the extracted flag would
+/// correct nothing.
+#[test]
+fn every_readonly_correction_changes_a_built_in_property() {
+    let overlays: Value =
+        serde_json::from_str(include_str!("../data/platform_overlays.json")).unwrap();
+    let facts: Value = serde_json::from_str(FACTS).unwrap();
+    let properties = facts["properties"].as_array().unwrap();
+    let help = PlatformHelp::without_io(&PlatformHelpRequest::Bundled).unwrap();
+    let data = PlatformData::from_help(help);
+    let corrections: Vec<&Value> = overlays["type_property_corrections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|correction| correction.get("is_readonly").is_some())
+        .collect();
+    assert!(corrections.iter().any(|correction| correction["is_readonly"] == false));
+    for correction in corrections {
+        let type_name = correction["type"].as_str().unwrap();
+        let property_name = correction["name"].as_str().unwrap();
+        let corrected = correction["is_readonly"].as_bool().unwrap();
+        let canonical_type = data
+            .get_type(type_name)
+            .unwrap_or_else(|| panic!("{type_name} is a built-in type"))
+            .english_name
+            .clone();
+        let extracted: Vec<&Value> = properties
+            .iter()
+            .filter(|prop| {
+                prop["type_name"] == canonical_type.as_str()
+                    && (prop["name"] == property_name || prop["english_name"] == property_name)
+            })
+            .collect();
+        assert_eq!(extracted.len(), 1, "{type_name}.{property_name}: one extracted property");
+        assert_eq!(
+            extracted[0]["is_readonly"].as_bool().unwrap_or(false),
+            !corrected,
+            "{type_name}.{property_name}: the extracted flag is the one the entry corrects"
+        );
+        for name in [&extracted[0]["name"], &extracted[0]["english_name"]] {
+            let name = name.as_str().unwrap();
+            let served = data
+                .get_property(&canonical_type, name)
+                .unwrap_or_else(|| panic!("{canonical_type}.{name} is served"));
+            assert_eq!(served.is_readonly, corrected, "{canonical_type}.{name}");
+        }
+    }
+}

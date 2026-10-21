@@ -205,7 +205,10 @@ static CATALOG_BASE_OBJECT: &[StandardAttrSpec] = &[
         kind: StandardKind::PredefinedDataName,
         value: AttrValueKind::StringUnbounded,
         condition: PresenceCondition::Always,
-        is_readonly: true,
+        // Writable on the object since 8.3.3: an element is bound to or released
+        // from a predefined item by assigning it (an unknown name fails with
+        // «Предопределенный элемент не существует», not as a read-only field).
+        is_readonly: false,
     },
 ];
 
@@ -327,7 +330,10 @@ static CHART_OF_CHARACTERISTIC_TYPES_OBJECT: &[StandardAttrSpec] = &[
         kind: StandardKind::PredefinedDataName,
         value: AttrValueKind::StringUnbounded,
         condition: PresenceCondition::Always,
-        is_readonly: true,
+        // Writable on the object since 8.3.3: an element is bound to or released
+        // from a predefined item by assigning it (an unknown name fails with
+        // «Предопределенный элемент не существует», not as a read-only field).
+        is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::ValueType,
@@ -376,7 +382,7 @@ static CHART_OF_CALCULATION_TYPES_OBJECT: &[StandardAttrSpec] = &[
         kind: StandardKind::PredefinedDataName,
         value: AttrValueKind::StringUnbounded,
         condition: PresenceCondition::Always,
-        is_readonly: true,
+        is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::ActionPeriodIsBasic,
@@ -436,7 +442,7 @@ static CHART_OF_ACCOUNTS_OBJECT: &[StandardAttrSpec] = &[
         kind: StandardKind::PredefinedDataName,
         value: AttrValueKind::StringUnbounded,
         condition: PresenceCondition::Always,
-        is_readonly: true,
+        is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::Order,

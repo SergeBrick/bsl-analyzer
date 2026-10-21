@@ -308,12 +308,6 @@ struct Inner {
     lock_held_by_test: AtomicBool,
 }
 
-/// How long a test fixture waits to take the lease lock from whoever holds it: the product's
-/// own holders let go, but on a loaded machine not always within the product's budget, so
-/// an ordinary run waits for the lock itself and only the timing profile keeps the bound.
-#[cfg(test)]
-const TEST_LOCK_WAIT: Duration = test_utils::wait::ceiling(LOCK_WAIT);
-
 #[cfg(test)]
 thread_local! {
     /// The lease lock files this test thread itself holds: a wait for one of them that a lease
@@ -328,14 +322,14 @@ thread_local! {
 #[cfg(test)]
 struct LockHeldByThisThread {
     #[allow(dead_code, reason = "held for its drop")]
-    guard: LockGuard,
+    guard: StandLock,
     path: PathBuf,
 }
 
 #[cfg(test)]
 impl LockHeldByThisThread {
     fn acquire(path: &Path) -> Self {
-        let guard = LockGuard::acquire(path, TEST_LOCK_WAIT).unwrap();
+        let guard = LockGuard::acquire_for_stand(path).unwrap();
         LOCKS_HELD_BY_THIS_THREAD.with(|held| held.borrow_mut().push(path.to_path_buf()));
         Self { guard, path: path.to_path_buf() }
     }
@@ -385,7 +379,7 @@ impl WorkspaceLease {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let _guard = LockGuard::acquire(&path, TEST_LOCK_WAIT).unwrap();
+            let _guard = LockGuard::acquire_for_stand(&path).unwrap();
             ready_tx.send(()).unwrap();
             // Either the stand releases it, or the stand is gone and the sender with it.
             let _ = release_rx.recv();
@@ -403,7 +397,7 @@ impl WorkspaceLease {
         let path = cache.lease_lock_path();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let _guard = LockGuard::acquire(&path, TEST_LOCK_WAIT).unwrap();
+            let _guard = LockGuard::acquire_for_stand(&path).unwrap();
             ready_tx.send(()).unwrap();
             std::thread::sleep(duration);
         });
@@ -1477,6 +1471,31 @@ impl LockGuard {
         }
     }
 
+    /// Take the lock for a test stand whenever its holder lets go, however long that takes.
+    /// Stands hold the lock to fix an order of events, and a daemon's own heartbeat may hold
+    /// it for longer than `LOCK_WAIT` on a loaded machine: a bound here would fail the stand on
+    /// speed alone. A stand that already holds this lock would instead wait on itself forever,
+    /// so that hold panics at once.
+    #[cfg(test)]
+    fn acquire_for_stand(path: &Path) -> io::Result<StandLock> {
+        let path = path.to_path_buf();
+        assert!(
+            !stand_held_locks().lock().unwrap().contains(&path),
+            "a stand already holds the lease lock {}: a second hold would wait on itself",
+            path.display(),
+        );
+        loop {
+            match Self::try_acquire(&path) {
+                Ok(guard) => {
+                    stand_held_locks().lock().unwrap().insert(path.clone());
+                    return Ok(StandLock { _guard: guard, path });
+                }
+                Err(e) if is_lock_contention(&e) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn try_acquire(path: &Path) -> io::Result<Self> {
         use std::os::unix::io::AsRawFd;
@@ -1509,6 +1528,29 @@ impl LockGuard {
     }
 }
 
+/// Lease locks held by test stands in this process, so a stand that takes one twice fails
+/// instead of waiting on its own hold.
+#[cfg(test)]
+fn stand_held_locks() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static HELD: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// A lease lock a test stand holds; dropping it releases the lock and its stand record.
+#[cfg(test)]
+struct StandLock {
+    _guard: LockGuard,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for StandLock {
+    fn drop(&mut self) {
+        stand_held_locks().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.path);
+    }
+}
+
 #[cfg(unix)]
 fn is_lock_contention(error: &io::Error) -> bool {
     error.raw_os_error().is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
@@ -1527,6 +1569,18 @@ fn is_lock_contention(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stand helpers wait for the lease lock without a bound, and `flock` makes a second hold
+    /// of the same file in this process wait on the first: a stand that holds the lock twice
+    /// must fail at once instead of waiting on itself forever.
+    #[test]
+    #[should_panic(expected = "already holds the lease lock")]
+    fn a_stand_holding_the_lease_lock_twice_fails_instead_of_waiting_on_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::cache::WorkspaceCacheLayout::for_workspace(dir.path());
+        let (_holder, _release) = WorkspaceLease::hold_cache_lock_until_released(&cache);
+        WorkspaceLease::while_cache_lock_held(&cache, || ());
+    }
 
     #[test]
     fn workspace_cache_scope_lease_admission_detects_project_drift() {

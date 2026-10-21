@@ -630,6 +630,14 @@ impl ide_db::provider::AnalysisProvider for MetadataTestProvider {
         std::sync::Arc::clone(&self.metadata)
     }
 
+    /// The test file stands for a module of the main configuration.
+    fn vendor_support_for_file(
+        &self,
+        _file_id: vfs::FileId,
+    ) -> Option<std::sync::Arc<bsl_metadata::VendorSupport>> {
+        self.db.vendor_support()
+    }
+
     fn call_summary(&self, module_id: hir::ModuleId) -> std::sync::Arc<hir::ModuleCallSummary> {
         use hir::DefDatabase;
 
@@ -866,6 +874,32 @@ where
     );
 
     check_fn(&metadata_arc, &ctx)
+}
+
+/// [`check_metadata_diagnostic_with_config`] for a module of the main
+/// configuration, with the vendor support map `support` loaded.
+pub fn check_metadata_diagnostic_with_vendor_support<F>(
+    metadata: hir::ModuleMetadata,
+    file_text: &str,
+    config: crate::DiagnosticsConfig,
+    support: Option<bsl_metadata::VendorSupport>,
+    check_fn: F,
+) -> Vec<Diagnostic>
+where
+    F: Fn(&crate::DiagnosticsContext) -> Vec<Diagnostic>,
+{
+    use std::sync::Arc;
+
+    let (mut db, file_id) = create_test_db(file_text);
+    db.set_vendor_support(support.map(Arc::new));
+    let provider_impl =
+        MetadataTestProvider { db, metadata: Arc::new(metadata), configuration: None };
+    let ctx = crate::DiagnosticsContext::new(
+        &config,
+        file_id,
+        &provider_impl as &dyn ide_db::provider::AnalysisProvider,
+    );
+    check_fn(&ctx)
 }
 
 pub fn check_diagnostic_with_privileged_modules<F>(
@@ -1652,6 +1686,7 @@ pub fn make_common_module_metadata(module: bsl_metadata::CommonModule) -> hir::M
         common_module: Some(std::sync::Arc::new(module)),
         mdo: None,
         register: None,
+        command: None,
         http_service: None,
         web_service: None,
         integration_service: None,
@@ -1669,6 +1704,7 @@ pub fn make_common_module_metadata_with_ctx(
         common_module: Some(std::sync::Arc::new(module)),
         mdo: None,
         register: None,
+        command: None,
         http_service: None,
         web_service: None,
         integration_service: None,
@@ -1685,6 +1721,7 @@ pub fn make_non_common_module_metadata(
         common_module: None,
         mdo: None,
         register: None,
+        command: None,
         http_service: None,
         web_service: None,
         integration_service: None,

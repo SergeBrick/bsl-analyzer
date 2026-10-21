@@ -208,6 +208,7 @@ mod tests {
             common_module: None,
             mdo: None,
             register: None,
+            command: None,
             http_service: None,
             web_service: None,
             integration_service: None,
@@ -238,6 +239,7 @@ mod tests {
             .build();
         ModuleMetadata {
             register: Some(Arc::new(register)),
+            command: None,
             ..base_metadata(bsl_metadata::ModuleType::ManagerModule)
         }
     }

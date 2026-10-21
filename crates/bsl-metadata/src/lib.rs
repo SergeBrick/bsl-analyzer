@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+pub mod command;
 pub mod common_attribute;
 pub mod common_module;
 pub mod configuration;
@@ -23,9 +24,11 @@ pub mod scoped_fs;
 pub mod subsystem;
 pub mod tabular_section;
 pub mod traits;
+pub mod vendor_support;
 pub mod web_service;
 pub mod xml_parser;
 
+pub use command::Command;
 pub use common_attribute::{
     kind_takes_common_attributes, CommonAttribute, CommonAttributeField, CommonAttributeSet,
     CommonAttributeUse, ObjectCommonAttributes,
@@ -90,6 +93,7 @@ pub use subsystem::Subsystem;
 pub use tabular_section::{TabularSection, TabularSectionAttribute};
 pub use traits::{MdObject, Module};
 pub use uuid::Uuid;
+pub use vendor_support::{SupportMode, VendorSupport, VendorSupportError};
 pub use web_service::{
     WebService, WebServiceBuilder, WebServiceOperation, WebServiceOperationBuilder,
     WebServiceParameter,

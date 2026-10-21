@@ -3,7 +3,7 @@ use crate::http_service::{
     HTTPService, HTTPServiceBuilder, HTTPServiceMethodBuilder, HTTPServiceURLTemplateBuilder,
 };
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_xml};
+use super::helpers::{child_text, find_child, find_mdo_element, mdo_uuid, parse_xml};
 
 pub fn parse_http_service_xml(xml: &str, name: &str) -> Result<HTTPService> {
     let _span = tracing::debug_span!("parse_http_service_xml", name).entered();
@@ -21,6 +21,7 @@ pub fn parse_http_service_xml(xml: &str, name: &str) -> Result<HTTPService> {
 
     let mut builder = HTTPServiceBuilder::new()
         .name(&svc_name)
+        .uuid(mdo_uuid(mdo))
         .root_url(&root_url)
         .uri(format!("HTTPServices/{}/Ext/Module.bsl", name));
 
@@ -76,4 +77,30 @@ pub fn parse_http_service_xml(xml: &str, name: &str) -> Result<HTTPService> {
     );
 
     Ok(http_service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Утилита читает uuid MDO-элемента: ключ сервиса в карте поддержки вендора.
+    #[test]
+    fn uuid_is_read_and_a_missing_one_degrades_to_nil() {
+        let with_uuid = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <HTTPService uuid="7f7f2a83-6ff8-4a72-a5e1-d5f8a10bb1f4">
+        <Properties>
+            <Name>HTTPСервис1</Name>
+            <RootURL>hs</RootURL>
+        </Properties>
+    </HTTPService>
+</MetaDataObject>"#;
+        let without_uuid = with_uuid.replace(" uuid=\"7f7f2a83-6ff8-4a72-a5e1-d5f8a10bb1f4\"", "");
+
+        let service = parse_http_service_xml(with_uuid, "HTTPСервис1").unwrap();
+        assert_eq!(service.uuid().to_string(), "7f7f2a83-6ff8-4a72-a5e1-d5f8a10bb1f4");
+
+        let service = parse_http_service_xml(&without_uuid, "HTTPСервис1").unwrap();
+        assert!(service.uuid().is_nil());
+    }
 }

@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HTTPService {
     name: String,
+    uuid: Uuid,
     root_url: String,
     url_templates: Vec<HTTPServiceURLTemplate>,
     uri: Option<String>,
@@ -10,11 +12,23 @@ pub struct HTTPService {
 
 impl HTTPService {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), root_url: String::new(), url_templates: Vec::new(), uri: None }
+        Self {
+            name: name.into(),
+            uuid: Uuid::nil(),
+            root_url: String::new(),
+            url_templates: Vec::new(),
+            uri: None,
+        }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The uuid of the metadata object itself: the key the vendor-support map
+    /// knows this service by. A service built without one is unidentified.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
     }
 
     pub fn root_url(&self) -> &str {
@@ -129,6 +143,7 @@ impl HTTPServiceMethod {
 #[derive(Debug, Default)]
 pub struct HTTPServiceBuilder {
     name: String,
+    uuid: Uuid,
     root_url: String,
     url_templates: Vec<HTTPServiceURLTemplate>,
     uri: Option<String>,
@@ -141,6 +156,11 @@ impl HTTPServiceBuilder {
 
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    pub fn uuid(mut self, uuid: Uuid) -> Self {
+        self.uuid = uuid;
         self
     }
 
@@ -162,6 +182,7 @@ impl HTTPServiceBuilder {
     pub fn build(self) -> HTTPService {
         HTTPService {
             name: self.name,
+            uuid: self.uuid,
             root_url: self.root_url,
             url_templates: self.url_templates,
             uri: self.uri,

@@ -61,6 +61,8 @@ pub enum ConventionalName {
     FormJson,
     /// The binary dialog of an ORDINARY form (`Ext/Form.bin`), next to `Ext/Form/`.
     FormBin,
+    /// The vendor support map under the configuration's `Ext`.
+    ParentConfigurationsBin,
 }
 
 impl ConventionalName {
@@ -88,6 +90,7 @@ impl ConventionalName {
         ConventionalName::FormXml,
         ConventionalName::FormJson,
         ConventionalName::FormBin,
+        ConventionalName::ParentConfigurationsBin,
     ];
 
     /// The canonical spelling the configurator writes. Constructing a path or
@@ -118,6 +121,7 @@ impl ConventionalName {
             ConventionalName::FormXml => "Form.xml",
             ConventionalName::FormJson => "Form.json",
             ConventionalName::FormBin => "Form.bin",
+            ConventionalName::ParentConfigurationsBin => "ParentConfigurations.bin",
         }
     }
 
@@ -217,7 +221,8 @@ mod tests {
             Rights.xml
             Form.xml
             Form.json
-            Form.bin"#]]
+            Form.bin
+            ParentConfigurations.bin"#]]
         .assert_eq(&listing);
     }
 

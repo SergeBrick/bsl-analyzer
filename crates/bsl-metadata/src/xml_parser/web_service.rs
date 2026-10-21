@@ -3,7 +3,7 @@ use crate::web_service::{
     WebService, WebServiceBuilder, WebServiceOperationBuilder, WebServiceParameter,
 };
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_xml};
+use super::helpers::{child_text, find_child, find_mdo_element, mdo_uuid, parse_xml};
 
 pub fn parse_web_service_xml(xml: &str, name: &str) -> Result<WebService> {
     let _span = tracing::debug_span!("parse_web_service_xml", name).entered();
@@ -20,6 +20,7 @@ pub fn parse_web_service_xml(xml: &str, name: &str) -> Result<WebService> {
 
     let mut builder = WebServiceBuilder::new()
         .name(&svc_name)
+        .uuid(mdo_uuid(mdo))
         .namespace(&namespace)
         .uri(format!("WebServices/{}/Ext/Module.bsl", name));
 
@@ -110,6 +111,7 @@ mod tests {
         let web_service = parse_web_service_xml(SAMPLE_XML, "WebСервис1").unwrap();
 
         assert_eq!(web_service.name(), "WebСервис1");
+        assert_eq!(web_service.uuid().to_string(), "0b4a4c9c-76e9-455c-9471-249051a8301d");
         assert_eq!(web_service.namespace(), "test.com");
         assert_eq!(web_service.operations().len(), 3);
 
@@ -126,5 +128,22 @@ mod tests {
         assert_eq!(op3.name(), "ОперацияСНесуществующимОбработчиком");
         assert_eq!(op3.procedure_name(), "НесуществующийОбработчик1");
         assert!(!op3.is_handler_empty());
+    }
+
+    /// Толерантность к отсутствию uuid: объект жив, uuid нулевой.
+    #[test]
+    fn missing_uuid_degrades_to_nil() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.10">
+    <WebService>
+        <Properties>
+            <Name>WebСервис1</Name>
+            <Namespace>test.com</Namespace>
+        </Properties>
+    </WebService>
+</MetaDataObject>"#;
+
+        let web_service = parse_web_service_xml(xml, "WebСервис1").unwrap();
+        assert!(web_service.uuid().is_nil());
     }
 }

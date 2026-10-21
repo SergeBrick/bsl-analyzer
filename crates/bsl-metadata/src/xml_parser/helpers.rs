@@ -9,6 +9,22 @@ pub(crate) fn parse_uuid(s: &str, context: &str) -> Result<Uuid> {
         .map_err(|e| MetadataError::InvalidFormat(format!("Invalid {} UUID: {}", context, e)))
 }
 
+/// The `uuid` attribute of the MDO element, tolerant: an absent or malformed
+/// uuid degrades to `nil` instead of failing the whole object — a consumer of
+/// the uuid (the vendor-support map) then sees an unidentified object, which it
+/// already must handle, while the object keeps serving its other consumers.
+pub(crate) fn mdo_uuid(mdo: roxmltree::Node<'_, '_>) -> Uuid {
+    mdo.attribute("uuid")
+        .and_then(|raw| {
+            raw.parse()
+                .inspect_err(|err| {
+                    tracing::debug!(uuid_raw = %raw, %err, "ignored malformed object uuid");
+                })
+                .ok()
+        })
+        .unwrap_or(Uuid::nil())
+}
+
 pub(crate) fn create_register_standard_attribute(
     kind: &StandardAttributeKind,
     mdo_type: MdoType,

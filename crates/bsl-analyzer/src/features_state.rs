@@ -10,6 +10,7 @@ impl GlobalState {
             self.project.as_ref().map(|project| project.config.clone()).unwrap_or_default();
         apply_project_config_to_db(self.analysis_host.raw_database_mut(), &config);
         self.apply_configuration_xml_settings();
+        apply_vendor_support_to_db(self.analysis_host.raw_database_mut(), self.project.as_ref());
         if let Some(project) = self.project.as_ref() {
             if let Some(warning) =
                 platform_help::source_change_warning(Some(&project.config), &project.root)
@@ -135,6 +136,25 @@ pub fn apply_ordinary_app_support_to_db(
         );
         options.ordinary_app_support = value;
         db.set_env_options(options);
+    }
+}
+
+/// The main configuration's vendor support map into the database, read only when
+/// the project's `[diagnostics]` asks for it (see [`ide::load_vendor_support`]).
+/// Kept apart from [`apply_project_config_to_db`] because it reads the project's
+/// files, not just its settings.
+pub fn apply_vendor_support_to_db(
+    db: &mut RootDatabaseImpl,
+    project: Option<&project_model::Project>,
+) {
+    let support = project.and_then(|project| {
+        ide::load_vendor_support(
+            &project.config.diagnostics.rules_json(),
+            project.configuration_path(),
+        )
+    });
+    if db.vendor_support() != support {
+        db.set_vendor_support(support);
     }
 }
 

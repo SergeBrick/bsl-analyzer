@@ -56,6 +56,10 @@ pub trait RootDatabase:
     /// the same configured/canonical longest-prefix rule as visibility.
     fn config_root_rank_and_label(&self, file_id: FileId) -> Option<(usize, Option<String>)>;
 
+    /// The vendor support map, when `file_id` lies in the main configuration and
+    /// the map is loaded.
+    fn vendor_support_for_file(&self, file_id: FileId) -> Option<Arc<bsl_metadata::VendorSupport>>;
+
     /// Topological ranks of roots visible to `file_id`, or `None` when the
     /// workspace has no configured root visibility.
     fn visible_config_root_ranks(&self, file_id: FileId) -> Option<Vec<usize>>;

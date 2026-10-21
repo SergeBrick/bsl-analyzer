@@ -289,6 +289,7 @@ impl RootDatabaseImpl {
             None,
             None,
             None,
+            None,
         )
         .durability(Durability::MEDIUM)
         .new(&db);
@@ -2779,6 +2780,28 @@ impl RootDatabaseImpl {
         input.set_compatibility_mode(self).to(mode);
     }
 
+    pub fn vendor_support(&self) -> Option<Arc<bsl_metadata::VendorSupport>> {
+        self.features().vendor_support(self)
+    }
+
+    pub fn set_vendor_support(&mut self, support: Option<Arc<bsl_metadata::VendorSupport>>) {
+        use salsa::Setter;
+        let input = self.features();
+        input.set_vendor_support(self).to(support);
+    }
+
+    /// The vendor support map when `file_id` lies in the MAIN configuration. Only
+    /// the main configuration is ever on support: an extension or an external
+    /// object is the developer's own whatever uuids it carries.
+    pub fn vendor_support_for_file(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<bsl_metadata::VendorSupport>> {
+        let support = self.vendor_support()?;
+        let (_, label) = self.config_root_rank_and_label(file_id)?;
+        label.is_none().then_some(support)
+    }
+
     pub(crate) fn get_file_path(&self, file_id: FileId) -> Option<PathBuf> {
         // Graph batch databases publish the full BSL FileSet but register a
         // file→root input only for the batch whose text they load.
@@ -3710,6 +3733,10 @@ impl RootDatabase for RootDatabaseImpl {
 
     fn config_root_rank_and_label(&self, file_id: FileId) -> Option<(usize, Option<String>)> {
         RootDatabaseImpl::config_root_rank_and_label(self, file_id)
+    }
+
+    fn vendor_support_for_file(&self, file_id: FileId) -> Option<Arc<bsl_metadata::VendorSupport>> {
+        RootDatabaseImpl::vendor_support_for_file(self, file_id)
     }
 
     fn visible_config_root_ranks(&self, file_id: FileId) -> Option<Vec<usize>> {

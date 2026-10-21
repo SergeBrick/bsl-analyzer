@@ -45,6 +45,40 @@ pub use standalone_query::{sdbl_query_codes, validate_query_text, METADATA_DEPEN
 pub use standards::{message_with_standards, standard_url, standards};
 pub use types::{Diagnostic, DiagnosticOutput, DiagnosticTag, Fix, Severity, TextEdit};
 
+/// The main configuration's vendor support map, for a project whose raw
+/// `[diagnostics]` section asks for it (`CommentedCode.skipSupported`); `None`
+/// otherwise, and when the configuration was never on support. An unreadable map
+/// is reported once and leaves the setting without effect.
+pub fn load_vendor_support(
+    diagnostics: &serde_json::Value,
+    configuration_root: Option<&std::path::Path>,
+) -> Option<std::sync::Arc<bsl_metadata::VendorSupport>> {
+    if !handlers::commented_code::vendor_support_requested(diagnostics) {
+        return None;
+    }
+    let root = configuration_root?;
+    match bsl_metadata::VendorSupport::load(root) {
+        Ok(Some(support)) => {
+            tracing::info!(root = %root.display(), records = support.len(), "loaded vendor support map");
+            Some(std::sync::Arc::new(support))
+        }
+        Ok(None) => {
+            tracing::info!(
+                root = %root.display(),
+                "no vendor support map: the configuration was never on support"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                root = %root.display(),
+                "{error}; CommentedCode.skipSupported has no effect"
+            );
+            None
+        }
+    }
+}
+
 pub fn all_diagnostic_codes() -> impl Iterator<Item = DiagnosticCode> {
     use strum::IntoEnumIterator;
     DiagnosticCode::iter()

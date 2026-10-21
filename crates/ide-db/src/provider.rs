@@ -304,6 +304,16 @@ pub trait AnalysisProvider {
         None
     }
 
+    /// The vendor support map when `file_id` belongs to the main configuration;
+    /// `None` (the default for providers without project settings) when it does
+    /// not, or no map is loaded.
+    fn vendor_support_for_file(
+        &self,
+        _file_id: FileId,
+    ) -> Option<Arc<bsl_metadata::VendorSupport>> {
+        None
+    }
+
     /// Which execution environments the project compiles client and server code
     /// for. The default matches an unconfigured database, so a provider without
     /// project settings does not invent a stricter availability gate.

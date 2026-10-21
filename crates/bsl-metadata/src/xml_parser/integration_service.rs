@@ -3,7 +3,7 @@ use crate::integration_service::{
     IntegrationService, IntegrationServiceBuilder, IntegrationServiceChannelBuilder,
 };
 
-use super::helpers::{child_text, find_child, find_mdo_element, parse_xml};
+use super::helpers::{child_text, find_child, find_mdo_element, mdo_uuid, parse_xml};
 
 pub fn parse_integration_service_xml(xml: &str, name: &str) -> Result<IntegrationService> {
     let _span = tracing::debug_span!("parse_integration_service_xml", name).entered();
@@ -19,7 +19,7 @@ pub fn parse_integration_service_xml(xml: &str, name: &str) -> Result<Integratio
 
     let svc_name = child_text(props, "Name").unwrap_or(name).to_string();
 
-    let mut builder = IntegrationServiceBuilder::new().name(&svc_name);
+    let mut builder = IntegrationServiceBuilder::new().name(&svc_name).uuid(mdo_uuid(mdo));
 
     if let Some(child_objects) = find_child(mdo, "ChildObjects") {
         for channel_node in child_objects
@@ -87,6 +87,7 @@ mod tests {
         let service = parse_integration_service_xml(SAMPLE_XML, "ОбменСообщениями").unwrap();
 
         assert_eq!(service.name(), "ОбменСообщениями");
+        assert_eq!(service.uuid().to_string(), "c512a1cd-1240-4e46-8bad-8b7b27c5c25a");
         assert_eq!(service.channels().len(), 2);
 
         let handlers: Vec<_> = service.receive_handlers().collect();

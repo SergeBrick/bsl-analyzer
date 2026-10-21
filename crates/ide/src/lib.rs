@@ -69,11 +69,11 @@ pub use ide_db::{
 };
 pub use ide_diagnostics::{
     all_diagnostic_codes, apply_extension_merge, diagnostics as compute_diagnostics, docs,
-    file_diagnostics, file_diagnostics_query, get_metadata, message_with_standards,
-    slab_verify_mismatches, standard_url, standards, validate_query_text, CleanCodeAttribute,
-    Diagnostic, DiagnosticCode, DiagnosticOutput, DiagnosticSeverityLevel, DiagnosticTag,
-    DiagnosticType, DiagnosticsConfig, DiagnosticsContext, Fix, ImpactSeverity, MetadataTag,
-    Severity, SoftwareQuality, TextEdit, METADATA_DEPENDENT_CODES,
+    file_diagnostics, file_diagnostics_query, get_metadata, load_vendor_support,
+    message_with_standards, slab_verify_mismatches, standard_url, standards, validate_query_text,
+    CleanCodeAttribute, Diagnostic, DiagnosticCode, DiagnosticOutput, DiagnosticSeverityLevel,
+    DiagnosticTag, DiagnosticType, DiagnosticsConfig, DiagnosticsContext, Fix, ImpactSeverity,
+    MetadataTag, Severity, SoftwareQuality, TextEdit, METADATA_DEPENDENT_CODES,
 };
 pub use inlay_hints::{InlayHint, InlayHintKind};
 pub use name_lookup::{

@@ -1100,7 +1100,7 @@ mod tests {
         let module = ordinary_form_on_disk(dir.path());
         let sidecar = module.with_file_name("Form.json");
 
-        for invalid in ["0", "-1", "1.5", "\"2\""] {
+        for invalid in ["0", "-1", "1.5", "\"2\"", "null", "true", "{}", "[]"] {
             std::fs::write(&sidecar, sidecar_json(invalid)).unwrap();
             let form = parse_form_from_bsl_path(&module).unwrap();
             assert!(is_descriptor_only(&form), "{invalid}: {form:?}");

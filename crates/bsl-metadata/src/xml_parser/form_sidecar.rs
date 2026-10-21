@@ -62,10 +62,19 @@ impl std::fmt::Display for SidecarRejection {
 struct Sidecar {
     /// Version of the format; absent = 1. Kept raw so that an invalid value is
     /// reported as such rather than as malformed JSON.
+    #[serde(deserialize_with = "deserialize_schema")]
     schema: Option<serde_json::Value>,
     form: SidecarForm,
     attributes: Vec<SidecarAttribute>,
     controls: Vec<SidecarControl>,
+}
+
+// A present null is an invalid version, not the absent version's default.
+fn deserialize_schema<'de, D>(deserializer: D) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize, Default)]
@@ -383,7 +392,7 @@ mod tests {
 
     #[test]
     fn invalid_versions_are_rejected() {
-        for schema in ["0", "-1", "1.5", "\"2\""] {
+        for schema in ["0", "-1", "1.5", "\"2\"", "null", "true", "{}", "[]"] {
             let json = format!(r#"{{"schema": {schema}, "form": {{"name": "Ф"}}}}"#);
             assert_eq!(
                 parse_sidecar(&json, "Ф").unwrap_err(),

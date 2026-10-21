@@ -228,6 +228,7 @@ impl PlatformDataInner {
         }
 
         apply_docs_gap_method_overlay(&mut methods, &global_functions);
+        apply_docs_gap_method_variant_overlay(&mut methods);
         apply_docs_gap_member_context_overlay(&mut methods, &mut global_functions, &types);
 
         let mut methods_by_name = FxHashMap::default();
@@ -288,6 +289,7 @@ impl PlatformDataInner {
         }
 
         apply_docs_only_variadic_overlay(&mut constructors);
+        apply_docs_gap_default_constructor_overlay(&mut constructors);
 
         let mut constructors_by_type: FxHashMap<SmolStr, Vec<usize>> = FxHashMap::default();
         for (idx, ctor) in constructors.iter().enumerate() {
@@ -746,10 +748,32 @@ fn apply_docs_gap_member_context_overlay(
         {
             context.thin_client = true;
             context.thick_client = true;
-            context.mobile_client = true;
+        }
+        if CLIENT_EXECUTABLE_METHODS
+            .iter()
+            .any(|(ty, name)| method.type_name == *ty && method.english_name == *name)
+        {
+            context.thin_client = true;
+            context.thick_client = true;
         }
     }
 }
+
+/// Methods whose pages (8.3.17 and 8.3.27 help alike) omit the thin client —
+/// and, for `ФорматированныйДокумент.УстановитьHTML`, the thick client too —
+/// although the platform executes them there: a live run in the thin client and
+/// in the thick client (managed application) on 8.3.17 and on 8.3.27 (with and
+/// without a compatibility mode) completes the call, while a method that is
+/// really missing from the thin client fails with "Метод объекта не обнаружен".
+/// The PDF methods appear in 8.3.18–8.3.22 and were checked on 8.3.27 only.
+/// The web and mobile clients were not checked and are left as the help says.
+/// Pairs: English type name, English method name.
+const CLIENT_EXECUTABLE_METHODS: &[(&str, &str)] = &[
+    ("FormattedDocument", "SetHTML"),
+    ("PDFDocument", "ConvertToGrayScale"),
+    ("PDFDocument", "AddSignature"),
+    ("PDFWriter", "ConvertToGrayScale"),
+];
 
 /// Synchronous `HTTPСоединение` methods whose pages, since the 8.3.21 help,
 /// list only server environments. The same pages say the call on the client is
@@ -758,7 +782,8 @@ fn apply_docs_gap_member_context_overlay(
 /// 8.3.27 with and without a compatibility mode) executes these calls in the thin
 /// and thick clients. Deprecation is `DeprecatedPlatformApi`'s business; the
 /// environment check must not turn it into "unavailable". The web client stays
-/// out: the type itself is absent there.
+/// out: the type itself is absent there. The mobile client was not checked and
+/// is left as the help says.
 const CLIENT_DEPRECATED_HTTP_CONNECTION_METHODS: &[&str] =
     &["Get", "Post", "Put", "Patch", "Delete", "Head", "CallHTTPMethod"];
 
@@ -835,6 +860,59 @@ fn apply_docs_gap_method_overlay(
     }
 }
 
+/// Call forms the platform accepts (compiled by `/CheckConfig` and run on
+/// 8.3.17 and 8.3.27) whose parameters the help archive drops. Each entry is
+/// (owner type, method, variant name, parameters as name / type / optional):
+/// - `ЭлементDOM.ПолучитьЭлементыПоИмени`: the page names the "По имени" variant
+///   but extracts it without its `Имя` — the same variant of
+///   `ДокументDOM.ПолучитьЭлементыПоИмени` carries it;
+/// - `ФоновоеЗадание.ОжидатьЗавершения`: since 8.3.15 the page shows the call
+///   without arguments while its text still describes the timeout, and the
+///   manager's `ОжидатьЗавершения(<Таймаут>)` keeps it documented.
+///
+/// An existing variant of that name that already has parameters means the
+/// archive documents the form itself, and the entry steps aside.
+const DOCS_GAP_METHOD_VARIANTS: &[(&str, &str, &str, &[DocsGapParam])] = &[
+    ("DOMElement", "ПолучитьЭлементыПоИмени", "По имени", &[("Имя", "Строка", false)]),
+    ("BackgroundJob", "ОжидатьЗавершения", "С таймаутом", &[("Таймаут", "Число", true)]),
+];
+
+/// Name, type and optionality of one restored parameter.
+type DocsGapParam = (&'static str, &'static str, bool);
+
+fn apply_docs_gap_method_variant_overlay(methods: &mut [PlatformMethod]) {
+    use crate::types::{MethodParam, MethodVariant};
+
+    for (type_name, method_name, variant_name, parameters) in DOCS_GAP_METHOD_VARIANTS {
+        let Some(method) = methods.iter_mut().find(|method| {
+            method.type_name == *type_name && method.name.fold_lower() == method_name.fold_lower()
+        }) else {
+            continue;
+        };
+        let parameters: Vec<MethodParam> = parameters
+            .iter()
+            .map(|(name, param_type, is_optional)| MethodParam {
+                name: SmolStr::new(*name),
+                param_type: Some(SmolStr::new(*param_type)),
+                is_optional: *is_optional,
+                is_variadic: false,
+            })
+            .collect();
+        match method
+            .variants
+            .iter_mut()
+            .find(|variant| variant.variant_name.as_deref() == Some(*variant_name))
+        {
+            Some(variant) if variant.parameters.is_empty() => variant.parameters = parameters,
+            Some(_) => {}
+            None => method.variants.push(MethodVariant {
+                variant_name: Some(SmolStr::new(*variant_name)),
+                parameters,
+            }),
+        }
+    }
+}
+
 fn apply_docs_only_variadic_overlay(constructors: &mut [PlatformConstructor]) {
     const OVERLAY: &[(&str, &str)] = &[
         ("Structure", "По ключам и значениям"),
@@ -850,6 +928,46 @@ fn apply_docs_only_variadic_overlay(constructors: &mut [PlatformConstructor]) {
         if let Some(last) = ctor.parameters.last_mut() {
             last.is_variadic = true;
         }
+    }
+}
+
+/// Types the platform constructs without arguments although their help pages
+/// list only constructors with a required parameter: `Новый Файл`,
+/// `Новый ДокументDOM` and `Новый ДокументHTML` compile (`/CheckConfig`) and run
+/// on 8.3.17 and 8.3.27, with or without empty parentheses, while the same
+/// check rejects the bare form of `HTTPСоединение`, `ДвоичныеДанные` and the
+/// rest with "Конструктор не найден". Each listed type gains a parameterless
+/// variant that takes its availability from the documented constructors; the
+/// entry is skipped once the archive documents such a variant itself.
+const DOCS_GAP_DEFAULT_CONSTRUCTORS: &[&str] = &["File", "DOMDocument", "HTMLDocument"];
+
+fn apply_docs_gap_default_constructor_overlay(constructors: &mut Vec<PlatformConstructor>) {
+    for type_name in DOCS_GAP_DEFAULT_CONSTRUCTORS {
+        let documented: Vec<&PlatformConstructor> =
+            constructors.iter().filter(|ctor| ctor.type_name == *type_name).collect();
+        let Some(source) = documented.first() else {
+            continue;
+        };
+        let has_default =
+            documented.iter().any(|ctor| ctor.parameters.iter().all(|param| param.is_optional));
+        if has_default {
+            continue;
+        }
+        // As with synthesized methods: no free id, no synthesized variant.
+        let Some(next_id) =
+            constructors.iter().map(|ctor| ctor.id).max().unwrap_or(0).checked_add(1)
+        else {
+            continue;
+        };
+        let default = PlatformConstructor {
+            id: next_id,
+            type_name: source.type_name.clone(),
+            variant_name: Some(SmolStr::new("По умолчанию")),
+            parameters: Vec::new(),
+            min_version: source.min_version.clone(),
+            context: source.context,
+        };
+        constructors.push(default);
     }
 }
 
@@ -1301,6 +1419,63 @@ mod tests {
     }
 
     #[test]
+    fn docs_gap_overlay_adds_parameterless_constructors() {
+        let data = PlatformDataInner::instance();
+        if data.all_constructors().is_empty() {
+            return;
+        }
+        let parameterless = |name: &str| {
+            data.get_constructors(name)
+                .iter()
+                .any(|ctor| ctor.parameters.iter().all(|param| param.is_optional))
+        };
+
+        for name in ["Файл", "ДокументDOM", "ДокументHTML", "File", "DOMDocument", "HTMLDocument"]
+        {
+            assert!(parameterless(name), "{name} is constructed without arguments");
+        }
+        // Control: the platform rejects the bare form of these, the overlay must not add it.
+        for name in ["HTTPСоединение", "ДвоичныеДанные", "ФиксированныйМассив"]
+        {
+            assert!(!parameterless(name), "{name} has no parameterless constructor");
+        }
+        let documented = data
+            .get_constructors("Файл")
+            .into_iter()
+            .find(|ctor| !ctor.parameters.is_empty())
+            .expect("the documented constructor of Файл stays");
+        assert_eq!(documented.parameters.len(), 1, "the documented variant is not changed");
+    }
+
+    #[test]
+    fn docs_gap_overlay_restores_dropped_method_parameters() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+        let arities = |type_name: &str, method_name: &str| {
+            let method = data.get_method(type_name, method_name).expect("method must exist");
+            std::iter::once(&method.parameters)
+                .chain(method.variants.iter().map(|variant| &variant.parameters))
+                .map(|params| (params.iter().filter(|p| !p.is_optional).count(), params.len()))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            arities("ЭлементDOM", "ПолучитьЭлементыПоИмени").contains(&(1, 1)),
+            "ЭлементDOM.ПолучитьЭлементыПоИмени takes one name"
+        );
+        assert!(
+            arities("ЭлементDOM", "ПолучитьЭлементыПоИмени").contains(&(2, 2)),
+            "the namespace form stays"
+        );
+        assert!(
+            arities("ФоновоеЗадание", "ОжидатьЗавершения").contains(&(0, 1)),
+            "ФоновоеЗадание.ОжидатьЗавершения takes an optional timeout"
+        );
+    }
+
+    #[test]
     fn docs_gap_overlay_widens_member_contexts() {
         let data = PlatformDataInner::instance();
         if data.all_methods().is_empty() {
@@ -1372,9 +1547,42 @@ mod tests {
                 ctx.thin_client && ctx.thick_client,
                 "{name} runs in the thin and thick client"
             );
-            assert!(ctx.mobile_client, "the 8.3.17 help lists the mobile client: {name}");
             assert!(ctx.server && ctx.external_connection, "{name} keeps its server contexts");
             assert!(!ctx.web_client, "HTTPСоединение is absent from the web client: {name}");
+            assert!(!ctx.mobile_client, "{name}: the mobile client was not checked and stays out");
+        }
+
+        // Narrow: a synchronous collaboration-system method that the thin client
+        // really lacks keeps its markup.
+        let control = data
+            .get_method("МенеджерСистемыВзаимодействия", "ПолучитьПользователей")
+            .expect("control must exist");
+        let ctx = control.context.as_ref().expect("control must carry availability");
+        assert!(!ctx.thin_client, "the control stays unavailable in the thin client");
+        assert!(ctx.thick_client, "the control keeps the thick client");
+    }
+
+    #[test]
+    fn docs_gap_overlay_adds_client_contexts_of_client_executable_methods() {
+        let data = PlatformDataInner::instance();
+        if data.all_methods().is_empty() {
+            return;
+        }
+
+        for (ty, name) in [
+            ("ФорматированныйДокумент", "УстановитьHTML"),
+            ("ДокументPDF", "ПреобразоватьВОттенкиСерого"),
+            ("ДокументPDF", "ДобавитьПодпись"),
+            ("ЗаписьPDF", "ПреобразоватьВОттенкиСерого"),
+        ] {
+            let method = data.get_method(ty, name).expect("method must exist");
+            let ctx = method.context.as_ref().expect("method must carry availability");
+            assert!(
+                ctx.thin_client && ctx.thick_client,
+                "{ty}.{name} runs in the thin and thick client"
+            );
+            assert!(ctx.server, "{ty}.{name} keeps the server");
+            assert!(!ctx.web_client, "{ty}.{name}: the web client was not checked and stays out");
         }
 
         // Narrow: a synchronous collaboration-system method that the thin client

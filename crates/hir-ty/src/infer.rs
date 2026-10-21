@@ -2868,10 +2868,9 @@ impl<'db> InferenceContext<'db> {
                 // Availability checks inside a branch see only the
                 // environments its condition compiles for; nesting works
                 // because each frame restores its own parent mask.
-                // The possible environments of a branch keep those a
-                // condition of the chain could not decide: they may take any
-                // branch from there on. A branch is dead only when a known
-                // body leaves it none.
+                // Unknown conditions may leave an environment in several
+                // branches, but each branch still has to admit it. A branch
+                // is dead only when a known body leaves it none.
                 use hir_def::execution_env::EnvFlags;
                 let parent = self.body_env;
                 let parent_possible = self.possible_env;
@@ -2879,7 +2878,6 @@ impl<'db> InferenceContext<'db> {
                 let parent_dead = self.in_dead_branch;
                 let mut remaining = parent;
                 let mut possible_remaining = parent_possible;
-                let mut undecided = EnvFlags::EMPTY;
                 let enter = |this: &mut Self, mask: EnvFlags, possible: EnvFlags| {
                     this.body_env = mask;
                     this.possible_env = possible;
@@ -2888,32 +2886,28 @@ impl<'db> InferenceContext<'db> {
                         parent_dead || (!parent_possible.is_empty() && possible.is_empty());
                 };
                 let mask = preproc.condition.narrow_branch(&mut remaining);
-                let taken = preproc
-                    .condition
-                    .narrow_branch_tracking(&mut possible_remaining, &mut undecided);
-                enter(self, mask, taken | undecided);
+                let taken = preproc.condition.possible_branch(&mut possible_remaining);
+                enter(self, mask, taken);
                 self.infer_stmts(&preproc.then_branch);
                 for (idx, (_, _, branch)) in preproc.elsif_branches.iter().enumerate() {
                     let (mask, taken) = match preproc.elsif_conditions.get(idx) {
                         Some(cond) => (
                             cond.narrow_branch(&mut remaining),
-                            cond.narrow_branch_tracking(&mut possible_remaining, &mut undecided),
+                            cond.possible_branch(&mut possible_remaining),
                         ),
                         // A branch without a lowered condition (broken
                         // alignment) poisons the rest of the chain,
                         // including #Иначе.
                         None => {
                             remaining = EnvFlags::EMPTY;
-                            undecided = undecided | possible_remaining;
-                            possible_remaining = EnvFlags::EMPTY;
-                            (EnvFlags::EMPTY, EnvFlags::EMPTY)
+                            (EnvFlags::EMPTY, possible_remaining)
                         }
                     };
-                    enter(self, mask, taken | undecided);
+                    enter(self, mask, taken);
                     self.infer_stmts(branch);
                 }
                 if let Some(else_branch) = &preproc.else_branch {
-                    enter(self, remaining, possible_remaining | undecided);
+                    enter(self, remaining, possible_remaining);
                     self.infer_stmts(else_branch);
                 }
                 self.body_env = parent;

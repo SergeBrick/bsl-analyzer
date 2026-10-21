@@ -69,18 +69,17 @@ pub fn from_hir(
 }
 
 /// Whether the call at `range` sits in a statement inference walked inside a `#Если`
-/// branch nothing proves compiled. The lowering that reports a local call does not
-/// know which branches compile, so the answer comes from inference; the qualified
-/// calls are dropped where inference reports them.
-pub(crate) fn in_uncompiled_branch(ctx: &BodyContext, range: LocalRange) -> bool {
+/// branch every environment of a known body decidably skips. The lowering that
+/// reports a local call does not know which branches compile, so the answer comes
+/// from inference; the qualified calls are dropped where inference reports them.
+pub(crate) fn in_dead_branch(ctx: &BodyContext, range: LocalRange) -> bool {
     let infer = ctx.infer();
-    let uncompiled = infer.uncompiled_stmts();
-    if uncompiled.is_empty() {
+    let dead = infer.dead_stmts();
+    if dead.is_empty() {
         return false;
     }
     let source_map = ctx.source_map();
-    uncompiled
-        .iter()
+    dead.iter()
         .any(|stmt| source_map.stmt_range(*stmt).is_some_and(|stmt| stmt.contains_range(range)))
 }
 
@@ -537,6 +536,93 @@ mod tests {
             vec!["Укажите обязательный параметр 'А'".to_string()],
             "only the compiled call after the branch is reported"
         );
+    }
+
+    /// A branch the condition cannot decide may be compiled, so its calls are
+    /// judged: `Линукс` is no symbol of the help, and an `#Иначе` after such a
+    /// branch is no more decided than the branch itself.
+    #[test]
+    fn an_undecided_branch_is_judged() {
+        const CALLS: &str = "    Х = Три(1, , 3);\n    Х = Другой.Три(1, , 3);\n";
+
+        let then_branch = module_calling(&format!("#Если Линукс Тогда\n{CALLS}#КонецЕсли\n"));
+        assert_eq!(then_branch.len(), 2, "the condition is undecided: {then_branch:?}");
+        let else_branch =
+            module_calling(&format!("#Если Линукс Тогда\n#Иначе\n{CALLS}#КонецЕсли\n"));
+        assert_eq!(else_branch.len(), 2, "the chain is undecided: {else_branch:?}");
+        let after_taken =
+            module_calling(&format!("#Если Сервер Тогда\n#Иначе\n{CALLS}#КонецЕсли\n"));
+        assert!(after_taken.is_empty(), "the server takes the first branch: {after_taken:?}");
+    }
+
+    /// The session module runs on the server and in the external connection, where
+    /// `Сервер` is undecided: a branch nested under `#Если Сервер` may still be
+    /// compiled there, while a contradiction is false whatever `Сервер` holds.
+    #[test]
+    fn a_branch_is_dead_only_when_every_environment_rules_it_out() {
+        let module = |call_site: &str| {
+            let fixture = format!(
+                "//- /Ext/SessionModule.bsl\n\
+                 Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n\n\
+                 Процедура Тест() Экспорт\n{call_site}КонецПроцедуры\n"
+            );
+            crate::test_utils::check_hir_diagnostic_with_fixtures(&fixture)
+                .into_iter()
+                .filter(|diag| diag.code == DiagnosticCode::MissedRequiredParameter)
+                .map(|diag| diag.message)
+                .collect::<Vec<_>>()
+        };
+        const CALL: &str = "    Х = Три(1, , 3);\n";
+
+        let plain = module(CALL);
+        assert_eq!(plain.len(), 1, "the session module compiles the plain call: {plain:?}");
+        let nested = module(&format!(
+            "#Если Сервер Тогда\n#Если Не Сервер Тогда\n{CALL}#КонецЕсли\n#КонецЕсли\n"
+        ));
+        assert_eq!(nested.len(), 1, "the external connection may compile it: {nested:?}");
+
+        let contradiction = module(&format!("#Если Сервер И Не Сервер Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(contradiction.is_empty(), "no environment compiles this branch: {contradiction:?}");
+        let client = module(&format!("#Если ТонкийКлиент Тогда\n{CALL}#КонецЕсли\n"));
+        assert!(client.is_empty(), "neither environment is a thin client: {client:?}");
+    }
+
+    /// A module of unknown environment may compile any of its branches.
+    #[test]
+    fn a_branch_of_a_module_of_unknown_environment_is_judged() {
+        let fixture = "//- /test.bsl\n\
+                       Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n\n\
+                       Процедура Тест()\n#Если Сервер Тогда\n    Х = Три(1, , 3);\n#КонецЕсли\n\
+                       КонецПроцедуры\n";
+        let messages: Vec<_> = crate::test_utils::check_hir_diagnostic_with_fixtures(fixture)
+            .into_iter()
+            .filter(|diag| diag.code == DiagnosticCode::MissedRequiredParameter)
+            .map(|diag| diag.message)
+            .collect();
+        assert_eq!(messages.len(), 1, "the environment is unknown: {messages:?}");
+    }
+
+    /// A method declared in a module-level branch no environment compiles is
+    /// dropped with the branch; one under an undecided region may be compiled.
+    #[test]
+    fn a_method_in_a_module_level_branch_no_environment_compiles_is_not_judged() {
+        let module = |condition: &str| {
+            in_server_module(&format!(
+                "Функция Три(А, Б, В) Экспорт\n    Возврат А;\nКонецФункции\n\n\
+                 #Если {condition} Тогда\n\
+                 Процедура Тест() Экспорт\n    Х = Три(1, , 3);\n    Х = Другой.Три(1, , 3);\n\
+                 КонецПроцедуры\n#КонецЕсли\n"
+            ))
+        };
+
+        let dead = module("Сервер И Не Сервер");
+        assert!(dead.is_empty(), "no environment compiles the method: {dead:?}");
+        let client = module("ТолстыйКлиентОбычноеПриложение");
+        assert!(client.is_empty(), "a server module never compiles the method: {client:?}");
+        let compiled = module("Сервер");
+        assert_eq!(compiled.len(), 2, "the server compiles the method: {compiled:?}");
+        let undecided = module("Линукс");
+        assert_eq!(undecided.len(), 2, "the region is undecided: {undecided:?}");
     }
 
     #[test]

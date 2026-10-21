@@ -162,7 +162,7 @@ pub fn dispatch_hir_diagnostic(
             args,
             range,
         } => {
-            if handlers::missed_required_parameter::in_uncompiled_branch(ctx, *range) {
+            if handlers::missed_required_parameter::in_dead_branch(ctx, *range) {
                 return None;
             }
             handlers::missed_required_parameter::from_hir(

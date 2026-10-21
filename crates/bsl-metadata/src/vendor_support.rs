@@ -178,24 +178,18 @@ impl VendorSupport {
     }
 }
 
-/// The `uuid` attribute of the `<Configuration>` element, read from the head of
-/// `Configuration.xml`: the attribute sits on the first element after the root,
-/// long before the object list that makes the file large.
+/// XML whitespace, quoting and a long preamble do not change the root's identity.
 fn configuration_root_uuid(config_root: &Path) -> Option<Uuid> {
-    use std::io::Read as _;
+    use crate::xml_parser::helpers::{find_mdo_element, parse_xml};
 
-    const HEAD: u64 = 16 * 1024;
     let path = bsl_conventions::find_child_ci(
         config_root,
         bsl_conventions::ConventionalName::ConfigurationXml.canonical(),
     )?;
-    let mut head = Vec::new();
-    std::fs::File::open(path).ok()?.take(HEAD).read_to_end(&mut head).ok()?;
-    let head = String::from_utf8_lossy(&head);
-    let element = head.find("<Configuration ")?;
-    let tag = &head[element..element + head[element..].find('>')?];
-    let value = tag.split("uuid=\"").nth(1)?.split('"').next()?;
-    Uuid::parse_str(value).ok()
+    let xml = std::fs::read_to_string(path).ok()?;
+    let doc = parse_xml(&xml).ok()?;
+    let element = find_mdo_element(&doc).filter(|node| node.has_tag_name("Configuration"))?;
+    Uuid::parse_str(element.attribute("uuid")?).ok()
 }
 
 struct Token<'a> {
@@ -441,6 +435,26 @@ mod tests {
         let map = VendorSupport::load(dir.path()).unwrap().unwrap();
         assert_eq!(map.configuration_root(), Some(uuid(ROOT)));
         assert!(map.is_supported(&uuid(ROOT)));
+    }
+
+    #[test]
+    fn configuration_uuid_accepts_xml_whitespace_and_long_preambles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Ext")).unwrap();
+        std::fs::write(
+            dir.path().join("Ext/ParentConfigurations.bin"),
+            fixture(&[(1, ROOT, ROOT)]),
+        )
+        .unwrap();
+        for padding in [0, 20 * 1024] {
+            let xml = format!(
+                "<MetaDataObject><!--{}--><Configuration\n uuid='{ROOT}'/></MetaDataObject>",
+                "x".repeat(padding)
+            );
+            std::fs::write(dir.path().join("Configuration.xml"), xml).unwrap();
+            let map = VendorSupport::load(dir.path()).unwrap().unwrap();
+            assert_eq!(map.configuration_root(), Some(uuid(ROOT)), "padding={padding}");
+        }
     }
 
     #[test]

@@ -382,7 +382,7 @@ static CHART_OF_CALCULATION_TYPES_OBJECT: &[StandardAttrSpec] = &[
         kind: StandardKind::PredefinedDataName,
         value: AttrValueKind::StringUnbounded,
         condition: PresenceCondition::Always,
-        is_readonly: true,
+        is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::ActionPeriodIsBasic,
@@ -442,7 +442,7 @@ static CHART_OF_ACCOUNTS_OBJECT: &[StandardAttrSpec] = &[
         kind: StandardKind::PredefinedDataName,
         value: AttrValueKind::StringUnbounded,
         condition: PresenceCondition::Always,
-        is_readonly: true,
+        is_readonly: false,
     },
     StandardAttrSpec {
         kind: StandardKind::Order,

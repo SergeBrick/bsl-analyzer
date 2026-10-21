@@ -113,6 +113,42 @@ fn form_property_names_are_locals_in_methods_without_context() {
     assert_eq!(read_only_findings(code), Vec::<(usize, String)>::new());
 }
 
+#[test]
+fn untyped_locals_do_not_regain_form_property_types() {
+    for directive in ["НаСервереБезКонтекста", "НаКлиентеНаСервереБезКонтекста"]
+    {
+        let code = format!(
+            "&{directive}\nФункция БезКонтекста(Форма)\n\
+             Элементы = Форма.Элементы;\n\
+             Возврат Элементы.Добавить(1);\nКонецФункции"
+        );
+        let (db, file_id) = setup(&code);
+        let findings: Vec<_> =
+            ide_diagnostics::file_diagnostics(&db, file_id, &DiagnosticsConfig::all_enabled())
+                .into_iter()
+                .filter(|d| d.code == DiagnosticCode::MismatchedArgCount)
+                .collect();
+        assert!(findings.is_empty(), "{directive}: {findings:?}");
+    }
+}
+
+#[test]
+fn chart_object_predefined_names_are_writable() {
+    let code = "\
+&НаСервере
+Процедура ЗаписатьИмена()
+    Счет = ПланыСчетов.ПланСчетов1.СоздатьСчет();
+    Счет.ИмяПредопределенныхДанных = \"\";
+    ВидРасчета = ПланыВидовРасчета.ПланВидовРасчета1.СоздатьВидРасчета();
+    ВидРасчета.ИмяПредопределенныхДанных = \"\";
+    Счет.Предопределенный = Истина;
+    ВидРасчета.Предопределенный = Истина;
+КонецПроцедуры
+";
+    let lines: Vec<_> = read_only_findings(code).into_iter().map(|(line, _)| line).collect();
+    assert_eq!(lines, vec![6, 7]);
+}
+
 /// Controls: the writes the platform refuses keep their finding, the bare form
 /// property names among them in a method that has the form in scope.
 #[test]

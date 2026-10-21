@@ -2062,6 +2062,7 @@ impl<'db> InferenceContext<'db> {
             matches!(resolved, Some(Resolution::Method(_) | Resolution::Variable(_)))
                 || self.body_declares_binding(name);
         if !declared_owner
+            && !self.in_method_without_form_context()
             && crate::form_self::resolve_form_self_property(self.db, &resolver, name).is_some()
         {
             return false;
@@ -3542,7 +3543,7 @@ impl<'db> InferenceContext<'db> {
             return found(self.db.unknown(), BareNameOrigin::Builtin, all_env);
         }
 
-        if !user_shadows && !body_binding_shadows {
+        if !user_shadows && !body_binding_shadows && !self.in_method_without_form_context() {
             if let Some(resolution) =
                 crate::form_self::resolve_form_self_property(self.db, &resolver, name)
             {
@@ -3551,7 +3552,7 @@ impl<'db> InferenceContext<'db> {
             }
         }
 
-        if !user_shadows && !body_binding_shadows {
+        if !user_shadows && !body_binding_shadows && !self.in_method_without_form_context() {
             if let Some(ty) = crate::form_attr::resolve_form_attribute(self.db, &resolver, name) {
                 trace!("resolved {} as managed-form attribute", name);
                 return found(ty, BareNameOrigin::FormMember, all_env);

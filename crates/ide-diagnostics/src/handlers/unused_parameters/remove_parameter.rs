@@ -9,9 +9,10 @@
 //!
 //! - the method is not `Экспорт`: an exported method has callers in other modules;
 //! - no body of the module (neither this one nor an extension's) runs `Выполнить` or
-//!   `Вычислить` or builds an `ОписаниеОповещения` from a handler name that is not one
-//!   string literal, no string literal of them names the method, and no extension body
-//!   mentions it at all: those callers are out of reach of a file-local edit;
+//!   `Вычислить` or binds a handler (`ОписаниеОповещения`, `УстановитьДействие`) by a
+//!   name that is not one string literal, no string literal of them names the method,
+//!   and no extension body mentions it at all: those callers are out of reach of a
+//!   file-local edit;
 //! - every mention of the method in the file is a call, bare (`Имя(…)`) or through
 //!   `ЭтотОбъект.`/`ЭтаФорма.`; a name read in any other way (a handler handed to
 //!   `ДобавитьОбработчик`, a same-named variable) leaves the method as it is;
@@ -258,36 +259,63 @@ fn runs_dynamic_code(root: &SyntaxNode) -> bool {
     })
 }
 
-/// `Новый ОписаниеОповещения(Имя, …)` (or `Новый("ОписаниеОповещения", Имя, …)`) whose
-/// handler or error handler name is not one string literal: the platform calls whatever
-/// method the value names, with the arguments the platform passes.
+/// `Новый ОписаниеОповещения(Имя, …)` (or `Новый("ОписаниеОповещения", Имя, …)`) or
+/// `Элемент.УстановитьДействие("Событие", Имя)` whose handler name is not one string
+/// literal: the platform calls whatever method the value names, with the arguments the
+/// platform passes.
 fn binds_computed_callback(root: &SyntaxNode) -> bool {
-    root.descendants().filter(|node| node.kind() == SyntaxKind::NEW_EXPR).any(|new_expr| {
-        let Some(args) = new_expr.children().find(|node| node.kind() == SyntaxKind::ARG_LIST)
-        else {
-            return false;
-        };
-        let slots = list_slots(&args);
-        let base = match syntax::ast_utils::new_expr_type_name_token(&new_expr) {
-            Some(type_name) if is_notify_description(type_name.text()) => 0,
-            Some(_) => return false,
-            None => match slots.as_ref().and_then(|slots| slots.first()) {
-                Some(first)
-                    if string_literal(first).is_some_and(|name| is_notify_description(&name)) =>
-                {
-                    1
-                }
-                _ => return false,
-            },
-        };
-        let Some(slots) = slots else {
-            return true;
-        };
-        [base, base + 3]
-            .into_iter()
-            .filter_map(|index| slots.get(index))
-            .any(|slot| !slot.items.is_empty() && string_literal(slot).is_none())
+    root.descendants().any(|node| match node.kind() {
+        SyntaxKind::NEW_EXPR => notify_description_with_computed_name(&node),
+        SyntaxKind::CALL_EXPR => set_action_with_computed_name(&node),
+        _ => false,
     })
+}
+
+fn set_action_with_computed_name(call: &SyntaxNode) -> bool {
+    let is_set_action = call
+        .first_child()
+        .and_then(|callee| syntax::ast_utils::field_tail_name_token(&callee))
+        .is_some_and(|name| {
+            matches!(name.text().fold_lower().as_str(), "установитьдействие" | "setaction")
+        });
+    if !is_set_action {
+        return false;
+    }
+    let Some(args) = call.children().find(|node| node.kind() == SyntaxKind::ARG_LIST) else {
+        return false;
+    };
+    match list_slots(&args) {
+        Some(slots) => slots
+            .get(1)
+            .is_some_and(|slot| !slot.items.is_empty() && string_literal(slot).is_none()),
+        None => true,
+    }
+}
+
+fn notify_description_with_computed_name(new_expr: &SyntaxNode) -> bool {
+    let Some(args) = new_expr.children().find(|node| node.kind() == SyntaxKind::ARG_LIST) else {
+        return false;
+    };
+    let slots = list_slots(&args);
+    let base = match syntax::ast_utils::new_expr_type_name_token(new_expr) {
+        Some(type_name) if is_notify_description(type_name.text()) => 0,
+        Some(_) => return false,
+        None => match slots.as_ref().and_then(|slots| slots.first()) {
+            Some(first)
+                if string_literal(first).is_some_and(|name| is_notify_description(&name)) =>
+            {
+                1
+            }
+            _ => return false,
+        },
+    };
+    let Some(slots) = slots else {
+        return true;
+    };
+    [base, base + 3]
+        .into_iter()
+        .filter_map(|index| slots.get(index))
+        .any(|slot| !slot.items.is_empty() && string_literal(slot).is_none())
 }
 
 fn is_notify_description(name: &str) -> bool {

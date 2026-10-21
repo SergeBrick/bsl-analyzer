@@ -370,3 +370,24 @@ fn default_value_with_an_effect_blocks_the_fix() {
         "a constant default must not block"
     );
 }
+
+#[test]
+fn set_action_with_a_computed_name_blocks_the_fix() {
+    for binding in [
+        "Элементы.Склад.УстановитьДействие(\"НачалоВыбора\", \"Запи\" + \"сать\");",
+        "Элементы.Склад.УстановитьДействие(\"НачалоВыбора\", ИмяОбработчика);",
+        "Items.Warehouse.SetAction(\"StartChoice\", HandlerName);",
+    ] {
+        let source = with_call("", &format!("Записать(1, 2);\n    {binding}"));
+        assert_eq!(fixes(OBJECT_MODULE, &source), "UnusedParameters @ 1:28 no fix", "`{binding}`");
+    }
+
+    let control = with_call(
+        "",
+        "Записать(1, 2);\n    Элементы.Склад.УстановитьДействие(\"НачалоВыбора\", \"Другой\");",
+    );
+    assert!(
+        fixes(OBJECT_MODULE, &control).starts_with(CONTROL_FIX),
+        "a literal name of another method must not block"
+    );
+}

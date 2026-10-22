@@ -347,7 +347,7 @@ pub fn extract_variable_comments_at_offset(
     if let Some(first_ann) = first_annotation_offset {
         if first_ann < var_keyword_offset && var_keyword_offset <= file_text.len() {
             let block = &file_text[first_ann..var_keyword_offset];
-            for line in block.lines() {
+            for line in annotation_block_lines(block) {
                 let trimmed = line.trim();
                 if let Some(rest) = trimmed.strip_prefix("//") {
                     let comment_text = rest.trim();
@@ -408,6 +408,12 @@ fn scan_variable_trailing_comment(file_text: &str, var_end_offset: usize) -> Opt
     None
 }
 
+/// Lines between a variable's first annotation and its keyword. A lone `\r`
+/// ends a line as `\n` does; the empty pieces CRLF leaves hold no comment.
+fn annotation_block_lines(block: &str) -> impl Iterator<Item = &str> {
+    block.split(['\n', '\r'])
+}
+
 fn has_annotation_comments(
     var_keyword_offset: usize,
     source_text: &str,
@@ -424,7 +430,7 @@ fn has_annotation_comments(
 
     let annotation_block = &source_text[first_ann..var_keyword_offset];
 
-    for line in annotation_block.lines() {
+    for line in annotation_block_lines(annotation_block) {
         let trimmed = line.trim();
         if trimmed.starts_with("//") {
             return true;

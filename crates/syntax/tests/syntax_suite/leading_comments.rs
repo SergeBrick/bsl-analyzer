@@ -4,8 +4,8 @@
 //! разбирается полностью, и тест интеграционный.
 
 use syntax::{
-    ast_utils::has_variable_leading_description, comment_runs,
-    extract_leading_comment_lines_at_offset, extract_leading_comments,
+    ast_utils::{has_variable_description, has_variable_leading_description},
+    comment_runs, extract_leading_comment_lines_at_offset, extract_leading_comments,
     extract_leading_comments_at_offset, extract_variable_comments_at_offset, CommentRun,
     SyntaxKind,
 };
@@ -213,6 +213,23 @@ mod variable_comment_extractor_tests {
         let got =
             extract_variable_comments_at_offset(text, var_kw, var_end, None, &runs(text)).unwrap();
         assert_eq!(got, vec!["purpose".to_string()]);
+    }
+
+    #[test]
+    fn comment_between_annotation_and_variable_after_lone_cr() {
+        let text = "&НаСервере\r// описание\rПерем X;";
+        let got = extract_variable_comments_at_offset(
+            text,
+            off(text, "Перем"),
+            text.len(),
+            Some(off(text, "&")),
+            &runs(text),
+        );
+        assert_eq!(got, Some(vec!["описание".to_string()]));
+        // Корень вместо узла переменной: хвостового комментария за ним нет, и
+        // над аннотацией ничего нет — решает только блок между ними.
+        let root = parser::parse(text).syntax_node();
+        assert!(has_variable_description(&root, off(text, "Перем"), text, Some(off(text, "&"))));
     }
 
     #[test]

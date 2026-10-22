@@ -156,3 +156,60 @@ async fn negotiation_follows_the_client_not_the_server() {
          server is echoing offers instead of negotiating: {unsupported}"
     );
 }
+
+/// A client that probes with `server/discover` and, getting no answer in time, falls back to
+/// `initialize` must end up in the classic lifecycle: its later requests carry no inline
+/// `_meta`, and a server still latched on the probe rejects them with `-32602`, leaving the
+/// client without tools. Claude Code does exactly this when discover is slow on a cold help
+/// cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialize_after_a_discover_probe_still_lists_tools() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    tokio::spawn(serve_stream(server(), server_io));
+    let (read_half, mut write) = tokio::io::split(client_io);
+    let mut read = BufReader::new(read_half);
+
+    let discover = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "0"},
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}
+    });
+    let initialize = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "probe", "version": "0"}
+        }
+    });
+    let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let list_tools = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"});
+
+    for frame in [discover, initialize, initialized, list_tools] {
+        write.write_all(format!("{frame}\n").as_bytes()).await.expect("frame written");
+    }
+
+    let mut answers = Vec::new();
+    while answers.len() < 3 {
+        let mut line = String::new();
+        tokio::time::timeout(common::STATE_CEILING, read.read_line(&mut line))
+            .await
+            .expect("the server answers every request")
+            .expect("frame read");
+        let answer: Value = serde_json::from_str(&line).expect("the answer is JSON");
+        if answer.get("id").is_some() {
+            answers.push(answer);
+        }
+    }
+
+    let tools = &answers[2];
+    assert_eq!(tools["id"], json!(3), "answers arrive in request order: {answers:?}");
+    assert!(
+        tools["result"]["tools"].as_array().is_some_and(|tools| !tools.is_empty()),
+        "tools/list after a discover-then-initialize fallback was not answered with tools: \
+         {tools}"
+    );
+}

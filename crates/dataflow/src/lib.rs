@@ -72,8 +72,10 @@ pub trait Transfer<L: Lattice> {
 
     fn transfer_loop_var_bind(&self, _loop_var: hir_def::BindingId, _state: &mut L, _body: &Body) {}
 
-    /// Entry of `Попытка`: the state computed here flows both into the
-    /// protected statements and along the exception edge into the handler.
+    /// Transfer through the `Попытка` vertex. In a forward analysis the state
+    /// computed here flows both into the protected statements and along the
+    /// exception edge into the handler; a backward analysis receives the join
+    /// of both successors instead and flows the result to the predecessor.
     fn transfer_try_entry(&self, _try_stmt: hir_def::StmtId, _state: &mut L, _body: &Body) {}
 }
 

@@ -192,9 +192,16 @@ pub fn diagnostics_baseline(
     )
 }
 
-fn diagnostic_author_lines(start_line: usize, end_line: usize, end_column: usize) -> (u32, u32) {
+/// The 1-based blame lines a diagnostic covers. Blame numbers lines as git does, by `\n`
+/// alone, so `index` (of the blamed text) renumbers the diagnostic's LSP lines.
+fn diagnostic_author_lines(
+    index: &line_index::LineIndex,
+    start_line: usize,
+    end_line: usize,
+    end_column: usize,
+) -> (u32, u32) {
     let end_line = if end_line > start_line && end_column == 0 { end_line - 1 } else { end_line };
-    (start_line as u32 + 1, end_line as u32 + 1)
+    (index.lf_line(start_line as u32) + 1, index.lf_line(end_line as u32) + 1)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -791,6 +798,7 @@ fn analyze_salsa(
                                 .map(|d| {
                                     ide::diagnostics_baseline::diagnostic_line_snippet(
                                         &source_lines,
+                                        &file_line_index,
                                         d.start_line,
                                     )
                                 })
@@ -998,11 +1006,13 @@ fn analyze_salsa(
                 author_blame_us
                     .fetch_add(blame_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let before = file.diagnostics.len();
+                let line_index = line_index::LineIndex::new(&String::from_utf8_lossy(&bytes));
                 let kept: Vec<_> = file
                     .diagnostics
                     .iter()
                     .map(|diagnostic| {
                         let (start, end) = diagnostic_author_lines(
+                            &line_index,
                             diagnostic.start_line,
                             diagnostic.end_line,
                             diagnostic.end_column,
@@ -1170,8 +1180,19 @@ mod analyze_walk_tests {
 
     #[test]
     fn author_filter_uses_half_open_diagnostic_end() {
-        assert_eq!(diagnostic_author_lines(0, 1, 0), (1, 1));
-        assert_eq!(diagnostic_author_lines(0, 1, 1), (1, 2));
+        let index = line_index::LineIndex::new("а\nб\n");
+        assert_eq!(diagnostic_author_lines(&index, 0, 1, 0), (1, 1));
+        assert_eq!(diagnostic_author_lines(&index, 0, 1, 1), (1, 2));
+    }
+
+    #[test]
+    fn author_filter_counts_blame_lines_by_lf_alone() {
+        // LSP lines: 0 "а", 1 "", 2 "б", 3 "в"; blame lines: 1 "а\r\r", 2 "б\rв".
+        let index = line_index::LineIndex::new("а\r\r\nб\rв");
+        assert_eq!(diagnostic_author_lines(&index, 1, 1, 0), (1, 1));
+        assert_eq!(diagnostic_author_lines(&index, 2, 2, 1), (2, 2));
+        assert_eq!(diagnostic_author_lines(&index, 3, 3, 1), (2, 2));
+        assert_eq!(diagnostic_author_lines(&index, 0, 3, 0), (1, 2));
     }
 
     #[test]

@@ -13,7 +13,7 @@ fn is_column_ref_pattern(expr: &ExprHir) -> bool {
 }
 
 impl LoweringContext<'_> {
-    fn lower_in_subquery(&mut self, node: &syntax::SyntaxNode) -> SdblHir {
+    pub(super) fn lower_in_subquery(&mut self, node: &syntax::SyntaxNode) -> SdblHir {
         use syntax::ast::AstNode;
 
         let subquery_node = if node.kind() == syntax::SyntaxKind::SDBL_SUBQUERY {
@@ -194,7 +194,9 @@ impl LoweringContext<'_> {
             crate::source_map::TokenCategory::SpecialKeyword,
         );
 
-        let Some(root_node) = children.next() else {
+        // An error node stands for an item the parser already reported missing.
+        let mut roots = children.filter(|n| n.kind() != syntax::SyntaxKind::ERROR);
+        let Some(root_node) = roots.next() else {
             return ExprHir::BinaryOp {
                 lhs: Box::new(expr),
                 op: crate::hir::BinaryOp::Eq,
@@ -224,6 +226,19 @@ impl LoweringContext<'_> {
         }
 
         let root_expr = self.lower_expr(&root_node);
+        let more_roots: Vec<ExprHir> = roots.map(|n| self.lower_expr(&n)).collect();
+        if !more_roots.is_empty() {
+            // Several roots: membership in any of their hierarchies, as `В` is in any value.
+            let mut roots = vec![root_expr];
+            roots.extend(more_roots);
+            return ExprHir::In {
+                expr: Box::new(expr),
+                negated,
+                values: InValues::List(roots),
+                ty: SdblType::Boolean,
+                range: node.text_range(),
+            };
+        }
         let membership = ExprHir::BinaryOp {
             lhs: Box::new(expr),
             op: crate::hir::BinaryOp::Eq,

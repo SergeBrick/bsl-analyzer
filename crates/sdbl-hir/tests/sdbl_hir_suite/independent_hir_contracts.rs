@@ -5,7 +5,9 @@
 //! query ranges, nested-query HIRs, alias and field identity, and the semantic token
 //! categories the IDE paints.
 
-use sdbl_hir::{lower_sdbl_to_hir, ExprHir, FunctionKind, JoinType, SdblPackage, TokenCategory};
+use sdbl_hir::{
+    lower_sdbl_to_hir, ExprHir, FunctionKind, InValues, JoinType, SdblPackage, TokenCategory,
+};
 
 fn lower(input: &str) -> SdblPackage {
     lower_sdbl_to_hir(&parser::parse_sdbl(input), None)
@@ -387,6 +389,36 @@ fn negated_hierarchy_predicate_keeps_its_negation() {
         list(&format!("Т.Код НЕ В ИЕРАРХИИ {subquery}")),
         Some(ExprHir::In { negated: true, .. })
     ));
+}
+
+#[test]
+fn every_root_of_a_hierarchy_list_is_lowered() {
+    let prefix = "ВЫБРАТЬ Т.Код ИЗ Т КАК Т ГДЕ ";
+    let subquery = "(ВЫБРАТЬ К.Ссылка ИЗ Справочник.Товары КАК К)";
+    let where_of = |expression: &str| {
+        lower(&format!("{prefix}{expression}")).queries()[0].hir.where_clause.clone()
+    };
+    let roots = |expression: &str| match where_of(expression) {
+        Some(ExprHir::In { values: InValues::List(items), .. }) => items,
+        other => panic!("unexpected predicate {other:?} for {expression:?}"),
+    };
+    let is_lowered_subquery =
+        |root: &ExprHir| matches!(root, ExprHir::Subquery { query, .. } if !query.from.is_empty());
+
+    let first = roots(&format!("Т.Код В ИЕРАРХИИ ({subquery}, &Корень)"));
+    assert_eq!(first.len(), 2, "{first:?}");
+    assert!(is_lowered_subquery(&first[0]), "{first:?}");
+    assert!(matches!(first[1], ExprHir::Parameter { .. }), "{first:?}");
+
+    let last = roots(&format!("Т.Код НЕ В ИЕРАРХИИ (&Корень, {subquery})"));
+    assert_eq!(last.len(), 2, "{last:?}");
+    assert!(matches!(last[0], ExprHir::Parameter { .. }), "{last:?}");
+    assert!(is_lowered_subquery(&last[1]), "{last:?}");
+
+    // A missing item is reported by the parser and is no root of its own.
+    let gap = roots("Т.Код В ИЕРАРХИИ (&Корень1, , &Корень2)");
+    assert!(matches!(gap.as_slice(), [ExprHir::Parameter { .. }, ExprHir::Parameter { .. }]));
+    assert!(matches!(where_of("Т.Код В ИЕРАРХИИ (&Корень, )"), Some(ExprHir::BinaryOp { .. })));
 }
 
 #[test]

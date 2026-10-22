@@ -145,7 +145,8 @@ pub enum SdblTokenKind {
     #[token("%")]
     Percent,
 
-    #[regex(r"[0-9]+\.[0-9]+")]
+    /// The fraction may be empty: the platform reads `0.` as a number (8.3.17 and 8.3.27).
+    #[regex(r"[0-9]+\.[0-9]*")]
     Float,
 
     #[regex(r"[0-9]+")]

@@ -40,6 +40,12 @@ fn message(missing: &MissingMetadata, ctx: &AnalysisContext) -> String {
         MissingMetadata::PredefinedValue { kind: mdo, owner, value } => {
             format!("Predefined value \"{value}\" is not found in \"{}.{owner}\"", kind(mdo))
         }
+        MissingMetadata::TypeSet { name } if ru => {
+            format!("\"{name}\" - набор типов, а не тип: укажите тип вместе с именем объекта")
+        }
+        MissingMetadata::TypeSet { name } => {
+            format!("\"{name}\" is a set of types, not a type: name the type with its object")
+        }
     }
 }
 

@@ -40,6 +40,13 @@ impl LoweringContext<'_> {
                 }
             }
             SyntaxKind::SDBL_TUPLE_EXPR => self.lower_tuple_expr(node),
+            // A nested query standing as a value, such as an item of an `В` or
+            // `В ИЕРАРХИИ` list: lowered as a query so its tables and fields resolve.
+            SyntaxKind::SDBL_SUBQUERY_EXPR => ExprHir::Subquery {
+                query: Box::new(self.lower_in_subquery(node)),
+                ty: SdblType::Unknown,
+                range: node.text_range(),
+            },
             SyntaxKind::SDBL_LOGICAL_OR_EXPR
             | SyntaxKind::SDBL_LOGICAL_AND_EXPR
             | SyntaxKind::SDBL_COMPARISON_EXPR

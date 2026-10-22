@@ -603,12 +603,15 @@ fn member_path(p: &mut Parser) {
         }
 
         if at_property_name(p) {
-            // Same-line keyword after a dot is a member name; across a newline a
-            // clause keyword is a dangling-dot recovery point. See the column-ref
-            // dot loop.
-            if crossed_newline
-                && (super::select::is_clause_keyword(p) || super::at_query_boundary(p))
-            {
+            // The same recovery points as after a field's dot: across a newline any
+            // clause start, on the same line only the alias separator AS/КАК, which is
+            // never a field name.
+            let dangling_dot_recovery = if crossed_newline {
+                super::select::is_likely_clause_start_after_dot(p) || super::at_query_boundary(p)
+            } else {
+                super::select::at_sdbl_keyword(p, "AS", "КАК")
+            };
+            if dangling_dot_recovery {
                 let err = p.start();
                 p.error_custom_at_marker(err, "ожидалось имя поля, встречено ключевое слово");
                 break;

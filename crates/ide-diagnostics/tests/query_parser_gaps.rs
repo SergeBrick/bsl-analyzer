@@ -97,3 +97,13 @@ fn a_dereference_of_case_without_parentheses_is_rejected() {
          ИЗ Справочник.Справочник1 КАК Т",
     );
 }
+
+#[test]
+fn a_dangling_dot_after_parentheses_before_an_alias_is_rejected() {
+    assert_rejected("ВЫБРАТЬ (Т.Ссылка).КАК Н ИЗ Справочник.Справочник1 КАК Т");
+    // A module string literal goes on to a new line only through `|`, so the line break
+    // is checked on the bare route.
+    let across_lines = "ВЫБРАТЬ (Т.Ссылка).\nКАК Н ИЗ Справочник.Справочник1 КАК Т";
+    assert!(!bare_query_errors(across_lines).is_empty(), "bare route must reject {across_lines}");
+    assert_rejected("ВЫБРАТЬ ВЫРАЗИТЬ(Т.Ссылка КАК Справочник.Справочник1).КАК Н ИЗ Справочник.Справочник1 КАК Т");
+}

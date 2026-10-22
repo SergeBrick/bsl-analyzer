@@ -5126,6 +5126,27 @@ impl<'db> InferenceContext<'db> {
             return BareReceiverDispatch::Resolved(self.db.unknown());
         }
 
+        // The same holds for a member of the module's own object (`ЭтотОбъект.Реквизит`):
+        // in an object or record-set module the bare name denotes that member and wins over
+        // a same-named common module, exactly as on the bare-name read path. A member that
+        // reaches this dispatch is untyped (`<Type/>`) or has a type that does not lower
+        // (`Отбор`, `ЛюбаяСсылка`); its read already inferred to Unknown, so the call on it
+        // is not this call site's to judge.
+        if crate::this_object_attr::resolve_this_object_member(self.db, &resolver, module_name)
+            .is_some()
+            || crate::this_object_attr::resolve_this_record_set_member(
+                self.db,
+                &resolver,
+                module_name,
+            )
+            .is_some()
+        {
+            for arg in args {
+                self.infer_expr(*arg);
+            }
+            return BareReceiverDispatch::Resolved(self.db.unknown());
+        }
+
         if resolver.user_common_module_exists(self.db, module_name) {
             let arg_presence: Vec<bool> = args
                 .iter()

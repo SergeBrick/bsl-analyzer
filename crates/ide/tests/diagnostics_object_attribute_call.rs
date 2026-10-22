@@ -72,6 +72,20 @@ const CATALOG_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <DescriptionLength>25</DescriptionLength>
         </Properties>
         <ChildObjects>
+            <Attribute uuid="66666666-6666-6666-6666-666666666602">
+                <Properties>
+                    <Name>РеквизитБезТипа</Name>
+                    <Type/>
+                </Properties>
+            </Attribute>
+            <Attribute uuid="66666666-6666-6666-6666-666666666603">
+                <Properties>
+                    <Name>РеквизитОтбор</Name>
+                    <Type>
+                        <v8:Type>cfg:Filter</v8:Type>
+                    </Type>
+                </Properties>
+            </Attribute>
             <Attribute uuid="66666666-6666-6666-6666-666666666601">
                 <Properties>
                     <Name>РеквизитЛюбаяСсылка</Name>
@@ -170,8 +184,21 @@ fn data_processor_unlowered_type_attribute_method_call_silent() {
 }
 
 #[test]
+fn catalog_untyped_attribute_method_call_silent() {
+    let bsl = "Процедура Тест()\n    РеквизитБезТипа.Вставить(\"Ключ\", 1);\nКонецПроцедуры\n";
+    let found = unresolved_calls(CATALOG_OBJECT_MODULE, bsl);
+    assert!(
+        found.is_empty(),
+        "a call on an untyped attribute of the catalog's own object must stay silent, got {found:?}"
+    );
+}
+
+#[test]
 fn catalog_unlowered_type_attribute_method_call_silent() {
-    let bsl = "Процедура Тест()\n    РеквизитЛюбаяСсылка.ПолучитьОбъект();\nКонецПроцедуры\n";
+    let bsl = "Процедура Тест()\n    \
+        РеквизитОтбор.Сбросить();\n    \
+        РеквизитЛюбаяСсылка.ПолучитьОбъект();\n\
+        КонецПроцедуры\n";
     let found = unresolved_calls(CATALOG_OBJECT_MODULE, bsl);
     assert!(
         found.is_empty(),

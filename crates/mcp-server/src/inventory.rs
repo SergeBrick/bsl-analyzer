@@ -870,6 +870,7 @@ fn the_test_only_modules_are_the_ones_the_parent_gates() {
         [
             "check_executor_windows_tests.rs",
             "check_executor_wire_tests.rs",
+            "diagnostics_state/project_config_tests.rs",
             "diagnostics_state/test_support.rs",
             "graph/build/vector_lifecycle_tests.rs",
             "graph/portable_workspace_graph_tests.rs",

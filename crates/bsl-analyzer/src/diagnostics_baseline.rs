@@ -59,6 +59,7 @@ pub(crate) fn active_for_file(
                 code: output.code,
                 snippet: Some(ide::diagnostics_baseline::diagnostic_line_snippet(
                     &source_lines,
+                    &line_index,
                     output.start_line,
                 )),
                 message: output.message,

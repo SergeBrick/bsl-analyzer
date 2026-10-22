@@ -21,23 +21,48 @@ pub struct LineColRange {
     pub end_character: u32,
 }
 
+/// Line starts of a text, with line breaks as LSP counts them: `\n`, `\r\n` and a lone `\r`.
+///
+/// A lone `\r` is a line break for every LSP client (the specification names all three
+/// terminators), and an editor that normalises mixed line endings on load turns it into
+/// one. Counting `\n` only puts every position below such a `\r` one line too high, so a
+/// file with `\r\r\n` sequences drifts by one line per sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineIndex {
+    /// Offset just past each line terminator, i.e. the start of every line but the first.
     newlines: Box<[TextSize]>,
+    /// Lines whose terminator is a lone `\r`, ascending: git and every other `\n`-only
+    /// line counter see each of them joined with the line below.
+    lone_cr_lines: Box<[u32]>,
     len: TextSize,
 }
 
 impl LineIndex {
     pub fn new(text: &str) -> Self {
         let mut newlines = Vec::new();
+        let mut lone_cr_lines = Vec::new();
+        let bytes = text.as_bytes();
 
-        for (idx, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
+        for (idx, &byte) in bytes.iter().enumerate() {
+            let breaks = match byte {
+                b'\n' => true,
+                // `\r\n` is one terminator: the line starts after its `\n`.
+                b'\r' => bytes.get(idx + 1) != Some(&b'\n'),
+                _ => false,
+            };
+            if breaks {
+                if byte == b'\r' {
+                    lone_cr_lines.push(newlines.len() as u32);
+                }
                 newlines.push(TextSize::from((idx + 1) as u32));
             }
         }
 
-        Self { newlines: newlines.into_boxed_slice(), len: TextSize::of(text) }
+        Self {
+            newlines: newlines.into_boxed_slice(),
+            lone_cr_lines: lone_cr_lines.into_boxed_slice(),
+            len: TextSize::of(text),
+        }
     }
 
     #[inline]
@@ -45,11 +70,27 @@ impl LineIndex {
         (self.newlines.len() + 1) as u32
     }
 
+    /// The number `line` has when only `\n` breaks a line, as git counts lines for blame
+    /// and diff hunks: every lone `\r` above it stops counting. 0-based, like `line`.
+    pub fn lf_line(&self, line: u32) -> u32 {
+        line - self.lone_cr_lines.partition_point(|&lone_cr| lone_cr < line) as u32
+    }
+
+    /// Whether `line` is the `\r\n` half of a `\r\r\n`: an empty line for an LSP client,
+    /// but no line of the module for the platform, which reads the whole sequence as one
+    /// line break.
+    pub fn is_cr_crlf_tail(&self, text: &str, line: u32) -> bool {
+        let Some(start) = self.try_line_start(line) else { return false };
+        let start = usize::from(start);
+        start > 0 && text.as_bytes()[start - 1] == b'\r' && text[start..].starts_with("\r\n")
+    }
+
     /// Approximate live heap bytes for Salsa's `memory_usage` report: the boxed
-    /// `newlines` slice (one `TextSize` per `\n` in the file). The `len` field is
-    /// inline and owns no heap.
+    /// `newlines` slice (one `TextSize` per line break in the file) and the boxed
+    /// `lone_cr_lines` slice. The `len` field is inline and owns no heap.
     pub fn estimated_heap(&self) -> usize {
         self.newlines.len() * std::mem::size_of::<TextSize>()
+            + self.lone_cr_lines.len() * std::mem::size_of::<u32>()
     }
 
     pub fn line_col(&self, offset: TextSize) -> LineCol {
@@ -190,6 +231,30 @@ impl LineIndex {
     pub fn lines(&self) -> impl Iterator<Item = (u32, TextRange)> + '_ {
         (0..self.len_lines()).filter_map(|line| self.line_range(line).map(|range| (line, range)))
     }
+}
+
+/// The lines of `text` without their terminators, split exactly where [`LineIndex`]
+/// starts a new line, so the `n`-th item is the text of [`LineIndex`] line `n`.
+///
+/// Unlike [`str::lines`] a lone `\r` ends a line too; otherwise the two agree, including
+/// that a terminator at the very end does not open an empty last line.
+pub fn split_lines(text: &str) -> impl Iterator<Item = &str> + '_ {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let line = match rest.find(['\n', '\r']) {
+            Some(at) => {
+                let terminator = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+                let line = &rest[..at];
+                rest = &rest[at + terminator..];
+                line
+            }
+            None => std::mem::take(&mut rest),
+        };
+        Some(line)
+    })
 }
 
 pub trait LineIndexExt {

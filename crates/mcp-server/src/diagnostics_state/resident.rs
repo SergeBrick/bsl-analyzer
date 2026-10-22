@@ -462,7 +462,8 @@ pub(crate) fn diagnostic_survives_authors(
     let end_offset =
         if range.is_empty() { range.start() } else { range.end() - line_index::TextSize::from(1) };
     let end = index.line_col(end_offset).line;
-    keep.range_survives(start + 1, end + 1)
+    // Blame numbers lines as git does, by `\n` alone.
+    keep.range_survives(index.lf_line(start) + 1, index.lf_line(end) + 1)
 }
 
 /// Drop diagnostics attributed to ignored authors, counting what was dropped.
@@ -819,6 +820,7 @@ impl DiagnosticsResident {
                                     .to_string_lossy()
                                     .replace(std::path::MAIN_SEPARATOR, "/");
                                 let source_lines: Vec<_> = text.lines().collect();
+                                let line_index = line_index::LineIndex::new(&text);
                                 diagnostics
                                     .into_iter()
                                     .map(|d| {
@@ -830,6 +832,7 @@ impl DiagnosticsResident {
                                         snippet: Some(
                                             ide::diagnostics_baseline::diagnostic_line_snippet(
                                                 &source_lines,
+                                                &line_index,
                                                 output.start_line,
                                             ),
                                         ),

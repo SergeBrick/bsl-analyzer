@@ -37,7 +37,7 @@ pub(crate) fn active_for_file(
     }
     let Ok(relative) = path.strip_prefix(project_root) else { return diagnostics };
     let relative = relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-    let source_lines: Vec<_> = text.lines().collect();
+    let source_lines: Vec<_> = line_index::split_lines(text).collect();
     // One index for the file, not one per diagnostic: `to_output` builds its own.
     let line_index = line_index::LineIndex::new(text);
     // Diagnostics whose range runs past the text are dropped rather than converted:

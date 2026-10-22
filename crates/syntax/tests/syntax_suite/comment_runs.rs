@@ -95,6 +95,31 @@ fn code_after_lone_cr_breaks_the_run() {
 }
 
 #[test]
+fn lone_cr_between_comments_continues_the_run() {
+    // Для платформы одиночный `\r` — перевод строки: `// б` стоит на своей
+    // строке, соседней с `// а`.
+    let code = "// а\r// б\n// в\n";
+    let found = runs(code);
+    assert_eq!(found.len(), 1);
+    assert_eq!(owned_lines(code, &found[0]), vec![(0, true), (0, true), (1, true)]);
+    // Два одиночных `\r` — пустая строка между комментариями.
+    assert_eq!(runs("// а\r\r// б\n").len(), 2);
+}
+
+#[test]
+fn comment_after_code_and_lone_cr_owns_its_line() {
+    let code = "А = 1;\r// б\n";
+    assert_eq!(owned_lines(code, &runs(code)[0]), vec![(0, true)]);
+}
+
+#[test]
+fn code_line_ended_by_lone_cr_breaks_the_run() {
+    assert_eq!(run_lines("// а\n// б\nА = 1;\r// в\n// г\n"), vec![(0, 1), (2, 3)]);
+    // Контроль: `\r` перед `\n` — часть CRLF, а не отдельная строка.
+    assert_eq!(run_lines("// а\r\n// б\r\nА = 1; \r\n// в\r\n"), vec![(0, 1), (3, 3)]);
+}
+
+#[test]
 fn trailing_comment_is_in_the_run_without_owning_its_line() {
     let code = "А = 1; // хвост\n// своя\n// своя2\n";
 
@@ -173,7 +198,7 @@ mod string_text {
     }
 
     fn by_tokens(code: &str) -> Vec<(usize, usize)> {
-        comment_runs_of(&parser::line_tokens(code))
+        comment_runs_of(code, &parser::line_tokens(code))
             .iter()
             .map(|run| {
                 (line_at(code, run.range().start().into()), line_at(code, run.range().end().into()))

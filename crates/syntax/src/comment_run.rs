@@ -6,8 +6,9 @@
 //! включая хвостовой на строке с кодом. Поэтому примитив не решает за
 //! потребителя, а отдаёт факты о тексте — соседство строк и владение строкой.
 //!
-//! Соседство выражается через токены `NEWLINE`, а не через индекс строк: обход
-//! дерева и так идёт по тексту, и номера строк тут ничего не добавляют.
+//! Соседство выражается через переводы строки в токенах — `NEWLINE` и
+//! одиночные `\r`, — а не через индекс строк: обход дерева и так идёт по
+//! тексту, и номера строк тут ничего не добавляют.
 
 use crate::{LineToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange};
 
@@ -87,44 +88,81 @@ fn non_trivia_kind(token: &SyntaxToken, forward: bool) -> Option<SyntaxKind> {
 /// токенам текста: у серии нет свойства, которого не было бы у потока
 /// токенов, и два способа получить поток обязаны давать одну серию.
 pub fn comment_runs(root: &SyntaxNode) -> Vec<CommentRun> {
-    let tokens: Vec<LineToken> = root
+    let mut tokens = root
         .descendants_with_tokens()
         .filter_map(|element| match element {
-            NodeOrToken::Token(token) => {
-                Some(LineToken { kind: token.kind(), range: token.text_range() })
-            }
+            NodeOrToken::Token(token) => Some(token),
             NodeOrToken::Node(_) => None,
         })
-        .collect();
-    comment_runs_of(&tokens)
+        .peekable();
+    let mut line_tokens = Vec::new();
+    let mut line_breaks = Vec::new();
+    while let Some(token) = tokens.next() {
+        let next = tokens.peek().map(SyntaxToken::kind);
+        line_breaks.push(line_breaks_of(token.kind(), token.text(), next));
+        line_tokens.push(LineToken { kind: token.kind(), range: token.text_range() });
+    }
+    runs_of(&line_tokens, &line_breaks)
 }
 
 /// Серии комментариев по токенам текста без дерева: для блока строк,
-/// разобранного лексером отдельно от файла.
-pub fn comment_runs_of(tokens: &[LineToken]) -> Vec<CommentRun> {
-    collect_runs(
-        tokens
-            .iter()
-            .enumerate()
-            .map(|(index, token)| (token.kind, token.range, is_string_text_at(tokens, index))),
-    )
+/// разобранного лексером отдельно от файла; `text` — текст, по которому
+/// посчитаны `tokens`.
+pub fn comment_runs_of(text: &str, tokens: &[LineToken]) -> Vec<CommentRun> {
+    let line_breaks: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            let next = tokens.get(index + 1).map(|next| next.kind);
+            line_breaks_of(token.kind, &text[token.range], next)
+        })
+        .collect();
+    runs_of(tokens, &line_breaks)
 }
 
-fn collect_runs(tokens: impl Iterator<Item = (SyntaxKind, TextRange, bool)>) -> Vec<CommentRun> {
+fn runs_of(tokens: &[LineToken], line_breaks: &[usize]) -> Vec<CommentRun> {
+    collect_runs(tokens.iter().zip(line_breaks).enumerate().map(|(index, (token, &breaks))| {
+        (token.kind, token.range, breaks, is_string_text_at(tokens, index))
+    }))
+}
+
+/// Переводы строки, которые несёт токен. Кроме `NEWLINE` это одиночные `\r`
+/// пробельного токена: платформа считает их переводом строки, и комментарий
+/// на них кончается. `\r` в конце пробельного токена перед `NEWLINE` — часть
+/// того же перевода, как и в лексеме комментария.
+fn line_breaks_of(kind: SyntaxKind, text: &str, next: Option<SyntaxKind>) -> usize {
+    match kind {
+        SyntaxKind::NEWLINE => 1,
+        SyntaxKind::WHITESPACE => {
+            let carriage_returns = text.matches('\r').count();
+            if next == Some(SyntaxKind::NEWLINE) {
+                carriage_returns - (text.len() - text.trim_end_matches('\r').len())
+            } else {
+                carriage_returns
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn collect_runs(
+    tokens: impl Iterator<Item = (SyntaxKind, TextRange, usize, bool)>,
+) -> Vec<CommentRun> {
     let mut runs = Vec::new();
     let mut current: Vec<CommentLine> = Vec::new();
     let mut at_line_start = true;
     let mut newlines = 0usize;
 
-    for (kind, range, string_text) in tokens {
+    for (kind, range, line_breaks, string_text) in tokens {
         match kind {
-            SyntaxKind::NEWLINE => {
-                newlines += 1;
-                at_line_start = true;
-            }
             // Отступ строку не начинает и не кончает; `\r` в CRLF приходит
             // отдельным пробельным токеном ровно на пустой строке.
-            SyntaxKind::WHITESPACE | SyntaxKind::BOM => {}
+            SyntaxKind::NEWLINE | SyntaxKind::WHITESPACE | SyntaxKind::BOM => {
+                if line_breaks > 0 {
+                    newlines += line_breaks;
+                    at_line_start = true;
+                }
+            }
             SyntaxKind::COMMENT => {
                 // Строку многострочного литерала, начинающуюся с `//`, лексер
                 // отдаёт токеном комментария; комментарием она от этого не
@@ -141,16 +179,11 @@ fn collect_runs(tokens: impl Iterator<Item = (SyntaxKind, TextRange, bool)>) -> 
                 at_line_start = false;
                 newlines = 0;
             }
-            // Код перед комментарием серию не закрывает: строка кода между
-            // сериями и так даёт два `NEWLINE`. Код сразу за комментарием, без
-            // `NEWLINE`, бывает только за одиночным `\r` - для платформы это уже
-            // следующая строка, и серия на нём кончается.
-            _ => {
-                if newlines == 0 && !current.is_empty() {
-                    push_run(&mut runs, std::mem::take(&mut current));
-                }
-                at_line_start = false;
-            }
+            // Код серию не закрывает: комментарий кончается вместе со строкой,
+            // поэтому между комментариями соседних строк может стоять только
+            // код той же строки, а строка кода между сериями и так даёт два
+            // перевода строки.
+            _ => at_line_start = false,
         }
     }
 

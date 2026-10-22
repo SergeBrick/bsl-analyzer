@@ -16,7 +16,12 @@ pub fn apply_features_to_db(db: &mut RootDatabaseImpl, features: &FeaturesConfig
     db.set_env_options(env_options_from_features(features));
 }
 
-/// Apply every project-level semantic input shared by LSP, MCP and batch analysis.
+/// The `bsl-analyzer.toml` settings shared by LSP, MCP and batch analysis.
+///
+/// Rebuilds the execution model from `[features]` rather than merging into it, so
+/// it runs before [`apply_configuration_xml_settings_to_db`]: what `Configuration.xml`
+/// states would otherwise be reset to defaults. [`apply_project_to_db`] keeps that
+/// order.
 pub fn apply_project_config_to_db(db: &mut RootDatabaseImpl, config: &ProjectConfig) {
     apply_features_to_db(db, &config.features);
     let target = config.target_platform_version.as_deref().map(Arc::<str>::from);

@@ -924,3 +924,19 @@ fn crlf_and_lf_parity_modulo_line_ending() {
     let out_crlf = format_crlf(&src_crlf);
     assert_eq!(out_crlf, out_lf.replace('\n', "\r\n"));
 }
+
+#[test]
+fn lone_cr_after_comment_keeps_the_code_out_of_it() {
+    // Одиночный `\r` заканчивает комментарий, и код за ним компилируется:
+    // пробел или пустота на его месте увели бы код в комментарий.
+    for (input, kept) in [
+        ("Процедура Т()\r\n\tЕсли А // к\rИ Б Тогда\r\n\t\tВ = 1;\r\n\tКонецЕсли;\r\nКонецПроцедуры\r\n", "// к\rИ Б Тогда"),
+        ("Процедура Т()\n\tА = 1 // к\r+ 2;\nКонецПроцедуры\n", "// к\r+ 2;"),
+        ("Процедура Т()\n\tА = Новый Массив(1 // к\r);\nКонецПроцедуры\n", "// к\r);"),
+        ("Процедура Т()\n\t// а\r// б\n\tА = 1;\nКонецПроцедуры\n", "// а\r// б"),
+    ] {
+        let parsed = parser::parse(input);
+        let result = format_file(&parsed.syntax_node(), &FormattingConfig::default());
+        assert!(result.text.contains(kept), "{input:?} formatted to {:?}", result.text);
+    }
+}

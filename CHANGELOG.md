@@ -103,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/) in the `0
 
 ### Fixed
 
+- mcp: клиент, перешедший с `server/discover` на `initialize`, снова получает инструменты.
+  Так поступает Claude Code, если на discover нет ответа ~3 с. Это бывает на холодном
+  кэше справки, когда сервер собирает индекс около 12 с. rmcp 3.1.4 оставляла соединение
+  в inline-lifecycle, и `tools/list` без `_meta` получал `-32602`. Теперь `rmcp` 3.6.0,
+  минимум 3.5.1, где это исправлено (modelcontextprotocol/rust-sdk#1248). Вместо
+  устаревшего в этих версиях `model::ServerInfo` используется `ServerConfig`.
 - diagnostics: `UnusedParameters` больше не сообщает о параметрах обработчика операции
   веб-сервиса и обработчика получения сообщения сервиса интеграции: их сигнатуру задаёт
   описание сервиса, как у обработчика HTTP-сервиса.

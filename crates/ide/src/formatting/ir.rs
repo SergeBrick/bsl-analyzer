@@ -275,6 +275,12 @@ fn decide_inline_gap(
         return GapDecision::Preserve;
     };
 
+    // Комментарий без `\n` за ним кончился на одиночном `\r`, а это перевод
+    // строки: пробел на его месте увёл бы следующий код в комментарий.
+    if prev == SyntaxKind::COMMENT {
+        return GapDecision::Preserve;
+    }
+
     if prev_was_unary {
         return GapDecision::None;
     }

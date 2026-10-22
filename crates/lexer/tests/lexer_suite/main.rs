@@ -2,6 +2,7 @@
 //! target: each file a module, so the crate links one test binary instead of one per file.
 
 mod case_fold_matches_lexer;
+mod lone_cr_comment;
 mod sdbl_golden_corpus;
 mod sdbl_slice1_addendum_braces;
 mod sdbl_slice1_core;

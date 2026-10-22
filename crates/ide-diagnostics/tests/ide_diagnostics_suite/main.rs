@@ -8,6 +8,7 @@ mod data_exchange_and_unused_method_fixes;
 mod diagnostic_quick_fixes;
 mod handlers_bound_from_another_module;
 mod inline_extension_directives;
+mod lone_cr_ends_comment;
 mod name_resolution_correctness;
 mod platform_fact_characterization;
 mod platform_membership_characterization;

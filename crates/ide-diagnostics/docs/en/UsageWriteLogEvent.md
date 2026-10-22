@@ -10,7 +10,7 @@ The current diagnostic checks several practical rules:
 - the second parameter, log level, must be specified explicitly;
 - the fifth parameter, comment, must not be empty;
 - inside `Except`, the log level should be `Error`;
-- inside `Except`, the comment should contain `DetailErrorDescription(ErrorInfo())`, unless the same exception path re-raises the error.
+- inside `Except`, the comment should contain `DetailErrorDescription(ErrorInfo())`, unless the same exception path re-raises the error. The detail may reach the comment through a variable or a field assigned earlier in the same `Except` branch, also concatenated or passed through a string function (`Text = Header + DetailErrorDescription(Info)`, where `Info = ErrorInfo()`); the last such assignment before the call counts.
 
 This rule is intentionally practical rather than formal. It helps catch incomplete or misleading event-log writes, especially in exception handling paths.
 

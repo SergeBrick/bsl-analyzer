@@ -1,7 +1,9 @@
 use bsl_platform::capability::{Category as CapabilityCategory, EntryKind as CapabilityEntryKind};
 use intern::NormName;
 use stdx::case::CaseExt;
-use syntax::ast_utils::{active_children, active_children_with_tokens, field_tail_name_token};
+use syntax::ast_utils::{
+    active_children, active_children_with_tokens, field_tail_name_token, significant_tokens,
+};
 use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 use crate::body::{
@@ -1413,12 +1415,20 @@ fn trace_value(
     targets: &[&str],
     values: &[TracedValue],
 ) -> TracedValue {
-    let last_value =
-        |target: &str| last_assignment_before(assignments, target, before).map(|i| values[i]);
+    let last_value = |target: &str| {
+        let last = last_assignment_before(assignments, target, before)?;
+        // A later write to a part of the path (its object, a field on the way
+        // or an index variable) leaves the stored value behind.
+        let outdated = assignments[last + 1..]
+            .iter()
+            .take_while(|a| a.start < before)
+            .any(|a| is_path_part(target, &a.target));
+        (!outdated).then_some(values[last])
+    };
     let is_error_info = |text: &str| {
         text.contains("информацияобошибке")
             || text.contains("errorinfo")
-            || (is_plain_identifier(text) && last_value(text).is_some_and(|v| v.error_info))
+            || last_value(text).is_some_and(|v| v.error_info)
     };
     let detail_error = detail_call_arguments(text).into_iter().any(is_error_info)
         || targets.iter().any(|target| {
@@ -1480,6 +1490,14 @@ fn references_path(text: &str, path: &str) -> bool {
     })
 }
 
+/// `part` names the object of `path`, a field on the way to it or a variable
+/// used in one of its indexes.
+fn is_path_part(path: &str, part: &str) -> bool {
+    let names_object =
+        path.strip_prefix(part).is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['));
+    names_object || (part != path && references_path(path, part))
+}
+
 fn is_identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -1491,7 +1509,8 @@ fn is_plain_identifier(text: &str) -> bool {
 /// Lower-cased code of `node` without trivia and without the text an extension
 /// removed. A string literal piece is spelled as the hex of its lower-cased
 /// text: `Поля["А"]` stays apart from `Поля["Б"]`, and a name written inside
-/// a string is not taken for code.
+/// a string is not taken for code. A key that is a valid name is spelled as a
+/// field, since `Структура["Текст"]` reads the same value as `Структура.Текст`.
 fn normalized_code_text(node: &SyntaxNode) -> String {
     let mut text = String::new();
     push_normalized_code(node, &mut text);
@@ -1499,6 +1518,12 @@ fn normalized_code_text(node: &SyntaxNode) -> String {
 }
 
 fn push_normalized_code(node: &SyntaxNode, text: &mut String) {
+    if let Some((object, key)) = name_key_access(node) {
+        push_normalized_code(&object, text);
+        text.push('.');
+        text.push_str(&key.fold_lower());
+        return;
+    }
     for element in active_children_with_tokens(node) {
         if let Some(child) = element.as_node() {
             push_normalized_code(child, text);
@@ -1520,6 +1545,27 @@ fn push_normalized_code(node: &SyntaxNode, text: &mut String) {
             _ => text.push_str(&token.text().fold_lower()),
         }
     }
+}
+
+/// The object and the key of `Объект["Ключ"]` when the key is a valid name.
+fn name_key_access(node: &SyntaxNode) -> Option<(SyntaxNode, String)> {
+    if node.kind() != SyntaxKind::INDEX_EXPR {
+        return None;
+    }
+    let mut children = active_children(node);
+    let object = children.next()?;
+    let index = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    let mut tokens = significant_tokens(&index);
+    let token = tokens.next()?;
+    if token.kind() != SyntaxKind::STRING || tokens.next().is_some() {
+        return None;
+    }
+    let key = token.text().strip_prefix('"')?.strip_suffix('"')?;
+    let starts_as_name = key.chars().next().is_some_and(|c| !c.is_numeric());
+    (starts_as_name && is_plain_identifier(key)).then(|| (object, key.to_owned()))
 }
 
 fn extract_type_name_from_first_arg(node: &SyntaxNode) -> Option<String> {

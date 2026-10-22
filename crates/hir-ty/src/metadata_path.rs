@@ -22,7 +22,6 @@
 use std::str::FromStr;
 
 use bsl_metadata::MdoType;
-use bsl_types::kind::MetadataKind;
 use stdx::case::CaseExt;
 
 use crate::object_resolver::ObjectResolver;
@@ -85,12 +84,17 @@ pub(crate) fn missing_metadata(
         // The platform trims the names and skips an empty one between commas; a
         // trailing comma or a blank string is accepted by one version and rejected by
         // another, so an empty name is not judged.
-        MetadataPathFunction::TypeDescription => text
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .filter_map(|name| missing_type(name, resolver))
-            .collect(),
+        MetadataPathFunction::TypeDescription => {
+            let mut missing = Vec::new();
+            for name in text.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+                if let Some(miss) = missing_type(name, resolver) {
+                    if !missing.contains(&miss) {
+                        missing.push(miss);
+                    }
+                }
+            }
+            missing
+        }
         MetadataPathFunction::Type => missing_type(text, resolver).into_iter().collect(),
         MetadataPathFunction::Form | MetadataPathFunction::PredefinedValue => {
             missing_object_path(function, text, resolver).into_iter().collect()
@@ -120,12 +124,14 @@ fn missing_type(text: &str, resolver: &dyn ObjectResolver) -> Option<MissingMeta
 /// A kind prefix written without the object name. `ОтчетОбъект` / `ReportObject` is the
 /// exception: a type of its own on the server (`Тип("ОтчетОбъект")` and
 /// `Новый ОписаниеТипов("ОтчетОбъект")` succeed there and fail on the client), so it is
-/// not judged. The prefix is matched as written: the platform does not read «ё» as «е»
-/// in a bare name (`ОтчётОбъект` fails where `ОтчетОбъект` succeeds).
+/// not judged. Only the «е» spelling is exempt: the platform does not read «ё» as «е»
+/// in a bare name (`ОтчётОбъект` fails where `ОтчетОбъект` succeeds), so any other kind
+/// spelled with «ё» fails all the same.
 fn type_set(name: &str) -> Option<MissingMetadata> {
-    let is_set = matches!(name.fold_lower().as_str(), "любаяссылка" | "anyref")
-        || crate::lower::metadata_kind_from_prefix(name)
-            .is_some_and(|kind| !matches!(kind, MetadataKind::ReportObject));
+    let folded = name.fold_lower();
+    let is_set = matches!(folded.as_str(), "любаяссылка" | "anyref")
+        || (crate::lower::metadata_kind_from_prefix(&kind_spelling(name)).is_some()
+            && !matches!(folded.as_str(), "отчетобъект" | "reportobject"));
     is_set.then(|| MissingMetadata::TypeSet { name: name.to_string() })
 }
 

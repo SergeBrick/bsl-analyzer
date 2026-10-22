@@ -77,7 +77,9 @@ pub(super) fn is_completed_elsewhere(literal: &SyntaxNode, query_text: &str) -> 
 fn is_substitution_source(literal: &SyntaxNode) -> bool {
     let mut top = unwrap_up(literal);
     while let Some(parent) = top.parent() {
-        if parent.kind() == SyntaxKind::TERNARY_EXPR && !is_ternary_condition(&parent, &top) {
+        if is_concatenation(&parent)
+            || (parent.kind() == SyntaxKind::TERNARY_EXPR && !is_ternary_condition(&parent, &top))
+        {
             top = unwrap_up(&parent);
         } else {
             break;
@@ -145,44 +147,35 @@ fn completion_after(
                 }
                 if children
                     .next()
-                    .is_some_and(|rhs| holders.contains(&normalized(&unwrap_down(&rhs))))
+                    .is_some_and(|rhs| is_holder_or_owner(&unwrap_down(&rhs), holders))
                 {
                     // An alias retains this value even if the original holder changes later.
                     return Some(false);
                 }
             }
         }
-        if node.kind() == SyntaxKind::RETURN_STMT
-            && active_children(node)
-                .any(|value| holders.contains(&normalized(&unwrap_down(&value))))
+        if (matches!(node.kind(), SyntaxKind::RETURN_STMT | SyntaxKind::CALL_EXPR)
+            || (node.kind() == SyntaxKind::NEW_EXPR && is_query_constructor(node)))
+            && reads_holder(node, holders)
         {
             return Some(false);
         }
-        if (node.kind() == SyntaxKind::NEW_EXPR && is_query_constructor(node))
-            || node.kind() == SyntaxKind::CALL_EXPR
-        {
-            // A call can consume a string or execute the query object that owns it.
-            if active_children(node).any(|child| {
-                holders.contains(&normalized(&unwrap_down(&child)))
-                    || (child.kind() == SyntaxKind::ARG_LIST
-                        && active_children(&child)
-                            .any(|arg| holders.contains(&normalized(&unwrap_down(&arg)))))
-                    || (child.kind() == SyntaxKind::FIELD_EXPR
-                        && active_children(&child).next().is_some_and(|receiver| {
-                            let receiver = normalized(&receiver);
-                            holders.iter().any(|holder| {
-                                holder
-                                    .strip_suffix(".текст")
-                                    .or_else(|| holder.strip_suffix(".text"))
-                                    == Some(receiver.as_str())
-                            })
-                        }))
-            }) {
-                return Some(false);
-            }
-        }
     }
     active_children(node).find_map(|child| completion_after(&child, after, holders))
+}
+
+fn is_holder_or_owner(node: &SyntaxNode, holders: &[String]) -> bool {
+    let name = normalized(node);
+    holders.contains(&name)
+        || holders.iter().any(|holder| {
+            holder.strip_suffix(".текст").or_else(|| holder.strip_suffix(".text"))
+                == Some(name.as_str())
+        })
+}
+
+fn reads_holder(node: &SyntaxNode, holders: &[String]) -> bool {
+    is_holder_or_owner(node, holders)
+        || active_children(node).any(|child| reads_holder(&child, holders))
 }
 
 fn completes_holder(value: &SyntaxNode, holders: &[String]) -> bool {

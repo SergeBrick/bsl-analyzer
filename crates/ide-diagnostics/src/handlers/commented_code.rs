@@ -133,7 +133,7 @@ pub fn check_block(ctx: &AnalysisContext, block: &Block) -> Vec<Diagnostic<Local
 
     // Владения строкой диагностика не требует: комментарий за кодом — такой же
     // кандидат в закомментированный код, как стоящий на своей строке.
-    for run in syntax::comment_runs_of(block.tokens) {
+    for run in syntax::comment_runs_of(text, block.tokens) {
         if is_commented_code(&run, text, &config) {
             // Deleting commented-out code is destructive and easy to regret, so it is an
             // opt-in quick fix, never part of an unattended `source.fixAll` sweep. The whole

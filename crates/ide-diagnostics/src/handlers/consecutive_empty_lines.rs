@@ -61,6 +61,10 @@ fn scan_consecutive_empty_lines(
 
     for line in 0..num_lines {
         let line_start = line_index.line_start(line);
+        // No blank line of the module: neither empty nor ending a run of empty ones.
+        if line_index.is_cr_crlf_tail(text, line) {
+            continue;
+        }
         let line_range = line_index.line_range(line);
 
         let is_empty = if let Some(range) = line_range {

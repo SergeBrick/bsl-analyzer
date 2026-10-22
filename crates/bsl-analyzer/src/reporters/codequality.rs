@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 
-use ide::diagnostics_baseline::{diagnostic_fingerprint, normalize_diagnostic_snippet};
+use ide::diagnostics_baseline::{diagnostic_fingerprint, diagnostic_line_snippet};
 
 use super::{AnalysisResults, FileAnalysis, Reporter};
 
@@ -55,14 +55,20 @@ impl Serialize for CodeQualitySeq<'_> {
             // once and normalizing its lines here, so the fingerprint keeps the
             // same source-line identity instead of silently degrading to
             // path+code+occurrence only.
-            let fallback_lines: Option<Vec<String>> =
+            let fallback_snippets: Option<Vec<String>> =
                 if file.line_snippets.is_empty() && !file.diagnostics.is_empty() {
-                    std::fs::read_to_string(&file.path)
-                        .ok()
-                        .map(|text| text.lines().map(normalize_diagnostic_snippet).collect())
+                    std::fs::read_to_string(&file.path).ok().map(|text| {
+                        let lines: Vec<_> = text.lines().collect();
+                        let index = line_index::LineIndex::new(&text);
+                        file.diagnostics
+                            .iter()
+                            .map(|d| diagnostic_line_snippet(&lines, &index, d.start_line))
+                            .collect()
+                    })
                 } else {
                     None
                 };
+            let snippets = fallback_snippets.as_ref().unwrap_or(&file.line_snippets);
 
             // Pair each finding with its source line, then sort the pairs together
             // so the snippet stays aligned with its finding through the canonical
@@ -71,13 +77,7 @@ impl Serialize for CodeQualitySeq<'_> {
                 .diagnostics
                 .iter()
                 .enumerate()
-                .map(|(i, d)| {
-                    let snippet = match &fallback_lines {
-                        Some(lines) => lines.get(d.start_line).map(String::as_str).unwrap_or(""),
-                        None => file.line_snippets.get(i).map(String::as_str).unwrap_or(""),
-                    };
-                    (d, snippet)
-                })
+                .map(|(i, d)| (d, snippets.get(i).map(String::as_str).unwrap_or("")))
                 .collect();
             rows.sort_by(|(a, _), (b, _)| {
                 (a.start_line, a.start_column, a.end_line, a.end_column, &a.code, &a.message).cmp(

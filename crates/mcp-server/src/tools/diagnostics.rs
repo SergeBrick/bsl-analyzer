@@ -2481,6 +2481,46 @@ mod tests {
             assert!(sweep.author_head.is_some());
         }
 
+        /// Blame numbers lines by `\n` alone: below a `\r\r\n` the developer's line is one
+        /// blame line higher than its LSP line, and the vendor's line sits right under it.
+        #[test]
+        fn author_filter_maps_lines_below_a_lone_cr_to_blame_lines() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let vendor = "Процедура Тест()\r\r\n    А = 1;\r\n    Б = 2;\r\n    В = В;\r\nКонецПроцедуры\r\n";
+            write_common_module(root, "Сервер", vendor);
+            write(root, "bsl-analyzer.toml", "[analysis]\nignored_authors = [\"Фирма Тест\"]\n");
+            run_git(root, &["init", "-q"]);
+            run_git(root, &["add", "."]);
+            run_git(root, &["commit", "-q", "-m", "vendor"]);
+            let path = root.join("CommonModules/Сервер/Ext/Module.bsl");
+            fs::write(&path, vendor.replace("Б = 2;", "Б = Б;")).unwrap();
+            run_git(
+                root,
+                &[
+                    "-c",
+                    "user.name=Разработчик",
+                    "-c",
+                    "user.email=dev@example.com",
+                    "commit",
+                    "-q",
+                    "-am",
+                    "own",
+                ],
+            );
+
+            let state = ready_state(root);
+            let body = run(&state, &path, &default_filters());
+            let self_assign_lines: Vec<_> = body["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["code"] == "SelfAssign")
+                .map(|finding| finding["range"]["start_line"].as_u64().unwrap())
+                .collect();
+            assert_eq!(self_assign_lines, [3], "only the developer's `Б = Б;` survives: {body}");
+        }
+
         /// The project's diagnostics settings reach the findings end-to-end, not just
         /// the resident's stored config: the same module yields a LineLength finding
         /// under a tiny threshold and none under a huge one.

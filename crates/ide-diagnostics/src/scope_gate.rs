@@ -58,8 +58,9 @@ pub(crate) fn apply(
         } else {
             d.range.end() - line_index::TextSize::from(1)
         };
-        let start = line_index.try_line_col(d.range.start()).map(|lc| lc.line);
-        let end = line_index.try_line_col(end_offset).map(|lc| lc.line);
+        // Hunks number lines as git does, by `\n` alone.
+        let start = line_index.try_line_col(d.range.start()).map(|lc| line_index.lf_line(lc.line));
+        let end = line_index.try_line_col(end_offset).map(|lc| line_index.lf_line(lc.line));
         match (start, end) {
             (Some(start), Some(end)) => scope.lines_in_scope(&path, start, end),
             // An unmappable range never silently drops a diagnostic.
@@ -153,6 +154,27 @@ mod tests {
             !has_self_assign(&off_changed_line),
             "a diagnostic on an unchanged line must be dropped: {off_changed_line:?}"
         );
+    }
+
+    /// A lone `\r` breaks a line for the diagnostic, not for git: the self-assignment is
+    /// on LSP line 4 but on line 3 of the hunks, since `\r\r\n` ends one git line.
+    #[test]
+    fn line_gate_counts_hunk_lines_by_lf_alone() {
+        use ide_db::base_db::SourceDatabase;
+
+        let code = "Процедура Тест()\r\r\n    А = 1;\r\n    А = А;\r\nКонецПроцедуры\r\n";
+        // The fixture parser normalises line endings, so the raw text goes in afterwards.
+        let (mut db, file_id) = create_test_db("");
+        db.set_file_text(file_id, code);
+        let diagnostics_with_hunk = |hunk: [u32; 2]| {
+            crate::file_diagnostics(&db, file_id, &config_with_scope(scope_for(Some(vec![hunk]))))
+        };
+
+        let on_changed_line = diagnostics_with_hunk([3, 3]);
+        assert!(has_self_assign(&on_changed_line), "{on_changed_line:?}");
+
+        let off_changed_line = diagnostics_with_hunk([4, 4]);
+        assert!(!has_self_assign(&off_changed_line), "{off_changed_line:?}");
     }
 
     /// The suppression module's meta-diagnostics point at the directive, not at a code

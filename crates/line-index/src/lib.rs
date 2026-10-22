@@ -31,12 +31,16 @@ pub struct LineColRange {
 pub struct LineIndex {
     /// Offset just past each line terminator, i.e. the start of every line but the first.
     newlines: Box<[TextSize]>,
+    /// Lines whose terminator is a lone `\r`, ascending: git and every other `\n`-only
+    /// line counter see each of them joined with the line below.
+    lone_cr_lines: Box<[u32]>,
     len: TextSize,
 }
 
 impl LineIndex {
     pub fn new(text: &str) -> Self {
         let mut newlines = Vec::new();
+        let mut lone_cr_lines = Vec::new();
         let bytes = text.as_bytes();
 
         for (idx, &byte) in bytes.iter().enumerate() {
@@ -47,11 +51,18 @@ impl LineIndex {
                 _ => false,
             };
             if breaks {
+                if byte == b'\r' {
+                    lone_cr_lines.push(newlines.len() as u32);
+                }
                 newlines.push(TextSize::from((idx + 1) as u32));
             }
         }
 
-        Self { newlines: newlines.into_boxed_slice(), len: TextSize::of(text) }
+        Self {
+            newlines: newlines.into_boxed_slice(),
+            lone_cr_lines: lone_cr_lines.into_boxed_slice(),
+            len: TextSize::of(text),
+        }
     }
 
     #[inline]
@@ -59,11 +70,18 @@ impl LineIndex {
         (self.newlines.len() + 1) as u32
     }
 
+    /// The number `line` has when only `\n` breaks a line, as git counts lines for blame
+    /// and diff hunks: every lone `\r` above it stops counting. 0-based, like `line`.
+    pub fn lf_line(&self, line: u32) -> u32 {
+        line - self.lone_cr_lines.partition_point(|&lone_cr| lone_cr < line) as u32
+    }
+
     /// Approximate live heap bytes for Salsa's `memory_usage` report: the boxed
-    /// `newlines` slice (one `TextSize` per line break in the file). The `len` field is
-    /// inline and owns no heap.
+    /// `newlines` slice (one `TextSize` per line break in the file) and the boxed
+    /// `lone_cr_lines` slice. The `len` field is inline and owns no heap.
     pub fn estimated_heap(&self) -> usize {
         self.newlines.len() * std::mem::size_of::<TextSize>()
+            + self.lone_cr_lines.len() * std::mem::size_of::<u32>()
     }
 
     pub fn line_col(&self, offset: TextSize) -> LineCol {

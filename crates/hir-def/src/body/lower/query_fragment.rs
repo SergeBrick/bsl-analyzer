@@ -55,10 +55,14 @@ pub(super) fn concat_role(literal: &SyntaxNode) -> ConcatRole {
             None => return ConcatRole::Dynamic,
         }
     }
-    match pieces.first() {
-        Some(ConcatPiece::Literal(first)) if first == literal => ConcatRole::Head(pieces),
-        Some(ConcatPiece::Literal(_)) => ConcatRole::Tail,
-        _ => ConcatRole::Dynamic,
+    let first_literal = pieces.iter().find_map(|piece| match piece {
+        ConcatPiece::Literal(node) => Some(node),
+        ConcatPiece::Char(..) => None,
+    });
+    if first_literal == Some(literal) {
+        ConcatRole::Head(pieces)
+    } else {
+        ConcatRole::Tail
     }
 }
 
@@ -102,18 +106,95 @@ fn is_substitution_source(literal: &SyntaxNode) -> bool {
         _ => return false,
     };
     let holders = equivalent_holders(&holder);
+    let Some(assignment) = literal.ancestors().find(|n| n.kind() == SyntaxKind::ASSIGN_STMT) else {
+        return false;
+    };
     let Some(body) = literal.ancestors().last() else { return false };
-    body.descendants().any(|node| {
-        if is_concatenation(&node) {
-            let mut operands = Vec::new();
-            collect_operands(&node, &mut operands);
-            operands.iter().any(|operand| holders.contains(&normalized(operand)))
-        } else if node.kind() == SyntaxKind::CALL_EXPR && is_substitution_call(&node) {
-            first_argument(&node).is_some_and(|arg| holders.contains(&normalized(&arg)))
-        } else {
-            false
+    active_children(&body)
+        .find_map(|node| completion_after(&node, assignment.text_range().end(), &holders))
+        .unwrap_or(false)
+}
+
+/// Only a write back to the holder completes its text. Stop at an overwrite or a
+/// use that can consume the old value: a later edit cannot change an earlier query.
+fn completion_after(
+    node: &SyntaxNode,
+    after: text_size::TextSize,
+    holders: &[String],
+) -> Option<bool> {
+    if node.text_range().end() <= after
+        || matches!(node.kind(), SyntaxKind::FUNCTION_DEF | SyntaxKind::PROCEDURE_DEF)
+    {
+        return None;
+    }
+    if node.text_range().start() >= after {
+        if node.kind() == SyntaxKind::ASSIGN_STMT {
+            let mut children = active_children(node);
+            if let Some(target) = children.next() {
+                let target = normalized(&target);
+                if holders.contains(&target) {
+                    return Some(
+                        children.next().is_some_and(|rhs| completes_holder(&rhs, holders)),
+                    );
+                }
+                if holders.iter().any(|holder| {
+                    holder.strip_suffix(".текст").or_else(|| holder.strip_suffix(".text"))
+                        == Some(target.as_str())
+                }) {
+                    return Some(false);
+                }
+                if children
+                    .next()
+                    .is_some_and(|rhs| holders.contains(&normalized(&unwrap_down(&rhs))))
+                {
+                    // An alias retains this value even if the original holder changes later.
+                    return Some(false);
+                }
+            }
         }
-    })
+        if node.kind() == SyntaxKind::RETURN_STMT
+            && active_children(node)
+                .any(|value| holders.contains(&normalized(&unwrap_down(&value))))
+        {
+            return Some(false);
+        }
+        if (node.kind() == SyntaxKind::NEW_EXPR && is_query_constructor(node))
+            || node.kind() == SyntaxKind::CALL_EXPR
+        {
+            // A call can consume a string or execute the query object that owns it.
+            if active_children(node).any(|child| {
+                holders.contains(&normalized(&unwrap_down(&child)))
+                    || (child.kind() == SyntaxKind::ARG_LIST
+                        && active_children(&child)
+                            .any(|arg| holders.contains(&normalized(&unwrap_down(&arg)))))
+                    || (child.kind() == SyntaxKind::FIELD_EXPR
+                        && active_children(&child).next().is_some_and(|receiver| {
+                            let receiver = normalized(&receiver);
+                            holders.iter().any(|holder| {
+                                holder
+                                    .strip_suffix(".текст")
+                                    .or_else(|| holder.strip_suffix(".text"))
+                                    == Some(receiver.as_str())
+                            })
+                        }))
+            }) {
+                return Some(false);
+            }
+        }
+    }
+    active_children(node).find_map(|child| completion_after(&child, after, holders))
+}
+
+fn completes_holder(value: &SyntaxNode, holders: &[String]) -> bool {
+    let value = unwrap_down(value);
+    if is_concatenation(&value) {
+        let mut operands = Vec::new();
+        collect_operands(&value, &mut operands);
+        operands.iter().any(|operand| holders.contains(&normalized(operand)))
+    } else {
+        is_substitution_call(&value)
+            && first_argument(&value).is_some_and(|arg| holders.contains(&normalized(&arg)))
+    }
 }
 
 /// `Запрос.Текст` and `Запрос.Text` name the same property.

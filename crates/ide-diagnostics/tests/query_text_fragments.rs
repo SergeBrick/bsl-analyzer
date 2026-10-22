@@ -1,4 +1,4 @@
-//! A literal that is a piece of a query text, not the text itself (#346).
+//! A literal that is a piece of a query text, not the text itself.
 //!
 //! The platform executes the text a module assembles: a constant concatenation is one query,
 //! a literal concatenated with a run-time value or completed further down is a piece of one,
@@ -28,6 +28,55 @@ fn query_errors(source: &str) -> Vec<Diagnostic> {
 
 fn method(body: &str) -> String {
     format!("Функция Тест(Имя, Флаг, Условие) Экспорт\n{body}\nКонецФункции\n")
+}
+
+fn assert_reported(body: &str) {
+    let source = method(body);
+    assert!(!query_errors(&source).is_empty(), "expected QueryParseError in\n{source}");
+}
+
+#[test]
+fn completion_in_another_method_does_not_hide_an_error() {
+    let source = "Функция A()\nТекст = \"ВЫБРАТЬ Т.Ссылка ИЗ Справочник.Валюты КАК Т ГДЕ\";\nВозврат Новый Запрос(Текст);\nКонецФункции\nФункция B(Условие)\nТекст = Текст + Условие;\nКонецФункции";
+    assert!(!query_errors(source).is_empty());
+}
+
+#[test]
+fn completion_of_a_different_value_does_not_hide_an_error() {
+    assert_reported(
+        "Текст = Текст + Условие;\nТекст = \"ВЫБРАТЬ 1 КАК\";\nВозврат Новый Запрос(Текст);",
+    );
+    assert_reported("Текст = \"ВЫБРАТЬ 1 КАК\";\nЗапрос = Новый Запрос(Текст);\nТекст = Текст + Условие;\nВозврат Запрос;");
+    assert_reported(
+        "Текст = \"ВЫБРАТЬ 1 КАК\";\nТекст = \"другое значение\";\nТекст = Текст + Условие;",
+    );
+    assert_reported("Текст = \"ВЫБРАТЬ 1 КАК\";\nКопия = Текст;\nТекст = Текст + Условие;\nВозврат Новый Запрос(Копия);");
+    assert_reported("Текст = \"ВЫБРАТЬ 1 КАК\";\nВозврат Текст;\nТекст = Текст + Условие;");
+    assert_reported("Запрос = Новый Запрос(\"ВЫБРАТЬ 1 КАК\");\nЗапрос.Выполнить();\nЗапрос.Text = Запрос.Текст + Условие;");
+    assert_reported("Запрос = Новый Запрос(\"ВЫБРАТЬ 1 КАК\");\nЗапрос = Новый Запрос;\nЗапрос.Text = Запрос.Текст + Условие;");
+}
+
+#[test]
+fn unrelated_concatenation_does_not_complete_the_query() {
+    assert_reported("Текст = \"ВЫБРАТЬ 1 КАК\";\nОтладочнаяСтрока = Текст + \" хвост\";\nВозврат Новый Запрос(Текст);");
+}
+
+#[test]
+fn character_prefix_is_constant_and_keeps_error_locations() {
+    for prefix in ["Символы.ПС", "Символы.ВК", "Символы.Таб", "Chars.LF", "Chars.CR", "Chars.Tab"]
+    {
+        assert_silent(&format!(
+            "Возврат Новый Запрос({prefix} + \"ВЫБРАТЬ 1 КАК Один,\" + \" 2 КАК Два\");"
+        ));
+        let source = method(&format!("Возврат Новый Запрос({prefix} + \"ВЫБРАТЬ 1 КАК Один,\");"));
+        let errors = query_errors(&source);
+        assert!(!errors.is_empty(), "expected QueryParseError in\n{source}");
+        let start = TextSize::try_from(source.find("\"ВЫБРАТЬ").unwrap()).unwrap();
+        let end = TextSize::try_from(source.find("\");").unwrap()).unwrap();
+        assert!(errors
+            .iter()
+            .all(|error| error.range.start() >= start && error.range.end() <= end));
+    }
 }
 
 fn assert_silent(body: &str) {

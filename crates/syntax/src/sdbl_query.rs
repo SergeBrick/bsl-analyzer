@@ -411,14 +411,19 @@ pub enum ConcatPiece {
 }
 
 /// The text a constant concatenation of strings evaluates to, and where each of
-/// its bytes stands in the source, relative to the start of the first piece.
+/// its bytes stands in the source, relative to the start of the first literal.
 ///
 /// `"ВЫБРАТЬ 1 КАК Один," + " 2 КАК Два"` is one query to the platform, not two
 /// literals: only the joined text says whether it parses, and only the map
 /// places an error of the second literal in the second literal. `None` when the
-/// first piece is not a literal or a literal holds no text.
+/// concatenation has no literal or a literal holds no text. Leading character
+/// constants map to the first literal's opening quote, since relative source
+/// offsets cannot represent positions before that literal.
 pub fn extract_concatenated_text(pieces: &[ConcatPiece]) -> Option<(String, LiteralTextMap)> {
-    let Some(ConcatPiece::Literal(first)) = pieces.first() else { return None };
+    let first = pieces.iter().find_map(|piece| match piece {
+        ConcatPiece::Literal(literal) => Some(literal),
+        ConcatPiece::Char(..) => None,
+    })?;
     let base = first.text_range().start();
     let mut builder = TornLiteralBuilder::default();
     for piece in pieces {
@@ -429,8 +434,9 @@ pub fn extract_concatenated_text(pieces: &[ConcatPiece]) -> Option<(String, Lite
                 }
             }
             ConcatPiece::Char(ch, range) => {
-                let start = u32::from(range.start() - base);
-                builder.push_unit(*ch, start, u32::from(range.len()));
+                let start = u32::from(range.start()).saturating_sub(u32::from(base));
+                let len = if range.start() < base { 0 } else { u32::from(range.len()) };
+                builder.push_unit(*ch, start, len);
             }
         }
     }

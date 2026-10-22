@@ -637,6 +637,29 @@ mod leading_comment_scan_tests {
     }
 
     #[test]
+    fn lone_cr_ends_a_documentation_line() {
+        // Одиночный `\r` — перевод строки: комментарий за ним стоит строкой выше
+        // объявления, а не на его строке.
+        let text = "// Описание\rФункция Т() Экспорт\r\nКонецФункции\r\n";
+        let at = off(text, "Функция");
+        assert_eq!(
+            extract_leading_comment_lines_at_offset(at, text, &runs(text)),
+            Some(vec!["Описание".to_string()])
+        );
+        let text = "// первая\r// вторая\r\nПроцедура П()\r\nКонецПроцедуры";
+        assert_eq!(
+            extract_leading_comments_at_offset(off(text, "Процедура"), text, &runs(text)),
+            Some(vec!["первая".to_string(), "вторая".to_string()])
+        );
+        // Два одиночных `\r` — пустая строка, она блок разрывает.
+        let text = "// далеко\r\rПроцедура П()";
+        assert_eq!(
+            extract_leading_comments_at_offset(off(text, "Процедура"), text, &runs(text)),
+            None
+        );
+    }
+
+    #[test]
     fn comment_at_file_start() {
         let text = "// шапка\nПроцедура П()";
         let got =
@@ -854,6 +877,18 @@ mod leading_comment_scan_tests {
     fn variable_without_description() {
         let text = "КонецПроцедуры\n&НаКлиенте\nПерем X;";
         assert!(!has_variable_leading_description(off(text, "Перем"), text, Some(off(text, "&"))));
+    }
+
+    #[test]
+    fn variable_description_after_lone_cr() {
+        // За одиночным `\r` комментарий стоит на своей строке, а не хвостом кода.
+        let text = "А = 1;\r// назначение\nПерем X;";
+        assert!(has_variable_leading_description(off(text, "Перем"), text, None));
+        let text = "// назначение\r\rПерем X;";
+        assert!(!has_variable_leading_description(off(text, "Перем"), text, None));
+        // Контроль: CRLF — один перевод строки.
+        let text = "// назначение\r\nПерем X;";
+        assert!(has_variable_leading_description(off(text, "Перем"), text, None));
     }
 
     #[test]

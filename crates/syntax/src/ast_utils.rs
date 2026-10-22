@@ -158,7 +158,7 @@ fn leading_comments(
     // The anchor's own line up to the anchor is indentation, an annotation or
     // the part of a comment the anchor stands in; it is not a separate line
     // and does not end the block.
-    let mut line_start = text[..anchor].rfind('\n').map_or(0, |newline| newline + 1);
+    let mut line_start = line_start_at(text, anchor);
     let fragment = &text[line_start..anchor];
     // An anchor between the two slashes leaves a lone `/`, which is code.
     let fragment_comment = candidates
@@ -188,7 +188,7 @@ fn leading_comments(
     };
     while line_start > 0 {
         let line_end = line_start - 1;
-        let prev_start = text[..line_end].rfind('\n').map_or(0, |newline| newline + 1);
+        let prev_start = line_start_at(text, line_end);
         // A comment runs to the end of its line, so the one starting on this
         // line is the last thing on it.
         let comment = candidates.next_if(|line| usize::from(line.range.start()) >= prev_start);
@@ -208,6 +208,21 @@ fn leading_comments(
     }
     comments.reverse();
     Some(comments)
+}
+
+/// Start of the line holding `pos`. A line ends at `\n` and at a lone `\r`,
+/// one not followed by `\n` after any further `\r`: the platform breaks the
+/// line there too.
+fn line_start_at(text: &str, pos: usize) -> usize {
+    let bytes = text.as_bytes();
+    (0..pos)
+        .rev()
+        .find(|&index| match bytes[index] {
+            b'\n' => true,
+            b'\r' => bytes[index..].iter().find(|&&byte| byte != b'\r') != Some(&b'\n'),
+            _ => false,
+        })
+        .map_or(0, |terminator| terminator + 1)
 }
 
 pub fn has_trailing_comment(node: &SyntaxNode, source_text: &str) -> bool {
@@ -253,7 +268,11 @@ pub fn has_variable_leading_description(
     // Backwards scan from the anchor: the loop exits on the first decisive
     // line, so the cost is bounded by the annotation/comment block, not by
     // the length of the preceding text.
-    let mut rev_lines = text_before.rsplit('\n');
+    let mut rev_lines = std::iter::successors(
+        Some((line_start_at(text_before, check_from), check_from)),
+        |&(start, _)| (start > 0).then(|| (line_start_at(text_before, start - 1), start - 1)),
+    )
+    .map(|(start, end)| &text_before[start..end]);
     let last_line = rev_lines.next().unwrap_or("");
     let trimmed_last = last_line.trim();
     let skip_last = trimmed_last.is_empty() || trimmed_last.starts_with('&');

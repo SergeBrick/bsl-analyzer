@@ -28,6 +28,11 @@ pub fn check(ctx: &DiagnosticsContext) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     for (_query_expr_id, query_info) in sdbl_queries.iter() {
+        // A piece or a template of a query fails to parse by being one; the platform
+        // executes the text assembled from it, which this literal does not hold.
+        if query_info.incomplete {
+            continue;
+        }
         let literal_start = query_info.bsl_literal_range.start();
         for (range_in_literal, err) in &query_info.error_ranges_in_bsl {
             diagnostics.push(Diagnostic {
@@ -99,15 +104,6 @@ mod tests {
               severity: Warning
             QueryParseError @ 7:25..7:25
               message: Ожидался псевдоним источника после 'КАК' / 'AS'
-              severity: Warning
-            QueryParseError @ 11:54..11:54
-              message: Неожиданный конец файла
-              severity: Warning
-            QueryParseError @ 11:54..11:54
-              message: Ожидалось 'ПО' / 'ON' в соединении
-              severity: Warning
-            QueryParseError @ 11:54..11:54
-              message: Ожидалось 'идентификатор', встречено конец файла
               severity: Warning
             QueryParseError @ 18:16..18:16
               message: Неожиданный конец файла
@@ -299,6 +295,8 @@ mod tests {
         check_diagnostics_snapshot_for(code, DiagnosticCode::QueryParseError, expect![[r#""#]]);
     }
 
+    /// The type name is appended at run time: the platform executes `ССЫЛКА Документ.<Имя>`,
+    /// not the literal that ends on the dot.
     #[test]
     fn test_dynamic_query_with_trailing_dot() {
         let code = r#"
@@ -311,14 +309,7 @@ mod tests {
                    |    Задания.Источник ССЫЛКА Документ."+ИмяДокумента+"";
 КонецПроцедуры
 "#;
-        check_diagnostics_snapshot_for(
-            code,
-            DiagnosticCode::QueryParseError,
-            expect![[r#"
-                QueryParseError @ 8:57..8:58
-                  message: Незавершённый путь в ссылке
-                  severity: Warning"#]],
-        );
+        check_diagnostics_snapshot_for(code, DiagnosticCode::QueryParseError, expect![[r#""#]]);
     }
 
     #[test]
@@ -339,14 +330,7 @@ mod tests {
                    |    И ЗаданияДляПроцессаОбработкиВходногоКонтроля.Источник ССЫЛКА Документ."+ИмяДокумента+"";
 КонецПроцедуры
 "#;
-        check_diagnostics_snapshot_for(
-            code,
-            DiagnosticCode::QueryParseError,
-            expect![[r#"
-                QueryParseError @ 14:95..14:96
-                  message: Незавершённый путь в ссылке
-                  severity: Warning"#]],
-        );
+        check_diagnostics_snapshot_for(code, DiagnosticCode::QueryParseError, expect![[r#""#]]);
     }
 
     #[test]

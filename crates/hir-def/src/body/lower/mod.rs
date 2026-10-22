@@ -4,6 +4,7 @@ mod expr;
 
 mod platform_helpers;
 mod preproc;
+mod query_fragment;
 mod stmt;
 mod utils;
 

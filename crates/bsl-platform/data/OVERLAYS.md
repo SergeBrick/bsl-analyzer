@@ -155,6 +155,36 @@ target therefore has no runtime symptom, so the curated entries are guarded by
 the tests over the built-in facts (`crates/bsl-platform/tests/bundled_facts.rs`),
 which fail if a target stops resolving.
 
+## Method return type correction schema
+
+<!-- overlay-document -->
+```json
+{
+  "schema_version": 1,
+  "method_parameter_overrides": [],
+  "method_return_type_corrections": [
+    {
+      "type": "XDTOFactory",
+      "name": "Создать",
+      "return_types": ["ОбъектXDTO", "ЗначениеXDTO"],
+      "evidence_source": "runtime probe: ТипЗнч of the result for each call variant",
+      "rationale": "the help page documents one return type for every variant"
+    }
+  ]
+}
+```
+
+Replaces the return-type list of a method the extract already carries. A help
+page that describes several call variants of a method gives one return type for
+all of them, and the extract keeps exactly that: `ФабрикаXDTO.Создать` creates
+an `ОбъектXDTO` from an object type and a `ЗначениеXDTO` from a value type, but
+its record names `ЗначениеXDTO` only. `return_types` is the whole new list, in
+the spelling of the extract; it must not be empty or repeat a type. `type` and
+`name` may be spelled in either language and resolve exactly like the targets
+of a property correction: an entry whose type or method a corpus does not have
+does not apply to it, two entries resolving to one method are refused, and the
+curated entries are guarded by `crates/bsl-platform/tests/bundled_facts.rs`.
+
 ## Type member surface attestation schema
 
 <!-- overlay-document -->

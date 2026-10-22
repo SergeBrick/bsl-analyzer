@@ -294,6 +294,15 @@
       "rationale": "shcntx_ru.hbk marks the property «Использование: Только чтение», so ReadOnlyPropertyAssignment reports a write the platform performs. A notification object is built property by property before it is sent."
     }
   ],
+  "method_return_type_corrections": [
+    {
+      "type": "XDTOFactory",
+      "name": "Создать",
+      "return_types": ["ОбъектXDTO", "ЗначениеXDTO"],
+      "evidence_source": "A runtime probe on platforms 8.3.17.1549 and 8.3.27.2214 (server code, a factory built from an XML schema with one complex and one simple type, and the global ФабрикаXDTO): `ТипЗнч(Ф.Создать(<ТипОбъектаXDTO>))` is «Объект XDTO» and equals `Тип(\"ОбъектXDTO\")`; `ТипЗнч(Ф.Создать(<ТипЗначенияXDTO>, \"x\"))` is «Значение XDTO»; `ФабрикаXDTO.Создать(ФабрикаXDTO.Тип(\"http://v8.1c.ru/8.1/data/core\", \"TypeDescription\"))` is «Объект XDTO». The extracted record (method id 2070) lists the variant «Создание объекта» with a `ТипОбъектаXDTO` parameter but carries `return_type: ЗначениеXDTO` for every variant.",
+      "rationale": "With `ЗначениеXDTO` alone every object created by the factory is typed as a value, and a write to a property of the object that is spelled like a property of ЗначениеXDTO (`Объект.Значение = …`, `Объект.Value = …`) is reported as ReadOnlyPropertyAssignment although the platform accepts it. The call returns one of the two types depending on the kind of its `Тип` argument, so the result is their union; a write to `Значение` of a value that is known to be a ЗначениеXDTO (an element of `Список`, for instance) is still reported."
+    }
+  ],
   "type_member_surface_attestations": [
     {
       "type": "SpreadsheetDocumentRange",

@@ -28,6 +28,13 @@ where
     fn classify_many(&self, body: &Body, expr_idx: ExprIdx) -> Vec<ResourceEvent<R>> {
         self.classify(body, expr_idx).into_iter().collect()
     }
+
+    /// Resources released already at the entry of `Попытка`: the release then
+    /// holds on the exception edge into the handler as well as on the
+    /// protected path.
+    fn closed_at_try_entry(&self, _body: &Body, _try_stmt: StmtId) -> Vec<R> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +143,12 @@ where
             self.apply(body, expr_idx, &mut next);
         });
         next
+    }
+
+    fn transfer_try_entry(&self, try_stmt: StmtId, state: &mut OpenSet<R>, body: &Body) {
+        for r in self.provider.closed_at_try_entry(body, try_stmt) {
+            state.close(&r);
+        }
     }
 
     fn transfer_edge(&self, edge_kind: CfgEdgeType, state: &OpenSet<R>) -> OpenSet<R> {

@@ -479,12 +479,7 @@ fn analyze_salsa(
 
     tracing::info!("Creating database");
     let mut db = RootDatabaseImpl::default();
-    bsl_analyzer::features_state::apply_project_config_to_db(&mut db, &project.config);
-    bsl_analyzer::features_state::apply_compatibility_mode_to_db(&mut db, Some(&project));
-    ide_host_core::apply_ordinary_forms_setting(&mut db, Some(&project));
-    bsl_analyzer::features_state::apply_ordinary_app_support_to_db(&mut db, Some(&project));
-    ide_host_core::apply_default_run_mode(&mut db, Some(&project));
-    bsl_analyzer::features_state::apply_vendor_support_to_db(&mut db, Some(&project));
+    ide_host_core::apply_project_to_db(&mut db, &project);
 
     // Register the base + extension configuration roots (with their dependency
     // topology) so per-file resolution — and the `&ИзменениеИКонтроль` effective

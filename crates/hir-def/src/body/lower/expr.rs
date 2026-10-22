@@ -1,8 +1,10 @@
 use bsl_platform::capability::{Category as CapabilityCategory, EntryKind as CapabilityEntryKind};
 use intern::NormName;
 use stdx::case::CaseExt;
-use syntax::ast_utils::{active_children, active_children_with_tokens, field_tail_name_token};
-use syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
+use syntax::ast_utils::{
+    active_children, active_children_with_tokens, field_tail_name_token, significant_tokens,
+};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxToken, TextSize};
 
 use crate::body::{
     Body, BodyDiagnostic, ExternalRef, MagicNumberContext, ManagerType, RedundantAccessKind,
@@ -1338,36 +1340,232 @@ fn has_detail_error_description(arg: &SyntaxNode) -> bool {
         && (text.contains("информацияобошибке") || text.contains("errorinfo"))
 }
 
-fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> Option<bool> {
-    let arg_text = arg.text().to_string();
-    let var_name = arg_text.trim();
-    if var_name.is_empty() || !var_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    let var_name = var_name.fold_lower();
+/// An assignment made in the `Исключение` branch; target and value are kept
+/// as [`normalized_code_text`].
+struct ExceptAssignment {
+    target: String,
+    start: TextSize,
+    value: String,
+}
 
+/// What a value is known to hold at the point it is read.
+#[derive(Clone, Copy)]
+struct TracedValue {
+    error_info: bool,
+    detail_error: bool,
+}
+
+/// Decides whether the comment of a logging call made in `Исключение` carries
+/// `ПодробноеПредставлениеОшибки(ИнформацияОбОшибке())` through a variable or a
+/// field assigned earlier in the same handler, also when the comment only
+/// concatenates such a variable or passes it through a string function, and
+/// when the error info itself was saved to a variable first.
+fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> Option<bool> {
     let except_clause = call_node.ancestors().find(|n| n.kind() == SyntaxKind::EXCEPT_CLAUSE)?;
 
-    let stmt_list = active_children(&except_clause).find(|n| n.kind() == SyntaxKind::STMT_LIST)?;
+    let assignments: Vec<ExceptAssignment> = except_clause
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ASSIGN_STMT)
+        .filter_map(|stmt| {
+            let mut nodes = active_children(&stmt);
+            let target = nodes.next()?;
+            let value = nodes.last()?;
+            Some(ExceptAssignment {
+                target: normalized_code_text(&target),
+                start: stmt.text_range().start(),
+                value: normalized_code_text(&value),
+            })
+        })
+        .collect();
 
-    for child in active_children(&stmt_list) {
-        if child.kind() == SyntaxKind::ASSIGN_STMT {
-            let lhs_node = match active_children(&child).next() {
-                Some(n) => n,
-                None => continue,
-            };
-            let lhs_name = lhs_node.text().to_string().trim().fold_lower();
-            if lhs_name == var_name {
-                let rhs_text = child.text().to_string().fold_lower();
-                let has_detail = (rhs_text.contains("подробноепредставлениеошибки")
-                    || rhs_text.contains("detailerrordescription"))
-                    && (rhs_text.contains("информацияобошибке") || rhs_text.contains("errorinfo"));
-                return Some(has_detail);
+    let comment = normalized_code_text(arg);
+    if comment.is_empty() {
+        return None;
+    }
+    if is_plain_identifier(&comment) && !assignments.iter().any(|a| a.target == comment) {
+        // A variable filled outside the handler: its content is not known here.
+        return Some(true);
+    }
+
+    // Each value is traced only through the assignments written before it, so
+    // one pass in text order settles every one of them without recursion.
+    let call_start = call_node.text_range().start();
+    let assignments = &assignments[..assignments.partition_point(|a| a.start < call_start)];
+    let mut targets: Vec<&str> = Vec::new();
+    for assignment in assignments {
+        if !targets.contains(&assignment.target.as_str()) {
+            targets.push(&assignment.target);
+        }
+    }
+    let mut values = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let value =
+            trace_value(&assignment.value, assignment.start, assignments, &targets, &values);
+        values.push(value);
+    }
+    Some(trace_value(&comment, call_start, assignments, &targets, &values).detail_error)
+}
+
+/// What `text` read at `before` holds, given the `values` already traced for
+/// the leading `assignments`.
+fn trace_value(
+    text: &str,
+    before: TextSize,
+    assignments: &[ExceptAssignment],
+    targets: &[&str],
+    values: &[TracedValue],
+) -> TracedValue {
+    let last_value = |target: &str| {
+        let last = last_assignment_before(assignments, target, before)?;
+        // A later write to a part of the path (its object, a field on the way
+        // or an index variable) leaves the stored value behind.
+        let outdated = assignments[last + 1..]
+            .iter()
+            .take_while(|a| a.start < before)
+            .any(|a| is_path_part(target, &a.target));
+        (!outdated).then_some(values[last])
+    };
+    let is_error_info = |text: &str| {
+        text.contains("информацияобошибке")
+            || text.contains("errorinfo")
+            || last_value(text).is_some_and(|v| v.error_info)
+    };
+    let detail_error = detail_call_arguments(text).into_iter().any(is_error_info)
+        || targets.iter().any(|target| {
+            references_path(text, target) && last_value(target).is_some_and(|v| v.detail_error)
+        });
+    TracedValue { error_info: is_error_info(text), detail_error }
+}
+
+/// Arguments of every `ПодробноеПредставлениеОшибки(...)` call in `text`.
+fn detail_call_arguments(text: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    for name in ["подробноепредставлениеошибки(", "detailerrordescription("]
+    {
+        for (pos, _) in text.match_indices(name) {
+            if text[..pos].chars().next_back().is_some_and(is_identifier_char) {
+                continue;
+            }
+            let args_start = pos + name.len();
+            let mut level = 1usize;
+            for (offset, ch) in text[args_start..].char_indices() {
+                match ch {
+                    '(' => level += 1,
+                    ')' => {
+                        level -= 1;
+                        if level == 0 {
+                            result.push(&text[args_start..args_start + offset]);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
+    result
+}
 
-    Some(true)
+/// Index of the last assignment to `target` made before `before`;
+/// `assignments` go in text order.
+fn last_assignment_before(
+    assignments: &[ExceptAssignment],
+    target: &str,
+    before: TextSize,
+) -> Option<usize> {
+    assignments.iter().rposition(|a| a.start < before && a.target == target)
+}
+
+/// `path` occurs in `text` as a whole value: not as a part of a longer name,
+/// not as the receiver of a field, index or call.
+fn references_path(text: &str, path: &str) -> bool {
+    text.match_indices(path).any(|(pos, _)| {
+        let before_ok =
+            !text[..pos].chars().next_back().is_some_and(|c| is_identifier_char(c) || c == '.');
+        let after_ok = !text[pos + path.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| is_identifier_char(c) || matches!(c, '.' | '(' | '['));
+        before_ok && after_ok
+    })
+}
+
+/// `part` names the object of `path`, a field on the way to it or a variable
+/// used in one of its indexes.
+fn is_path_part(path: &str, part: &str) -> bool {
+    let names_object =
+        path.strip_prefix(part).is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['));
+    names_object || (part != path && references_path(path, part))
+}
+
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn is_plain_identifier(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(is_identifier_char)
+}
+
+/// Lower-cased code of `node` without trivia and without the text an extension
+/// removed. A string literal piece is spelled as the hex of its lower-cased
+/// text: `Поля["А"]` stays apart from `Поля["Б"]`, and a name written inside
+/// a string is not taken for code. A key that is a valid name is spelled as a
+/// field, since `Структура["Текст"]` reads the same value as `Структура.Текст`.
+fn normalized_code_text(node: &SyntaxNode) -> String {
+    let mut text = String::new();
+    push_normalized_code(node, &mut text);
+    text
+}
+
+fn push_normalized_code(node: &SyntaxNode, text: &mut String) {
+    if let Some((object, key)) = name_key_access(node) {
+        push_normalized_code(&object, text);
+        text.push('.');
+        text.push_str(&key.fold_lower());
+        return;
+    }
+    for element in active_children_with_tokens(node) {
+        if let Some(child) = element.as_node() {
+            push_normalized_code(child, text);
+            continue;
+        }
+        let Some(token) = element.into_token() else { continue };
+        match token.kind() {
+            kind if kind.is_trivia() => {}
+            SyntaxKind::STRING
+            | SyntaxKind::STRING_START
+            | SyntaxKind::STRING_PART
+            | SyntaxKind::STRING_TAIL => {
+                text.push('"');
+                for byte in token.text().fold_lower().bytes() {
+                    text.push_str(&format!("{byte:02x}"));
+                }
+                text.push('"');
+            }
+            _ => text.push_str(&token.text().fold_lower()),
+        }
+    }
+}
+
+/// The object and the key of `Объект["Ключ"]` when the key is a valid name.
+fn name_key_access(node: &SyntaxNode) -> Option<(SyntaxNode, String)> {
+    if node.kind() != SyntaxKind::INDEX_EXPR {
+        return None;
+    }
+    let mut children = active_children(node);
+    let object = children.next()?;
+    let index = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    let mut tokens = significant_tokens(&index);
+    let token = tokens.next()?;
+    if token.kind() != SyntaxKind::STRING || tokens.next().is_some() {
+        return None;
+    }
+    let key = token.text().strip_prefix('"')?.strip_suffix('"')?;
+    let starts_as_name = key.chars().next().is_some_and(|c| !c.is_numeric());
+    (starts_as_name && is_plain_identifier(key)).then(|| (object, key.to_owned()))
 }
 
 fn extract_type_name_from_first_arg(node: &SyntaxNode) -> Option<String> {

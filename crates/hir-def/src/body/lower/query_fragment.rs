@@ -129,6 +129,12 @@ fn completion_after(
     {
         return None;
     }
+    if node.kind() == SyntaxKind::IF_STMT && node.text_range().start() < after {
+        // A literal inside one branch cannot be completed by an alternative branch.
+        return active_children(node)
+            .find(|child| child.text_range().start() < after && child.text_range().end() >= after)
+            .and_then(|branch| completion_after(&branch, after, holders));
+    }
     if node.text_range().start() >= after {
         if node.kind() == SyntaxKind::ASSIGN_STMT {
             let mut children = active_children(node);

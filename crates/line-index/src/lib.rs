@@ -76,6 +76,15 @@ impl LineIndex {
         line - self.lone_cr_lines.partition_point(|&lone_cr| lone_cr < line) as u32
     }
 
+    /// Whether `line` is the `\r\n` half of a `\r\r\n`: an empty line for an LSP client,
+    /// but no line of the module for the platform, which reads the whole sequence as one
+    /// line break.
+    pub fn is_cr_crlf_tail(&self, text: &str, line: u32) -> bool {
+        let Some(start) = self.try_line_start(line) else { return false };
+        let start = usize::from(start);
+        start > 0 && text.as_bytes()[start - 1] == b'\r' && text[start..].starts_with("\r\n")
+    }
+
     /// Approximate live heap bytes for Salsa's `memory_usage` report: the boxed
     /// `newlines` slice (one `TextSize` per line break in the file) and the boxed
     /// `lone_cr_lines` slice. The `len` field is inline and owns no heap.

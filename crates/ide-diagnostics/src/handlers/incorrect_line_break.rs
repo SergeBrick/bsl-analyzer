@@ -62,7 +62,11 @@ pub fn check_block(ctx: &AnalysisContext, block: &Block) -> Vec<Diagnostic<Local
         // За последней строкой блока продолжения литерала быть не может:
         // строку, начатую `"` или `|`, парсер держит в узле своего выражения,
         // и она лежит в том же блоке.
-        let next_line = lines.get(line_idx + 1).copied();
+        // `\r\n`-половина `\r\r\n` — не строка модуля: платформа читает всю
+        // последовательность как один перенос.
+        let next_line = (line_idx + 1..lines.len())
+            .find(|&next| !block.line_index.is_cr_crlf_tail(text, next as u32))
+            .map(|next| lines[next]);
         if let Some(diag) = check_line_end(tokens, next_line, code, ctx) {
             diagnostics.push(diag);
         }

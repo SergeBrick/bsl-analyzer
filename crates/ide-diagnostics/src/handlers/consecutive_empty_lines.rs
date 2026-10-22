@@ -61,11 +61,8 @@ fn scan_consecutive_empty_lines(
 
     for line in 0..num_lines {
         let line_start = line_index.line_start(line);
-        // The `\r\n` half of a `\r\r\n` is a line of its own for an LSP client, but the
-        // platform reads the whole sequence as one line break: it is no blank line of the
-        // module, neither empty nor ending a run of empty ones.
-        let start = usize::from(line_start);
-        if start > 0 && text.as_bytes()[start - 1] == b'\r' && text[start..].starts_with("\r\n") {
+        // No blank line of the module: neither empty nor ending a run of empty ones.
+        if line_index.is_cr_crlf_tail(text, line) {
             continue;
         }
         let line_range = line_index.line_range(line);

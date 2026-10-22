@@ -31,6 +31,8 @@
 
 mod drift;
 mod lifecycle;
+#[cfg(test)]
+mod project_config_tests;
 mod resident;
 mod session;
 mod snapshot;

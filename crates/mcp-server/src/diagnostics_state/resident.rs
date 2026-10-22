@@ -79,43 +79,6 @@ fn retire_registration(
     file_id
 }
 
-pub(super) fn apply_project_compatibility_mode(
-    db: &mut RootDatabaseImpl,
-    resolved: Option<(String, project_model::CompatibilityModeSource)>,
-) {
-    use std::sync::Arc;
-
-    if let Some((value, source)) = &resolved {
-        if bsl_platform::PlatformVersion::parse_compatibility_mode(value).is_none() {
-            tracing::warn!(
-                compatibility_mode = %value,
-                ?source,
-                "compatibility mode is not a recognized value; the compatibility-mode check stays off"
-            );
-        }
-    }
-    let mode = resolved.map(|(value, _)| Arc::<str>::from(value));
-    if db.compatibility_mode().as_deref() != mode.as_deref() {
-        tracing::info!(compatibility_mode = ?mode, "updated compatibility mode");
-        db.set_compatibility_mode(mode);
-    }
-}
-
-/// The main configuration's vendor support map, read only when the project's
-/// `[diagnostics]` asks for it (see [`ide::load_vendor_support`]).
-pub(super) fn apply_project_vendor_support(
-    db: &mut RootDatabaseImpl,
-    project: &project_model::Project,
-) {
-    let support = ide::load_vendor_support(
-        &project.config.diagnostics.rules_json(),
-        project.configuration_path(),
-    );
-    if db.vendor_support() != support {
-        db.set_vendor_support(support);
-    }
-}
-
 /// Re-read every held hole. Returns `(healed, vanished)` by canonical key, so the
 /// caller can move each one's baseline entry and bump what a baseline move obliges.
 ///
@@ -1532,17 +1495,15 @@ pub(super) fn apply_resident_changes(
         metadata_paths.extend(refresh);
         if !xml_paths.is_empty() {
             resident.db.bump_config_for_paths(xml_paths.iter().map(|p| p.as_path()));
-            apply_project_compatibility_mode(
+            ide_host_core::apply_configuration_xml_settings_to_db(
                 &mut resident.db,
-                resident.project.compatibility_mode(),
+                Some(&resident.project),
             );
-            ide_host_core::apply_ordinary_forms_setting(&mut resident.db, Some(&resident.project));
-            ide_host_core::apply_default_run_mode(&mut resident.db, Some(&resident.project));
             // `<DefaultRunMode>` can decide the diagnostics' `ordinaryAppSupport`; the
             // config is otherwise read once, at the build.
             resident.config.ordinary_app_support =
                 ide_host_core::effective_ordinary_app_support(&resident.project);
-            apply_project_vendor_support(&mut resident.db, &resident.project);
+            ide_host_core::apply_vendor_support_to_db(&mut resident.db, Some(&resident.project));
             metadata_changed = true;
         }
         moved = true;
@@ -1983,8 +1944,9 @@ mod tests {
         assert!(!resident.db.env_options().managed_run_mode);
     }
 
-    /// The diagnostics `ordinaryAppSupport` derived from `<DefaultRunMode>` follows an
-    /// edit of `Configuration.xml` applied in place, as a fresh build would read it.
+    /// The diagnostics `ordinaryAppSupport` derived from `<DefaultRunMode>`, and the
+    /// execution model with it, follow an edit of `Configuration.xml` applied in place,
+    /// as a fresh build would read them.
     #[test]
     fn the_resident_rederives_ordinary_app_support_on_a_configuration_edit() {
         let dir = tempfile::tempdir().unwrap();
@@ -2015,8 +1977,8 @@ mod tests {
         assert!(!rebuild, "an edit inside the configuration root is applied in place");
         assert!(resident.config().ordinary_app_support);
         assert!(
-            !resident.db.env_options().ordinary_app_support,
-            "the resident's execution model is not built from the project settings"
+            resident.db.env_options().ordinary_app_support,
+            "the resident's execution model follows the same value, as in the CLI and the LSP"
         );
     }
 

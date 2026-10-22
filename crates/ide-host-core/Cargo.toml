@@ -11,6 +11,8 @@ doctest = false
 [dependencies]
 ide.workspace = true
 ide-db.workspace = true
+hir.workspace = true
+bsl-platform.workspace = true
 base-db.workspace = true
 bsl-conventions.workspace = true
 bsl-metadata.workspace = true

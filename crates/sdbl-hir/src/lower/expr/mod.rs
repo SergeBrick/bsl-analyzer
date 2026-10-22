@@ -27,10 +27,16 @@ impl LoweringContext<'_> {
             SyntaxKind::SDBL_MULTI_STRING => self.lower_multi_string(node),
             SyntaxKind::SDBL_FUNCTION_CALL => self.lower_function_call(node),
             SyntaxKind::SDBL_PAREN_EXPR => {
-                if let Some(inner) = node.children().next() {
-                    self.lower_expr(&inner)
+                let Some(inner) = node.children().next() else {
+                    return ExprHir::Missing { range: node.text_range() };
+                };
+                let inner = self.lower_expr(&inner);
+                // `(...).Поле` dereferences the value; the type of the member is not
+                // followed, so it stays unknown rather than the type of the parentheses.
+                if syntax::ast_utils::direct_name_tokens(node).next().is_some() {
+                    inner.with_type(SdblType::Unknown)
                 } else {
-                    ExprHir::Missing { range: node.text_range() }
+                    inner
                 }
             }
             SyntaxKind::SDBL_TUPLE_EXPR => self.lower_tuple_expr(node),

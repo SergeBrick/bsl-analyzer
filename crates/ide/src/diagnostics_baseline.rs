@@ -7,8 +7,19 @@ pub fn normalize_diagnostic_snippet(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn diagnostic_line_snippet(lines: &[&str], line: usize) -> String {
-    normalize_diagnostic_snippet(lines.get(line).copied().unwrap_or_default())
+/// The snippet of LSP line `line` of `line_index`, cut from `lines`, the [`str::lines`] of
+/// the same text.
+///
+/// A snippet line is broken by `\n` alone, so a line below a lone `\r` takes the whole
+/// `\n` line it sits in: that keeps the fingerprints recorded when the line index did not
+/// count a lone `\r` either, and no baseline entry stops matching its finding.
+pub fn diagnostic_line_snippet(
+    lines: &[&str],
+    line_index: &line_index::LineIndex,
+    line: usize,
+) -> String {
+    let lf_line = line_index.lf_line(line as u32) as usize;
+    normalize_diagnostic_snippet(lines.get(lf_line).copied().unwrap_or_default())
 }
 
 pub fn diagnostic_fingerprint(path: &str, code: &str, snippet: &str, occurrence: u32) -> String {
@@ -568,6 +579,18 @@ mod tests {
             assert_eq!(value["state"], state_string(state));
             assert!(value.get("new").is_none());
         }
+    }
+
+    /// A lone `\r` breaks the LSP line but not the snippet line, so the fingerprint of
+    /// a finding below it is the one recorded when the line index ignored a lone `\r`.
+    #[test]
+    fn snippet_below_a_lone_cr_is_its_whole_lf_line() {
+        let text = "Процедура А()\r\tБ = Б;\nКонецПроцедуры\n";
+        let lines: Vec<_> = text.lines().collect();
+        let index = line_index::LineIndex::new(text);
+
+        assert_eq!(diagnostic_line_snippet(&lines, &index, 1), "Процедура А() Б = Б;");
+        assert_eq!(diagnostic_line_snippet(&lines, &index, 2), "КонецПроцедуры");
     }
 
     #[test]

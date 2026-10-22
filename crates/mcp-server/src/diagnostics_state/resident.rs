@@ -856,7 +856,8 @@ impl DiagnosticsResident {
                                     .unwrap_or(Path::new(path))
                                     .to_string_lossy()
                                     .replace(std::path::MAIN_SEPARATOR, "/");
-                                let source_lines: Vec<_> = line_index::split_lines(&text).collect();
+                                let source_lines: Vec<_> = text.lines().collect();
+                                let line_index = line_index::LineIndex::new(&text);
                                 diagnostics
                                     .into_iter()
                                     .map(|d| {
@@ -868,6 +869,7 @@ impl DiagnosticsResident {
                                         snippet: Some(
                                             ide::diagnostics_baseline::diagnostic_line_snippet(
                                                 &source_lines,
+                                                &line_index,
                                                 output.start_line,
                                             ),
                                         ),

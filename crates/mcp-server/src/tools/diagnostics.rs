@@ -781,7 +781,8 @@ fn classify_file_baseline(
 ) -> Result<(Vec<ide::Diagnostic>, DiagnosticsBaselineSummary), Box<DiagnosticsBaselineSummary>> {
     use ide_host_core::diagnostics_baseline::DiagnosticsBaselineSnapshot;
     let relative = baseline_project_path(resident.workspace_root(), path);
-    let source_lines: Vec<_> = line_index::split_lines(file_text).collect();
+    let source_lines: Vec<_> = file_text.lines().collect();
+    let line_index = line_index::LineIndex::new(file_text);
     let candidates: Vec<_> = diagnostics
         .into_iter()
         .enumerate()
@@ -793,6 +794,7 @@ fn classify_file_baseline(
                 code: output.code,
                 snippet: Some(ide::diagnostics_baseline::diagnostic_line_snippet(
                     &source_lines,
+                    &line_index,
                     output.start_line,
                 )),
                 message: output.message,

@@ -1,5 +1,5 @@
 //! `split_lines` cuts a text where `LineIndex` starts its lines, so a line number from the
-//! index picks the right source line for a snippet.
+//! index picks the text of that line.
 
 use line_index::{split_lines, LineIndex};
 

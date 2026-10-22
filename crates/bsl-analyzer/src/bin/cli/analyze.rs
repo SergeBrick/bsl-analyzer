@@ -792,13 +792,13 @@ fn analyze_salsa(
                             // still hot (this pass runs in parallel across files),
                             // so reporters that need a line-shift-stable fingerprint
                             // do not re-read the file or rescan its text per finding.
-                            let source_lines: Vec<_> =
-                                line_index::split_lines(&file_text).collect();
+                            let source_lines: Vec<_> = file_text.lines().collect();
                             let line_snippets: Vec<String> = diagnostic_outputs
                                 .iter()
                                 .map(|d| {
                                     ide::diagnostics_baseline::diagnostic_line_snippet(
                                         &source_lines,
+                                        &file_line_index,
                                         d.start_line,
                                     )
                                 })

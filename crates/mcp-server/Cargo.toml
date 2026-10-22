@@ -33,7 +33,7 @@ rayon.workspace = true
 stdx.workspace = true
 check-contract = { path = "../check-contract" }
 
-rmcp = { version = "3.1", features = [
+rmcp = { version = "3.5.1", features = [
     "server",
     "macros",
     "transport-io",
@@ -109,7 +109,7 @@ tracing-subscriber.workspace = true
 # Client features for integration tests that drive real MCP handshakes through
 # the broker and Streamable HTTP transports. Unified with the library's server
 # features at build time.
-rmcp = { version = "3.1", features = [
+rmcp = { version = "3.5.1", features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }

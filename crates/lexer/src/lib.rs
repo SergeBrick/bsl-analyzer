@@ -383,7 +383,11 @@ pub enum TokenKind {
     #[regex(r"[_\p{L}]", |lex| finish_identifier(lex, TokenKind::Ident), priority = 1)]
     Ident,
 
-    #[regex(r"//[^\n]*")]
+    /// Комментарий кончается на переводе строки, а одиночный `\r` (не перед
+    /// `\n`) для платформы - тоже перевод: код после него в той же
+    /// `\n`-строке компилируется. `\r` перед `\n` остаётся в лексеме, как
+    /// и раньше, - см. [`finish_comment`].
+    #[regex(r"//[^\n\r]*", finish_comment)]
     Comment,
 
     #[token("\n")]
@@ -396,6 +400,17 @@ pub enum TokenKind {
     Bom,
 
     Error,
+}
+
+/// Забирает в комментарий `\r`, за которыми идёт `\n` или конец текста:
+/// строка CRLF (и `\r\r\n`) даёт ту же лексему, что и прежде. Одиночный `\r`
+/// перед кодом комментарий заканчивает.
+fn finish_comment(lexer: &mut logos::Lexer<TokenKind>) {
+    let remainder = lexer.remainder().as_bytes();
+    let carriage_returns = remainder.iter().take_while(|&&byte| byte == b'\r').count();
+    if carriage_returns > 0 && matches!(remainder.get(carriage_returns), None | Some(b'\n')) {
+        lexer.bump(carriage_returns);
+    }
 }
 
 fn finish_identifier(lexer: &mut logos::Lexer<TokenKind>, original_kind: TokenKind) -> TokenKind {

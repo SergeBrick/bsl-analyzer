@@ -1338,17 +1338,20 @@ fn has_detail_error_description(arg: &SyntaxNode) -> bool {
         && (text.contains("информацияобошибке") || text.contains("errorinfo"))
 }
 
-/// An assignment made in the `Исключение` branch before the logging call;
-/// target and value are kept as [`normalized_code_text`].
+/// An assignment made in the `Исключение` branch; target and value are kept
+/// as [`normalized_code_text`].
 struct ExceptAssignment {
     target: String,
     start: TextSize,
     value: String,
 }
 
-/// How many assignments may be followed back from the comment argument
-/// (`Текст = Подробно; Сообщение = Заголовок + Текст; ... Сообщение`).
-const MAX_DETAIL_TRACE_DEPTH: u8 = 4;
+/// What a value is known to hold at the point it is read.
+#[derive(Clone, Copy)]
+struct TracedValue {
+    error_info: bool,
+    detail_error: bool,
+}
 
 /// Decides whether the comment of a logging call made in `Исключение` carries
 /// `ПодробноеПредставлениеОшибки(ИнформацияОбОшибке())` through a variable or a
@@ -1357,11 +1360,10 @@ const MAX_DETAIL_TRACE_DEPTH: u8 = 4;
 /// when the error info itself was saved to a variable first.
 fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> Option<bool> {
     let except_clause = call_node.ancestors().find(|n| n.kind() == SyntaxKind::EXCEPT_CLAUSE)?;
-    let call_start = call_node.text_range().start();
 
     let assignments: Vec<ExceptAssignment> = except_clause
         .descendants()
-        .filter(|n| n.kind() == SyntaxKind::ASSIGN_STMT && n.text_range().end() <= call_start)
+        .filter(|n| n.kind() == SyntaxKind::ASSIGN_STMT)
         .filter_map(|stmt| {
             let mut nodes = active_children(&stmt);
             let target = nodes.next()?;
@@ -1378,44 +1380,51 @@ fn resolve_comment_in_except_block(arg: &SyntaxNode, call_node: &SyntaxNode) -> 
     if comment.is_empty() {
         return None;
     }
-    if is_plain_identifier(&comment)
-        && last_assignment_before(&assignments, &comment, call_start).is_none()
-    {
+    if is_plain_identifier(&comment) && !assignments.iter().any(|a| a.target == comment) {
         // A variable filled outside the handler: its content is not known here.
         return Some(true);
     }
 
-    Some(carries_detail_error(&comment, call_start, &assignments, MAX_DETAIL_TRACE_DEPTH))
+    // Each value is traced only through the assignments written before it, so
+    // one pass in text order settles every one of them without recursion.
+    let call_start = call_node.text_range().start();
+    let assignments = &assignments[..assignments.partition_point(|a| a.start < call_start)];
+    let mut targets: Vec<&str> = Vec::new();
+    for assignment in assignments {
+        if !targets.contains(&assignment.target.as_str()) {
+            targets.push(&assignment.target);
+        }
+    }
+    let mut values = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let value =
+            trace_value(&assignment.value, assignment.start, assignments, &targets, &values);
+        values.push(value);
+    }
+    Some(trace_value(&comment, call_start, assignments, &targets, &values).detail_error)
 }
 
-fn carries_detail_error(
+/// What `text` read at `before` holds, given the `values` already traced for
+/// the leading `assignments`.
+fn trace_value(
     text: &str,
     before: TextSize,
     assignments: &[ExceptAssignment],
-    depth: u8,
-) -> bool {
-    if detail_call_arguments(text).iter().any(|arg| is_error_info(arg, before, assignments)) {
-        return true;
-    }
-    if depth == 0 {
-        return false;
-    }
-    assignments.iter().filter(|a| a.start < before && references_path(text, &a.target)).any(|a| {
-        last_assignment_before(assignments, &a.target, before).is_some_and(|last| {
-            carries_detail_error(&last.value, last.start, assignments, depth - 1)
-        })
-    })
-}
-
-fn is_error_info(arg: &str, before: TextSize, assignments: &[ExceptAssignment]) -> bool {
-    let is_error_info_call =
-        |text: &str| text.contains("информацияобошибке") || text.contains("errorinfo");
-    if is_error_info_call(arg) {
-        return true;
-    }
-    is_plain_identifier(arg)
-        && last_assignment_before(assignments, arg, before)
-            .is_some_and(|last| is_error_info_call(&last.value))
+    targets: &[&str],
+    values: &[TracedValue],
+) -> TracedValue {
+    let last_value =
+        |target: &str| last_assignment_before(assignments, target, before).map(|i| values[i]);
+    let is_error_info = |text: &str| {
+        text.contains("информацияобошибке")
+            || text.contains("errorinfo")
+            || (is_plain_identifier(text) && last_value(text).is_some_and(|v| v.error_info))
+    };
+    let detail_error = detail_call_arguments(text).into_iter().any(is_error_info)
+        || targets.iter().any(|target| {
+            references_path(text, target) && last_value(target).is_some_and(|v| v.detail_error)
+        });
+    TracedValue { error_info: is_error_info(text), detail_error }
 }
 
 /// Arguments of every `ПодробноеПредставлениеОшибки(...)` call in `text`.
@@ -1447,12 +1456,14 @@ fn detail_call_arguments(text: &str) -> Vec<&str> {
     result
 }
 
-fn last_assignment_before<'a>(
-    assignments: &'a [ExceptAssignment],
+/// Index of the last assignment to `target` made before `before`;
+/// `assignments` go in text order.
+fn last_assignment_before(
+    assignments: &[ExceptAssignment],
     target: &str,
     before: TextSize,
-) -> Option<&'a ExceptAssignment> {
-    assignments.iter().filter(|a| a.start < before && a.target == target).max_by_key(|a| a.start)
+) -> Option<usize> {
+    assignments.iter().rposition(|a| a.start < before && a.target == target)
 }
 
 /// `path` occurs in `text` as a whole value: not as a part of a longer name,
@@ -1477,21 +1488,38 @@ fn is_plain_identifier(text: &str) -> bool {
     !text.is_empty() && text.chars().all(is_identifier_char)
 }
 
-/// Lower-cased code of `node` without trivia; every string literal piece is
-/// collapsed to `"` so that names inside strings are not taken for code.
+/// Lower-cased code of `node` without trivia and without the text an extension
+/// removed. A string literal piece is spelled as the hex of its lower-cased
+/// text: `Поля["А"]` stays apart from `Поля["Б"]`, and a name written inside
+/// a string is not taken for code.
 fn normalized_code_text(node: &SyntaxNode) -> String {
     let mut text = String::new();
-    for token in node.descendants_with_tokens().filter_map(|el| el.into_token()) {
+    push_normalized_code(node, &mut text);
+    text
+}
+
+fn push_normalized_code(node: &SyntaxNode, text: &mut String) {
+    for element in active_children_with_tokens(node) {
+        if let Some(child) = element.as_node() {
+            push_normalized_code(child, text);
+            continue;
+        }
+        let Some(token) = element.into_token() else { continue };
         match token.kind() {
             kind if kind.is_trivia() => {}
             SyntaxKind::STRING
             | SyntaxKind::STRING_START
             | SyntaxKind::STRING_PART
-            | SyntaxKind::STRING_TAIL => text.push('"'),
+            | SyntaxKind::STRING_TAIL => {
+                text.push('"');
+                for byte in token.text().fold_lower().bytes() {
+                    text.push_str(&format!("{byte:02x}"));
+                }
+                text.push('"');
+            }
             _ => text.push_str(&token.text().fold_lower()),
         }
     }
-    text
 }
 
 fn extract_type_name_from_first_arg(node: &SyntaxNode) -> Option<String> {
